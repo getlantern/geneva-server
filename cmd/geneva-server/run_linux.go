@@ -103,13 +103,12 @@ func runServer(ctx context.Context, o *options) error {
 
 	// Control/health surface.
 	ctrl := control.New(control.Providers{
-		Mode:        o.mode,
-		Version:     version,
-		Commit:      commit,
-		Engine:      eng,
-		Canary:      pool,
-		Verdicts:    func() any { return rt.Snapshot() },
-		AllowReload: o.mode == "eval",
+		Mode:     o.mode,
+		Version:  version,
+		Commit:   commit,
+		Engine:   eng,
+		Canary:   pool,
+		Verdicts: func() any { return rt.Snapshot() },
 	})
 	httpSrv := &http.Server{
 		Addr:              o.controlAddr,

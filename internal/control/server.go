@@ -30,9 +30,6 @@ type Providers struct {
 	// Verdicts returns the runtime's verdict counters (JSON-marshalable). It may
 	// be nil before the runtime starts.
 	Verdicts func() any
-	// AllowReload permits PUT /strategy at runtime. True only in eval mode; prod
-	// boxes reload by restart.
-	AllowReload bool
 }
 
 // Server is the HTTP control surface.
@@ -98,17 +95,17 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
-// handleStrategy serves GET (current DNA) and, in eval mode, PUT (assign a
-// candidate). Assignment validates the DNA before installing it.
+// handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).
+// PUT validates the DNA before installing it, and the swap is atomic, so the new
+// strategy applies to the next packet with no restart. This works in both modes:
+// the swap is strategy-content-only (the queues, nftables rules, reinjector, and
+// offload setup are untouched). The write endpoint is unauthenticated, so the
+// control address must stay on a private interface (see deploy/README.md).
 func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
 	case http.MethodPut:
-		if !s.p.AllowReload {
-			writeError(w, http.StatusForbidden, "strategy reload is disabled in prod mode; reload by restart")
-			return
-		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "read body: "+err.Error())

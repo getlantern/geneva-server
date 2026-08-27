@@ -117,7 +117,8 @@ func (s *Stats) snapshot() Snapshot {
 }
 
 // Engine applies a single strategy to packets. The strategy can be swapped
-// atomically at runtime (used by eval mode); prod mode sets it once.
+// atomically at runtime via SetStrategy — in either mode — so a new strategy
+// takes effect on the next packet without a restart.
 type Engine struct {
 	mu    sync.Mutex // serializes swaps; reads use the atomic pointer
 	cur   atomic.Pointer[loaded]

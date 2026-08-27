@@ -38,7 +38,7 @@ proxy's traffic.
 
 ## Modes
 
-- **prod** — one fixed strategy on a fleet box; reload by restart:
+- **prod** — the assigned strategy on a fleet box:
 
   ```
   geneva-server run \
@@ -48,9 +48,9 @@ proxy's traffic.
     --control-addr=127.0.0.1:8092
   ```
 
-- **eval** — a replaceable candidate on a dedicated test box, with canary
-  capture. The GA brain assigns candidates via `PUT /strategy` and reads the
-  per-market canary pool from `GET /canary`:
+- **eval** — a candidate on a dedicated test box, with canary capture. The GA
+  brain assigns candidates via `PUT /strategy` and reads the per-market canary
+  pool from `GET /canary`:
 
   ```
   geneva-server run \
@@ -59,11 +59,16 @@ proxy's traffic.
     --control-addr=127.0.0.1:8092
   ```
 
-  The control API is unauthenticated, so it must not listen on `0.0.0.0`: on an
-  eval box, `PUT /strategy` lets any reachable client replace the active strategy
-  and read canary data. If the GA brain needs to reach it remotely, bind only a
-  dedicated management interface (e.g. a WireGuard/VPC address) and gate it with
-  network ACLs — never the public interface.
+Both modes support updating the strategy **in place**: `PUT /strategy` validates
+the DNA and swaps it atomically, taking effect on the next packet with no
+restart. Delivering a strategy at boot (via `--strategy-file` + the config path)
+and restarting also works.
+
+The control API is unauthenticated, so it must not listen on `0.0.0.0`:
+`PUT /strategy` lets any reachable client replace the active strategy on either a
+prod or an eval box. If the GA brain needs to reach it remotely, bind only a
+dedicated management interface (e.g. a WireGuard/VPC address) and gate it with
+network ACLs — never the public interface.
 
 ## Control / health surface
 
@@ -74,7 +79,7 @@ Bind `--control-addr` to a private address (localhost or a management network).
 | `GET /healthz`  | both      | liveness + mode, strategy, engine & verdict stats   |
 | `GET /metrics`  | both      | overhead measurements for GA pre-screen             |
 | `GET /strategy` | both      | current strategy DNA                                |
-| `PUT /strategy` | eval only | assign/replace a candidate (validated before apply) |
+| `PUT /strategy` | both      | assign/replace the strategy in place (validated)    |
 | `GET /canary`   | eval only | per-market captured field-value pool                |
 
 ## Provisioning notes (bandit VPS)

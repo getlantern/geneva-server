@@ -72,6 +72,17 @@ echo "$ruleset" | grep -q "9090" && fail "ruleset unexpectedly references port 9
   && pass "unrelated :9090 service still serves normally" \
   || fail ":9090 service broke"
 
+step "In-place strategy reload on the running prod sidecar"
+newdna='[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/'
+"${COMPOSE[@]}" exec -T tester sh -c "curl -fsS -X PUT --data-binary '$newdna' http://server:8092/strategy" >/dev/null \
+  && pass "PUT /strategy accepted on a prod-mode box" \
+  || fail "PUT /strategy rejected"
+got=$("${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8092/strategy' | jq -r .strategy)
+[[ "$got" == "$newdna" ]] && pass "strategy swapped in place (no restart)" || fail "strategy not updated: $got"
+"${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8080/healthz' >/dev/null \
+  && pass "service still serves after the in-place swap" \
+  || fail "service broke after strategy swap"
+
 step "3. Clean teardown leaves no stale rules"
 "${COMPOSE[@]}" stop -t 10 sidecar >/dev/null
 "${COMPOSE[@]}" logs sidecar 2>&1 | grep -q "nftables steering removed" \

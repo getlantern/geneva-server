@@ -52,11 +52,17 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
 
 ## Modes
 
-- **prod** — one fixed strategy on a fleet box. Reload by restart.
-- **eval** — a replaceable candidate on a dedicated test box, plus a per-market
-  **canary** that captures real header field values (window, TTL, MSS, options,
-  flags, …) so the brain can mutate against values that actually occur. Seeded
-  with a small static cold-start corpus.
+- **prod** — the assigned strategy on a fleet box.
+- **eval** — a candidate on a dedicated test box, plus a per-market **canary**
+  that captures real header field values (window, TTL, MSS, options, flags, …)
+  so the brain can mutate against values that actually occur. Seeded with a small
+  static cold-start corpus.
+
+The only difference is the canary (eval-only). Both modes accept a strategy
+update in place: `PUT /strategy` validates the DNA and swaps it atomically, so it
+takes effect on the next packet with no restart (the swap touches only the
+strategy — the queues, nftables rules, and reinjector are untouched). Restarting
+also works and is how a strategy is delivered at boot via the config path.
 
 ## Usage
 
@@ -83,8 +89,11 @@ See [`deploy/`](deploy/) for the systemd unit and provisioning notes, and
 | `GET /healthz`  | both      | liveness + mode, strategy, engine & verdict stats  |
 | `GET /metrics`  | both      | overhead measurements for the GA pre-screen        |
 | `GET /strategy` | both      | current strategy DNA                               |
-| `PUT /strategy` | eval only | assign/replace a candidate (validated first)       |
+| `PUT /strategy` | both      | assign/replace the strategy in place (validated)   |
 | `GET /canary`   | eval only | per-market captured field-value pool               |
+
+`PUT /strategy` is unauthenticated, so keep `--control-addr` on a private
+interface (see [`deploy/`](deploy/)).
 
 ## Development
 

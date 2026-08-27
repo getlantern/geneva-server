@@ -33,8 +33,10 @@ ReadOnlyPaths=/etc/geneva-server
 EnvironmentFile=/etc/geneva-server/geneva.env
 ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
 
-# v1 reloads by restart (no hot swap on prod boxes), so there is no ExecReload:
-# the process does not handle SIGHUP, and its default action would kill it.
+# There is no ExecReload: a running strategy is replaced in place via the control
+# API (PUT /strategy), and a restart re-reads --strategy-file. The process does
+# not handle SIGHUP (its default action would kill it), so systemd reload is a
+# no-op by omission rather than a signal.
 
 # On stop, systemd sends SIGTERM; the sidecar tears down its nftables table on
 # the way out. Give it room to do so before SIGKILL.

@@ -18,11 +18,10 @@ func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Se
 		t.Fatalf("engine: %v", err)
 	}
 	p := Providers{
-		Mode:        mode,
-		Version:     "test",
-		Engine:      eng,
-		AllowReload: mode == "eval",
-		Verdicts:    func() any { return map[string]int{"accepted": 0} },
+		Mode:     mode,
+		Version:  "test",
+		Engine:   eng,
+		Verdicts: func() any { return map[string]int{"accepted": 0} },
 	}
 	if withCanary {
 		p.Canary = canary.NewPool("RU", 16)
@@ -92,16 +91,28 @@ func TestStrategyReloadRejectsInvalid(t *testing.T) {
 	}
 }
 
-func TestStrategyReloadForbiddenInProd(t *testing.T) {
+func TestStrategyReloadWorksInProd(t *testing.T) {
+	// Reload-in-place is supported in both modes; prod is not special-cased.
 	srv := newTestServer(t, "prod", `[TCP:flags:R]-drop-| \/`, false)
-	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(`\/`))
+	newDNA := `[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/`
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(newDNA))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("prod reload status = %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prod reload status = %d, want 200", resp.StatusCode)
+	}
+	gr, err := http.Get(srv.URL + "/strategy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = gr.Body.Close() }()
+	var got map[string]string
+	_ = json.NewDecoder(gr.Body).Decode(&got)
+	if got["strategy"] != newDNA {
+		t.Fatalf("strategy = %q, want %q", got["strategy"], newDNA)
 	}
 }
 
