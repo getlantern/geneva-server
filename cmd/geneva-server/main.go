@@ -13,6 +13,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/getlantern/geneva-server/internal/engine"
 	"github.com/spf13/cobra"
@@ -92,12 +93,13 @@ func (o *options) resolveStrategy() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("read strategy file: %w", err)
 		}
-		return string(b), nil
+		// Tolerate a trailing newline in an operator-managed file.
+		return strings.TrimSpace(string(b)), nil
 	}
 	if o.strategy == "" && o.mode == "prod" {
 		return "", fmt.Errorf("prod mode requires --strategy or --strategy-file")
 	}
-	return o.strategy, nil
+	return strings.TrimSpace(o.strategy), nil
 }
 
 func (o *options) validate() error {
@@ -151,9 +153,9 @@ func validateCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("read strategy file: %w", err)
 				}
-				dna = string(b)
+				dna = strings.TrimSpace(string(b))
 			case len(args) == 1:
-				dna = args[0]
+				dna = strings.TrimSpace(args[0])
 			default:
 				return fmt.Errorf("provide a strategy as an argument or via --file")
 			}

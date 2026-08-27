@@ -18,7 +18,9 @@ package nfqueue
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"sync/atomic"
 
 	nfq "github.com/florianl/go-nfqueue/v2"
@@ -146,8 +148,13 @@ func (rt *Runtime) open(queue uint16) (*nfq.Nfqueue, error) {
 }
 
 func (rt *Runtime) errHook(e error) int {
-	// A read timeout is not fatal; log everything else and keep the queue open.
-	rt.log.Errorf("nfqueue error: %v", e)
+	// A read timeout is expected and not fatal — log it quietly. Everything else
+	// is logged at error level. Either way the queue stays open.
+	if errors.Is(e, os.ErrDeadlineExceeded) {
+		rt.log.Debugf("nfqueue read timeout: %v", e)
+	} else {
+		rt.log.Errorf("nfqueue error: %v", e)
+	}
 	return 0
 }
 
@@ -187,18 +194,29 @@ func (rt *Runtime) hook(q *nfq.Nfqueue, dir strategy.Direction) nfq.HookFunc {
 
 // verdictOutbound: unchanged packets are accepted as-is; everything else drops
 // the original and reinjects the replacement packets (possibly none, for a drop).
+//
+// If a strategy produced replacement packets but every reinjection failed, the
+// original is accepted instead of dropped: dropping it would black-hole the
+// flow, and failing open keeps the proxy serving.
 func (rt *Runtime) verdictOutbound(q *nfq.Nfqueue, id uint32, res engine.Result) {
 	if res.Outcome == engine.OutcomeUnchanged {
 		rt.accept(q, id)
 		return
 	}
+	injected := 0
 	for _, p := range res.Packets {
 		if err := rt.reinjector.Inject(p); err != nil {
 			rt.log.Errorf("reinject: %v", err)
 			rt.Stats.InjectFails.Add(1)
 			continue
 		}
+		injected++
 		rt.Stats.Reinjected.Add(1)
+	}
+	if len(res.Packets) > 0 && injected == 0 {
+		rt.log.Errorf("all %d replacement packets failed to reinject; accepting original to avoid black-hole", len(res.Packets))
+		rt.accept(q, id)
+		return
 	}
 	_ = q.SetVerdict(id, nfq.NfDrop)
 	rt.Stats.Dropped.Add(1)

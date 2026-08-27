@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/getlantern/geneva-server/internal/canary"
@@ -103,7 +104,7 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
-	case http.MethodPut, http.MethodPost:
+	case http.MethodPut:
 		if !s.p.AllowReload {
 			writeError(w, http.StatusForbidden, "strategy reload is disabled in prod mode; reload by restart")
 			return
@@ -113,7 +114,9 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 			return
 		}
-		dna := string(body)
+		// Tolerate a trailing newline or surrounding whitespace (common when the
+		// body is piped from a file), which would otherwise fail validation.
+		dna := strings.TrimSpace(string(body))
 		if err := s.p.Engine.SetStrategy(dna); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid strategy: "+err.Error())
 			return

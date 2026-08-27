@@ -1,4 +1,2 @@
-bin/
 .git/
-e2e/
-*.md
+bin/
