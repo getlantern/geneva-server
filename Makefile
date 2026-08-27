@@ -20,6 +20,9 @@ test-race:
 vet:
 	go vet ./...
 
+lint:
+	golangci-lint run ./...
+
 # Full e2e over docker networking (requires docker + a netfilter-capable kernel).
 e2e:
 	./e2e/run.sh

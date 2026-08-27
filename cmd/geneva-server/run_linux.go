@@ -115,11 +115,16 @@ func runServer(ctx context.Context, o *options) error {
 		Addr:              o.controlAddr,
 		Handler:           ctrl.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
+		// Bound the whole request read: strategy uploads call io.ReadAll, so a
+		// slow client must not be able to hold a handler open indefinitely.
+		ReadTimeout: 30 * time.Second,
 	}
+	serveErr := make(chan error, 1)
 	go func() {
 		log.Info("control surface listening", "addr", o.controlAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("control surface failed", "err", err)
+			serveErr <- err
 			stop() // bring the whole process down; a dead control plane is fatal
 		}
 	}()
@@ -131,6 +136,16 @@ func runServer(ctx context.Context, o *options) error {
 
 	log.Info("nfqueue runtime starting", "out_queue", o.outQueue, "in_queue", o.inQueue)
 	err = rt.Run(ctx)
+
+	// If the control listener failed, surface that as the exit error rather than
+	// reporting a clean shutdown: the process must not exit 0 when the control
+	// surface never came up.
+	select {
+	case serr := <-serveErr:
+		return fmt.Errorf("control surface failed: %w", serr)
+	default:
+	}
+
 	if errors.Is(err, context.Canceled) {
 		log.Info("shutting down")
 		return nil

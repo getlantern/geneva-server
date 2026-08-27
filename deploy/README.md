@@ -56,8 +56,14 @@ proxy's traffic.
   geneva-server run \
     --mode=eval --market=RU \
     --port=443 --iface=eth0 \
-    --control-addr=0.0.0.0:8092
+    --control-addr=127.0.0.1:8092
   ```
+
+  The control API is unauthenticated, so it must not listen on `0.0.0.0`: on an
+  eval box, `PUT /strategy` lets any reachable client replace the active strategy
+  and read canary data. If the GA brain needs to reach it remotely, bind only a
+  dedicated management interface (e.g. a WireGuard/VPC address) and gate it with
+  network ACLs — never the public interface.
 
 ## Control / health surface
 

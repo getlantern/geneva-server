@@ -14,7 +14,7 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
 
 ## How it works
 
-```
+```text
         proxy egress (sport=PORT)                     proxy ingress (dport=PORT)
                   │                                              │
       nftables: queue → OUT_Q (bypass)          nftables: queue → IN_Q (bypass)

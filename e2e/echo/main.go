@@ -45,6 +45,6 @@ func main() {
 	})
 
 	log.Printf("echo listening on %s serving %d bytes", *addr, *size)
-	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second}
 	log.Fatal(srv.ListenAndServe())
 }

@@ -15,6 +15,7 @@ package netdev
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -34,16 +35,28 @@ func DisableOffload(ctx context.Context, ethtoolPath, iface string) (string, err
 	if _, err := exec.LookPath(ethtoolPath); err != nil {
 		return "", fmt.Errorf("ethtool not found (needed to disable NIC offloads on %s): %w", iface, err)
 	}
+	// A missing interface is a hard error, not a "feature unchanged": otherwise a
+	// typo in --iface would silently leave every offload on.
+	if _, err := os.Stat("/sys/class/net/" + iface); err != nil {
+		return "", fmt.Errorf("interface %q not found: %w", iface, err)
+	}
 	var ok, skipped []string
 	for _, f := range offloadFeatures {
 		cmd := exec.CommandContext(ctx, ethtoolPath, "-K", iface, f, "off")
 		if out, err := cmd.CombinedOutput(); err != nil {
-			// Feature fixed/unsupported on this interface; not fatal.
+			// Feature fixed/unsupported on this interface; not fatal on its own.
 			_ = out
 			skipped = append(skipped, f)
 			continue
 		}
 		ok = append(ok, f)
+	}
+	// If nothing could be changed at all, something is wrong (permissions, a
+	// context cancellation, an interface that rejects every request) — surface it
+	// rather than letting NFQUEUE receive GSO/checksum-offloaded packets.
+	if len(ok) == 0 {
+		return "", fmt.Errorf("failed to disable any offload on %q (check CAP_NET_ADMIN); attempted: %s",
+			iface, strings.Join(offloadFeatures, " "))
 	}
 	return fmt.Sprintf("disabled=[%s] unchanged=[%s]", strings.Join(ok, " "), strings.Join(skipped, " ")), nil
 }

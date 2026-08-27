@@ -4,6 +4,13 @@ After=network.target nss-lookup.target network-online.target
 # Run alongside the proxy it steers. Order after it if they share a host.
 
 [Service]
+# Run as a dedicated non-root account: the sidecar's job needs two network
+# capabilities, not filesystem-wide root. Provisioning must create this user
+# (system account, no shell) and grant it read access to /etc/geneva-server.
+# Ambient capabilities are delivered to the non-root user by systemd.
+User=geneva-server
+Group=geneva-server
+
 # The sidecar needs exactly two capabilities and nothing more:
 #   CAP_NET_ADMIN — program nftables, set SO_MARK, toggle NIC offloads
 #   CAP_NET_RAW   — open the raw socket used to reinject outbound packets
@@ -11,11 +18,23 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=true
 
+# Filesystem/namespace hardening: none of these interfere with netfilter or the
+# raw socket, which are reached over AF_NETLINK / AF_INET.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+RestrictAddressFamilies=AF_INET AF_NETLINK
+ReadOnlyPaths=/etc/geneva-server
+
 # Configuration is written by the deployment's cloud-init before start:
 #   GENEVA_ARGS holds the run flags (mode, strategy-file, port, iface, ...).
 EnvironmentFile=/etc/geneva-server/geneva.env
 ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
-ExecReload=/bin/kill -HUP $MAINPID
+
+# v1 reloads by restart (no hot swap on prod boxes), so there is no ExecReload:
+# the process does not handle SIGHUP, and its default action would kill it.
 
 # On stop, systemd sends SIGTERM; the sidecar tears down its nftables table on
 # the way out. Give it room to do so before SIGKILL.
