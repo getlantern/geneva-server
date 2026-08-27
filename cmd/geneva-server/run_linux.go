@@ -27,7 +27,8 @@ type slogLogger struct{ l *slog.Logger }
 func (s slogLogger) Debugf(f string, a ...any) { s.l.Debug(fmt.Sprintf(f, a...)) }
 func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
 
-func runServer(ctx context.Context, o *options) error {
+func runServer(o *runCmd) error {
+	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	dna, err := o.resolveStrategy()
@@ -38,13 +39,13 @@ func runServer(ctx context.Context, o *options) error {
 	if err != nil {
 		return err
 	}
-	log.Info("engine ready", "mode", o.mode, "strategy", eng.DNA())
+	log.Info("engine ready", "mode", o.Mode, "strategy", eng.DNA())
 
 	// eval mode captures a per-market canary pool from live traffic.
 	var pool *canary.Pool
 	var observer nfqueue.Observer
-	if o.mode == "eval" {
-		pool = canary.NewPool(o.market, o.canaryCapacity)
+	if o.Mode == "eval" {
+		pool = canary.NewPool(o.Market, o.CanaryCapacity)
 		observer = pool
 	}
 
@@ -55,28 +56,28 @@ func runServer(ctx context.Context, o *options) error {
 	// Disable NIC offloads on the steered interface so NFQUEUE yields real,
 	// MTU-sized, fully-checksummed packets that reinjection can put back on the
 	// wire intact.
-	if o.iface != "" {
-		summary, err := netdev.DisableOffload(ctx, o.ethtoolPath, o.iface)
+	if o.Iface != "" {
+		summary, err := netdev.DisableOffload(ctx, o.EthtoolPath, o.Iface)
 		if err != nil {
 			return err
 		}
-		log.Info("NIC offloads adjusted", "iface", o.iface, "result", summary)
+		log.Info("NIC offloads adjusted", "iface", o.Iface, "result", summary)
 	}
 
 	// Program the steering rules. They are torn down on any exit path.
 	nft := nftables.New(nftables.Config{
-		Table:    o.table,
-		Port:     o.port,
-		OutQueue: o.outQueue,
-		InQueue:  o.inQueue,
-		Mark:     o.mark,
-		NFTPath:  o.nftPath,
+		Table:    o.Table,
+		Port:     o.Port,
+		OutQueue: o.OutQueue,
+		InQueue:  o.InQueue,
+		Mark:     uint32(o.Mark),
+		NFTPath:  o.NFTPath,
 	})
-	if !o.noNFT {
+	if !o.NoNFT {
 		if err := nft.Install(ctx); err != nil {
 			return err
 		}
-		log.Info("nftables steering installed", "table", o.table, "port", o.port)
+		log.Info("nftables steering installed", "table", o.Table, "port", o.Port)
 		defer func() {
 			// Use a fresh context: the root one is already cancelled at shutdown.
 			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -91,9 +92,9 @@ func runServer(ctx context.Context, o *options) error {
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
-		OutQueue: o.outQueue,
-		InQueue:  o.inQueue,
-		Mark:     o.mark,
+		OutQueue: o.OutQueue,
+		InQueue:  o.InQueue,
+		Mark:     uint32(o.Mark),
 		Observer: observer,
 		Logger:   slogLogger{l: log},
 	})
@@ -103,7 +104,7 @@ func runServer(ctx context.Context, o *options) error {
 
 	// Control/health surface.
 	ctrl := control.New(control.Providers{
-		Mode:     o.mode,
+		Mode:     o.Mode,
 		Version:  version,
 		Commit:   commit,
 		Engine:   eng,
@@ -111,7 +112,7 @@ func runServer(ctx context.Context, o *options) error {
 		Verdicts: func() any { return rt.Snapshot() },
 	})
 	httpSrv := &http.Server{
-		Addr:              o.controlAddr,
+		Addr:              o.ControlAddr,
 		Handler:           ctrl.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bound the whole request read: strategy uploads call io.ReadAll, so a
@@ -120,7 +121,7 @@ func runServer(ctx context.Context, o *options) error {
 	}
 	serveErr := make(chan error, 1)
 	go func() {
-		log.Info("control surface listening", "addr", o.controlAddr)
+		log.Info("control surface listening", "addr", o.ControlAddr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("control surface failed", "err", err)
 			serveErr <- err
@@ -133,7 +134,7 @@ func runServer(ctx context.Context, o *options) error {
 		_ = httpSrv.Shutdown(shCtx)
 	}()
 
-	log.Info("nfqueue runtime starting", "out_queue", o.outQueue, "in_queue", o.inQueue)
+	log.Info("nfqueue runtime starting", "out_queue", o.OutQueue, "in_queue", o.InQueue)
 	err = rt.Run(ctx)
 
 	// If the control listener failed, surface that as the exit error rather than
