@@ -1,0 +1,29 @@
+[Unit]
+Description=geneva-server NFQUEUE sidecar
+After=network.target nss-lookup.target network-online.target
+# Run alongside the proxy it steers. Order after it if they share a host.
+
+[Service]
+# The sidecar needs exactly two capabilities and nothing more:
+#   CAP_NET_ADMIN — program nftables, set SO_MARK, toggle NIC offloads
+#   CAP_NET_RAW   — open the raw socket used to reinject outbound packets
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# Configuration is written by the deployment's cloud-init before start:
+#   GENEVA_ARGS holds the run flags (mode, strategy-file, port, iface, ...).
+EnvironmentFile=/etc/geneva-server/geneva.env
+ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+
+# On stop, systemd sends SIGTERM; the sidecar tears down its nftables table on
+# the way out. Give it room to do so before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target

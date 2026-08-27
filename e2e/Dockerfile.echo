@@ -1,0 +1,19 @@
+# Test-only image: the echo "proxy" plus the tooling the e2e assertions need
+# (curl for fetching, jq for parsing the control API). Also used as the tester
+# container, reusing its baked-in echo binary to regenerate the expected payload.
+FROM golang:1.25-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/echo ./e2e/echo
+
+FROM debian:bookworm-slim
+RUN set -ex \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/echo /usr/local/bin/echo
+COPY e2e/entrypoint-server.sh /usr/local/bin/entrypoint-server.sh
+RUN chmod +x /usr/local/bin/entrypoint-server.sh
+ENTRYPOINT ["/usr/local/bin/echo"]

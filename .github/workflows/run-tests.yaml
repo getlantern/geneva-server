@@ -1,0 +1,32 @@
+name: Run Tests
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - main
+  pull_request:
+jobs:
+  build:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # The runner is root-capable and ships nftables, so the root-gated
+      # nftables lifecycle test runs here too.
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Run tests
+        run: sudo -E env "PATH=$PATH" go test -race -coverprofile=profile.cov -covermode=atomic ./...
