@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/alexflint/go-arg v1.6.1
 	github.com/florianl/go-nfqueue/v2 v2.1.0
-	github.com/getlantern/geneva v0.0.0-20260827131956-6be158c66856
+	github.com/getlantern/geneva v0.0.0-20260828114548-70585ff8eafa
 	github.com/gopacket/gopacket v1.7.1
 	golang.org/x/sys v0.45.0
 )
