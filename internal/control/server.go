@@ -10,6 +10,7 @@ package control
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -106,8 +107,16 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
 	case http.MethodPut:
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		// MaxBytesReader returns an error once the limit is exceeded, so an oversized
+		// body is rejected rather than silently truncated (as io.LimitReader would).
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeError(w, http.StatusRequestEntityTooLarge, "strategy exceeds 1 MiB limit")
+				return
+			}
 			writeError(w, http.StatusBadRequest, "read body: "+err.Error())
 			return
 		}

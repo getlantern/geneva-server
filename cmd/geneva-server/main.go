@@ -30,7 +30,15 @@ var (
 type markFlag uint32
 
 func (m *markFlag) UnmarshalText(b []byte) error {
-	v, err := strconv.ParseUint(string(b), 0, 32)
+	// Accept only decimal and 0x/0X-prefixed hex, per the documented format. Base 0 would
+	// also accept octal ("010") and binary ("0b10"), which we deliberately reject.
+	s := string(b)
+	base := 10
+	if len(s) > 2 && (s[0] == '0') && (s[1] == 'x' || s[1] == 'X') {
+		base = 16
+		s = s[2:]
+	}
+	v, err := strconv.ParseUint(s, base, 32)
 	if err != nil {
 		return fmt.Errorf("invalid mark %q: %w", string(b), err)
 	}

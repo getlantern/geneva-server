@@ -6,8 +6,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/florianl/go-nfqueue/v2 v2.1.0 h1:Fywt30TY/evxyDySpXjxQ1jsRW7nQbLpOhELqpr4068=
 github.com/florianl/go-nfqueue/v2 v2.1.0/go.mod h1:8PKUM5rYoVFO5IZV1bifx4/b0jHAglKkHXr9PRwzi4Y=
-github.com/getlantern/geneva v0.0.0-20260828114548-70585ff8eafa h1:DKxrfE7rP+gVvukQyecz25n2lYmPt0tMhhCBjPH6+7A=
-github.com/getlantern/geneva v0.0.0-20260828114548-70585ff8eafa/go.mod h1:+qFYj07mr5wkT1gpxHX6tJiGTb9j6RF17A1OOdLR7Sg=
+github.com/getlantern/geneva v0.0.0-20260828121546-e4b88d19a7b3 h1:nFZptUuU9qIy+JS64rTHQfR4AjrvN1XFNX5Il/vpDDs=
+github.com/getlantern/geneva v0.0.0-20260828121546-e4b88d19a7b3/go.mod h1:+qFYj07mr5wkT1gpxHX6tJiGTb9j6RF17A1OOdLR7Sg=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/gopacket/gopacket v1.7.1 h1:1C7/wrJ5HyiEAYDtStJHQk4rV0ChpanZDV9+3Ov3gaM=

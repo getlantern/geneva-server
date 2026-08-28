@@ -91,6 +91,23 @@ func TestStrategyReloadRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestStrategyReloadRejectsOversizedBody(t *testing.T) {
+	srv := newTestServer(t, "eval", "", false)
+
+	// A valid strategy followed by more than 1 MiB of trailing bytes: the handler must
+	// reject it with 413 rather than truncating to the first MiB and reporting success.
+	body := `[TCP:flags:R]-drop-| \/` + "\n" + strings.Repeat("x", 1<<20)
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body status = %d, want 413", resp.StatusCode)
+	}
+}
+
 func TestStrategyReloadWorksInProd(t *testing.T) {
 	// Reload-in-place is supported in both modes; prod is not special-cased.
 	srv := newTestServer(t, "prod", `[TCP:flags:R]-drop-| \/`, false)

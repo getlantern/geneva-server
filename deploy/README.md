@@ -40,7 +40,7 @@ proxy's traffic.
 
 - **prod** — the assigned strategy on a fleet box:
 
-  ```
+  ```sh
   geneva-server run \
     --mode=prod \
     --strategy-file=/etc/geneva-server/strategy.dna \
@@ -52,7 +52,7 @@ proxy's traffic.
   brain assigns candidates via `PUT /strategy` and reads the per-market canary
   pool from `GET /canary`:
 
-  ```
+  ```sh
   geneva-server run \
     --mode=eval --market=RU \
     --port=443 --iface=eth0 \
