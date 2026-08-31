@@ -1,0 +1,56 @@
+[Unit]
+Description=geneva-server NFQUEUE sidecar
+After=network.target nss-lookup.target network-online.target
+# Run alongside the proxy it steers. Order after it if they share a host.
+
+[Service]
+# Run as a dedicated non-root account: the sidecar's job needs two network
+# capabilities, not filesystem-wide root. Provisioning must create this user
+# (system account, no shell) and grant it read access to /etc/geneva-server.
+# Ambient capabilities are delivered to the non-root user by systemd.
+User=geneva-server
+Group=geneva-server
+
+# The sidecar needs exactly two capabilities and nothing more:
+#   CAP_NET_ADMIN — program nftables, set SO_MARK, toggle NIC offloads
+#   CAP_NET_RAW   — open the raw socket used to reinject outbound packets
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# Filesystem/namespace hardening: none of these interfere with netfilter or the
+# raw socket, which are reached over AF_NETLINK / AF_INET.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+# AF_INET covers both the raw reinjection socket and the OTLP metric export.
+# AF_INET6 is deliberately absent, so OTEL_EXPORTER_OTLP_ENDPOINT must name an
+# IPv4 literal (127.0.0.1:4318, not "localhost", which can resolve to ::1).
+RestrictAddressFamilies=AF_INET AF_NETLINK
+ReadOnlyPaths=/etc/geneva-server
+
+# Configuration is written by the deployment's cloud-init before start:
+#   GENEVA_ARGS holds the run flags (mode, strategy-file, port, iface, ...).
+#   OTEL_EXPORTER_OTLP_* / OTEL_RESOURCE_ATTRIBUTES point metric export at the
+#   box's local collector. With no OTLP endpoint set the sidecar runs with
+#   metrics disabled rather than failing to start.
+EnvironmentFile=/etc/geneva-server/geneva.env
+ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
+
+# There is no ExecReload: a running strategy is replaced in place via the control
+# API (PUT /strategy), and a restart re-reads --strategy-file. The process does
+# not handle SIGHUP (its default action would kill it), so systemd reload is a
+# no-op by omission rather than a signal.
+
+# On stop, systemd sends SIGTERM; the sidecar tears down its nftables table on
+# the way out. Give it room to do so before SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=infinity
+
+[Install]
+WantedBy=multi-user.target

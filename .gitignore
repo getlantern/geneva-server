@@ -1,0 +1,4 @@
+/bin/
+*.test
+profile.cov
+*.exe

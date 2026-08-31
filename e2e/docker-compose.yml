@@ -1,0 +1,60 @@
+# End-to-end topology, exercised by run.sh.
+#
+#   server  — runs the "proxy" (echo on :8080) plus an unrelated service (:9090)
+#             and owns the network namespace.
+#   sidecar — geneva-server in prod mode, sharing the server's netns, applying a
+#             duplicate strategy to :8080 egress. Holds only CAP_NET_ADMIN and
+#             CAP_NET_RAW.
+#   tester  — issues curl/jq assertions against the server and control surface.
+#   probe   — an on-demand container in the server's netns for inspecting the
+#             nftables state after teardown (run via `docker compose run`).
+name: geneva-e2e
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile.echo
+    image: geneva-e2e/echo:latest
+    entrypoint: ["/usr/local/bin/entrypoint-server.sh"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: "1s"
+      timeout: "2s"
+      retries: 30
+
+  sidecar:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: geneva-e2e/server:latest
+    network_mode: "service:server"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - ./strategy.txt:/strategy.txt:ro
+    command:
+      - "run"
+      - "--mode=prod"
+      - "--strategy-file=/strategy.txt"
+      - "--port=8080"
+      - "--iface=eth0"
+      - "--control-addr=0.0.0.0:8092"
+
+  tester:
+    image: geneva-e2e/echo:latest
+    depends_on:
+      server:
+        condition: service_healthy
+    profiles: ["tools"]
+    entrypoint: ["sleep", "infinity"]
+
+  probe:
+    image: geneva-e2e/server:latest
+    network_mode: "service:server"
+    profiles: ["tools"]
+    entrypoint: ["sleep", "infinity"]

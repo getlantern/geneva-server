@@ -1,0 +1,46 @@
+[tools]
+go = "1.25.5"
+golangci-lint = "2.13.1"
+
+[env]
+GOPRIVATE = "github.com/getlantern/*"
+# Build with the Go pinned above, never a toolchain silently fetched because a
+# dependency raised go.mod's `go` directive. Under the default `auto` a `go get`
+# that bumps that directive changes the compiler with no review; `local` turns
+# it into a build error instead. Raising the version means editing the pin here,
+# go.mod, and the `go-version` in .github/workflows together.
+GOTOOLCHAIN = "local"
+
+[settings]
+lockfile = true
+
+[task_config]
+dir = "{{ config_root }}"
+
+[tasks.build]
+description = "build the geneva-server binary into bin/"
+run = "make build"
+
+[tasks.test]
+description = "unit + packet-level tests (root-gated nftables tests self-skip)"
+run = "make test"
+
+[tasks."test:race"]
+description = "tests under the race detector"
+run = "make test-race"
+
+[tasks.lint]
+description = "golangci-lint over the module"
+run = "golangci-lint run ./..."
+
+[tasks.vet]
+description = "go vet over the module"
+run = "make vet"
+
+[tasks.e2e]
+description = "full docker-networking e2e (needs docker + a netfilter-capable kernel)"
+run = "make e2e"
+
+[tasks.docker]
+description = "build the geneva-server container image"
+run = "make docker"

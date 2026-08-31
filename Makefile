@@ -1,0 +1,34 @@
+# geneva-server — build, test, and e2e targets.
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
+
+.PHONY: build test test-race vet lint e2e docker clean
+
+build:
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/geneva-server ./cmd/geneva-server
+
+# Unit + packet-level tests. Root-gated integration tests (real nftables) run
+# only when invoked as root; otherwise they self-skip.
+test:
+	go test ./...
+
+test-race:
+	go test -race ./...
+
+vet:
+	go vet ./...
+
+lint:
+	golangci-lint run ./...
+
+# Full e2e over docker networking (requires docker + a netfilter-capable kernel).
+e2e:
+	./e2e/run.sh
+
+docker:
+	docker build -t geneva-server:$(VERSION) --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) .
+
+clean:
+	rm -rf bin

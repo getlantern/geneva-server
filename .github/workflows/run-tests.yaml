@@ -1,0 +1,40 @@
+name: Run Tests
+on:
+  push:
+    tags:
+      - v*
+    branches:
+      - main
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Go ${{ matrix.go }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "1.27.x"]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      # The suite runs unprivileged; the nftables lifecycle test self-skips
+      # without root.
+      - name: Run tests
+        run: go test -race -coverprofile=profile.cov -covermode=atomic ./...
+      # Run only the root-gated nftables lifecycle test under sudo, so the bulk
+      # of the suite never runs as root.
+      - name: Install nftables
+        run: sudo apt-get update && sudo apt-get install -y nftables
+      - name: Root nftables lifecycle test
+        run: sudo -E env "PATH=$PATH" go test -run TestInstallRemoveLifecycle ./internal/nftables/
