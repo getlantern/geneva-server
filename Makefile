@@ -4,7 +4,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: build test test-race vet lint e2e docker clean
+.PHONY: build test test-race vet lint e2e docker package clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/geneva-server ./cmd/geneva-server
@@ -30,5 +30,11 @@ e2e:
 docker:
 	docker build -t geneva-server:$(VERSION) --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) .
 
+# Build the release .deb locally, exactly as the release workflow does, without
+# publishing. Useful for checking the package's contents, dependencies and
+# maintainer scripts before tagging.
+package:
+	goreleaser release --snapshot --clean --skip=publish
+
 clean:
-	rm -rf bin
+	rm -rf bin dist
