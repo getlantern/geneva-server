@@ -1,6 +1,7 @@
 [tools]
 go = "1.25.5"
 golangci-lint = "2.13.1"
+goreleaser = "2.18.0"
 
 [env]
 GOPRIVATE = "github.com/getlantern/*"
@@ -44,3 +45,7 @@ run = "make e2e"
 [tasks.docker]
 description = "build the geneva-server container image"
 run = "make docker"
+
+[tasks.package]
+description = "build the release .deb locally (goreleaser snapshot, no publish)"
+run = "make package"

@@ -1,0 +1,76 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+project_name: geneva-server
+
+builds:
+  - id: geneva-server
+    main: ./cmd/geneva-server
+    binary: geneva-server
+    flags:
+      - -trimpath
+    # Pure Go: the netlink and gopacket layers need no cgo, so one build
+    # matrix covers both architectures with no cross-compiler.
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .ShortCommit }}
+
+archives:
+  - formats: ["tar.gz"]
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  replace_existing_artifacts: true
+
+nfpms:
+  - id: geneva-server
+    package_name: geneva-server
+    formats: [deb]
+    # The systemd unit and the Dockerfile both invoke /usr/local/bin/geneva-server;
+    # nfpm's default bindir is /usr/bin, so it is set explicitly to keep the three
+    # in agreement.
+    bindir: /usr/local/bin
+    section: net
+    maintainer: "Lantern Team <dev@getlantern.org>"
+    description: |
+      Privileged NFQUEUE sidecar that applies Geneva strategies to a proxy's
+      outer IPv4/TCP packets.
+    vendor: "Brave New Software"
+    homepage: "https://github.com/getlantern/geneva-server"
+    license: "GPL-3.0"
+    # nftables programs the runtime-owned steering table; ethtool disables the
+    # NIC offloads that would otherwise hand NFQUEUE super-segments with
+    # placeholder checksums (see deploy/README.md).
+    dependencies:
+      - nftables
+      - ethtool
+    # preinstall runs addgroup/adduser before the package's files are unpacked,
+    # so adduser has to be fully configured by then — a plain dependency is only
+    # guaranteed to be unpacked.
+    deb:
+      predepends:
+        - adduser
+    contents:
+      - src: deploy/geneva-server.service
+        dst: /usr/lib/systemd/system/geneva-server.service
+      # Configuration is written by the deployment (cloud-init), not the
+      # package: the mode, market, strategy and OTLP endpoint are all
+      # per-box. The package only owns the directory and its permissions.
+      - dst: /etc/geneva-server
+        type: dir
+        file_info:
+          mode: 0750
+          owner: root
+          group: geneva-server
+    scripts:
+      preinstall: deploy/preinstall.sh
+      preremove: deploy/preremove.sh

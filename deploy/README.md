@@ -110,15 +110,52 @@ revision; both can be overridden through `OTEL_SERVICE_NAME` /
 the rest of the fleet — a test box being torn down and replaced (which happens
 continuously as IPs burn) then reads as a series ending, not as a negative jump.
 
+## Installing from a release
+
+Tagged builds publish a `.deb` per architecture to GitHub Releases:
+
+```
+https://github.com/getlantern/geneva-server/releases/download/v<ver>/geneva-server_<ver>_linux_<arch>.deb
+```
+
+The package installs `/usr/local/bin/geneva-server`, the systemd unit at
+`/usr/lib/systemd/system/geneva-server.service`, an empty
+`/etc/geneva-server` (mode `0750`, group `geneva-server`), and depends on
+`nftables` and `ethtool`. Its preinstall script creates the `geneva-server`
+system account the unit runs as — without it systemd cannot deliver the two
+ambient capabilities.
+
+The unit ships **disabled**: it cannot start until the deployment has written
+`/etc/geneva-server/geneva.env`, and in prod mode the strategy file it names. So
+install, write the config, then `systemctl enable --now geneva-server`.
+
+`main` auto-tags a patch release on any change to the binary or its packaging
+(the workflow's path filter excludes tests, the e2e harness and this file, since
+those produce an identical package).
+The tag is pushed before the release build runs, so the newest tag is
+installable only once its release workflow has published — during a build, or
+after a failed one, the tag can exist with no assets. Assets are never
+overwritten, so a published tag stays installable forever; there is no mutable
+"latest" asset to pin against.
+
 ## Provisioning notes (bandit VPS)
 
 Mirror the `lantern-box` provisioning flow:
 
-1. Install `nftables` and `ethtool` in `provision.sh` (or bake them into the
-   image — the `Dockerfile` already does).
-2. Write `/etc/geneva-server/geneva.env` with `GENEVA_ARGS=...`, the
-   `OTEL_EXPORTER_OTLP_*` endpoint, and the strategy file via cloud-init.
-3. Enable `geneva-server.service`.
+1. Install the `.deb` for the target tag. `nftables` and `ethtool` come in as
+   dependencies, so cloud-init does not install them separately (the
+   `Dockerfile` bakes them into the image path instead).
+2. Write `/etc/geneva-server/geneva.env` with `GENEVA_ARGS=...` and the
+   `OTEL_EXPORTER_OTLP_*` endpoint, plus — in prod mode — the strategy file
+   `GENEVA_ARGS` names. Both must be readable by the `geneva-server` account
+   (`root:geneva-server`, mode `0640`); the unit's `ProtectSystem=strict` makes
+   all of `/etc` read-only to the process, so nothing else is needed to protect
+   them.
+3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
+   the sidecar stopped until the next boot.
+
+In eval mode the strategy file is optional: the sidecar starts in pass-through
+until the GA brain assigns a candidate over `PUT /strategy`.
 
 The nftables rules are runtime-owned: the sidecar creates its table on start and
 deletes it on stop, so provisioning must **not** install steering rules itself.

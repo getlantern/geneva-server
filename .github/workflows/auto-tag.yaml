@@ -1,0 +1,80 @@
+name: Auto-tag patch release
+
+on:
+  push:
+    branches: [main]
+    # Only changes that alter the shipped binary or its packaging. Docs, tests,
+    # the e2e harness and CI config produce an identical .deb, so they don't earn
+    # a version. Negations come last: later patterns win.
+    paths:
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+      - ".goreleaser.yaml"
+      - "deploy/**"
+      - "!**_test.go"
+      - "!e2e/**"
+      - "!deploy/README.md"
+
+permissions:
+  contents: write
+  actions: write
+
+# Serialize tag allocation. Two runs that read the same latest tag would compute
+# the same next one, and the loser's `git push` fails — leaving that change with
+# no tag and no release. cancel-in-progress stays false: a cancelled run is a
+# change that never gets a release, which is the failure we are avoiding.
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  auto-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Bump patch version
+        id: tag
+        run: |
+          set -euo pipefail
+          # Consider only tags that are exactly vN.N.N. Git accepts tag names
+          # containing shell metacharacters, and this value feeds both an
+          # arithmetic expansion and later command lines — so the grammar is
+          # enforced here rather than trusted.
+          latest=$(git tag -l 'v*' --sort=-v:refname \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | head -1 || true)
+          if [ -z "$latest" ]; then
+            next="v0.0.1"
+          else
+            version="${latest#v}"
+            major="${version%%.*}"
+            rest="${version#*.}"
+            minor="${rest%%.*}"
+            patch="${rest#*.}"
+            next="v${major}.${minor}.$((patch + 1))"
+          fi
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Bumping ${latest:-<none>} -> $next"
+
+      - name: Create and push tag
+        env:
+          # Through the environment, not string interpolation: the step output
+          # reaches the shell as a value rather than as script text.
+          NEXT: ${{ steps.tag.outputs.next }}
+        run: |
+          set -euo pipefail
+          git tag "$NEXT"
+          git push origin "$NEXT"
+
+      - name: Trigger release workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT: ${{ steps.tag.outputs.next }}
+        # A tag pushed with GITHUB_TOKEN does not trigger a workflow on its own,
+        # so the release is dispatched explicitly.
+        run: gh workflow run release.yaml --ref "$NEXT"
