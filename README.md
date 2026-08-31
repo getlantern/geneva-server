@@ -84,16 +84,63 @@ See [`deploy/`](deploy/) for the systemd unit and provisioning notes, and
 
 ## Control / health surface
 
-| Method + path   | Mode      | Purpose                                            |
-| --------------- | --------- | -------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine & verdict stats  |
-| `GET /metrics`  | both      | overhead measurements for the GA pre-screen        |
-| `GET /strategy` | both      | current strategy DNA                               |
-| `PUT /strategy` | both      | assign/replace the strategy in place (validated)   |
-| `GET /canary`   | eval only | per-market captured field-value pool               |
+The control surface carries only what has to be synchronous against one named
+box. Everything else is exported as metrics (below).
+
+| Method + path   | Mode      | Purpose                                                     |
+| --------------- | --------- | ----------------------------------------------------------- |
+| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
+| `GET /strategy` | both      | current strategy DNA                                        |
+| `PUT /strategy` | both      | assign/replace the strategy in place (validated)            |
+| `GET /canary`   | eval only | per-market captured field-value pool                        |
 
 `PUT /strategy` is unauthenticated, so keep `--control-addr` on a private
 interface (see [`deploy/`](deploy/)).
+
+## Metrics
+
+The sidecar exports OTLP metrics to the box's local collector, which forwards to
+the fleet's backend. It does not serve a scrape endpoint: the pipeline already
+exists, and a control plane SSH-ing to each box to read a counter neither scales
+with the pool nor aggregates across it. Export is opt-in via the standard
+`OTEL_EXPORTER_OTLP_*` environment variables — with none set, the sidecar runs
+with metrics disabled and builds no provider.
+
+Every series is labelled `geneva.mode` and, when the box's market is known,
+`geo.country.iso_code`. No label carries a strategy DNA or candidate id:
+candidate identity lives in the brain's tables behind opaque tokens, and a
+per-candidate label would leak it and make cardinality track population size.
+
+| Metric                        | Attributes            | Meaning                                        |
+| ----------------------------- | --------------------- | ---------------------------------------------- |
+| `geneva.engine.packets_in/out`, `geneva.engine.bytes_in/out` | — | volume through the engine |
+| `geneva.engine.outcomes`      | `geneva.outcome`      | unchanged / dropped / tampered / expanded      |
+| `geneva.engine.packet_overhead`, `geneva.engine.byte_overhead` | — | fan-out and expansion ratios |
+| `geneva.engine.errors`        | —                     | decode / apply failures (each one failed open) |
+| `geneva.runtime.verdicts`     | `geneva.verdict`      | accepted / dropped / modified                  |
+| `geneva.runtime.reinjections` | `geneva.reinjection`  | raw-socket reinjection ok / failed             |
+| `geneva.strategy_swaps`       | —                     | in-place strategy replacements                 |
+| `geneva.uptime`               | —                     | seconds since start                            |
+| `geneva.censor.inbound_tcp`   | `geneva.tcp_event`    | inbound TCP by flags/payload — see below       |
+
+### `geneva.censor.inbound_tcp` — the signal clients cannot send
+
+Clients report what they observe: a session's success and throughput. A
+connection the censor kills during the handshake produces **no report at all** —
+the client sees a dial failure, indistinguishable from never having dialled,
+from a routing fault, or from going offline. Silence is not evidence.
+
+The box sees the censor's work directly. `geneva.censor.inbound_tcp` counts
+inbound TCP packets on the steered port by `geneva.tcp_event` (`syn`, `rst`,
+`fin`, `ack_only`, `data`), so the `syn`-versus-`data` ratio per market is a
+usable estimate of the box's IP having been burned — and clean test-box IP
+supply is the binding cost of GA exploration, so that estimate is what an
+adaptive exploration posture budgets against. Injected resets show up as `rst`.
+
+The classifier is deliberately stateless — no per-flow table. Tracking handshake
+completion by 4-tuple would be a strictly better signal but means unbounded
+per-packet state on a box whose job is to stay out of the proxy's way; the ratio
+needs nothing but the current packet's header.
 
 ## Development
 

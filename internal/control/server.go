@@ -1,7 +1,15 @@
-// Package control exposes the sidecar's HTTP control and health surface. The GA
-// brain uses it to read health and overhead measurements (for provisioning and
-// pre-screening) and, in eval mode, to assign a candidate strategy and read the
-// per-market canary pool.
+// Package control exposes the sidecar's HTTP control and health surface: the
+// reads and writes that must happen synchronously, right now, against one named
+// box. The GA brain uses it to assign a candidate strategy, confirm the swap
+// landed, check liveness, read the overhead measurements the pre-screen gates
+// on, and (in eval mode) read the per-market canary pool.
+//
+// Everything that does not need to be synchronous is exported as OTLP metrics
+// instead (see internal/telemetry) and read from SigNoz, which aggregates
+// across the pool and outlives any single box. The engine snapshot stays on
+// /healthz because the pre-screen decides whether to keep a candidate within
+// seconds of self-dialling it, and the metrics pipeline's export interval plus
+// query lag is longer than that decision can wait.
 //
 // The surface is intentionally small and unauthenticated: it binds to a
 // control address the deployment keeps private (localhost or a management
@@ -31,6 +39,9 @@ type Providers struct {
 	// Verdicts returns the runtime's verdict counters (JSON-marshalable). It may
 	// be nil before the runtime starts.
 	Verdicts func() any
+	// InboundTCP returns the inbound TCP event counts (JSON-marshalable), the
+	// box-side censor-reachability signal. It may be nil.
+	InboundTCP func() any
 }
 
 // Server is the HTTP control surface.
@@ -48,7 +59,6 @@ func New(p Providers) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/strategy", s.handleStrategy)
 	mux.HandleFunc("/canary", s.handleCanary)
 	return mux
@@ -65,6 +75,10 @@ type healthResp struct {
 	Strategy string          `json:"strategy"`
 	Engine   engine.Snapshot `json:"engine"`
 	Verdicts any             `json:"verdicts,omitempty"`
+	// InboundTCP is reported here as well as over OTLP so the counters can be
+	// read on a box with no collector configured — during an e2e run, or when
+	// an operator is on the box asking whether its IP has been burned.
+	InboundTCP any `json:"inbound_tcp,omitempty"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -80,20 +94,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.p.Verdicts != nil {
 		resp.Verdicts = s.p.Verdicts()
 	}
+	if s.p.InboundTCP != nil {
+		resp.InboundTCP = s.p.InboundTCP()
+	}
 	writeJSON(w, http.StatusOK, resp)
-}
-
-// handleMetrics returns the overhead-focused view the GA pre-screen reads: how
-// much duplication/expansion the strategy adds, plus verdict counters.
-func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{
-		"mode":   s.p.Mode,
-		"engine": s.p.Engine.Snapshot(),
-	}
-	if s.p.Verdicts != nil {
-		out["verdicts"] = s.p.Verdicts()
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 // handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).

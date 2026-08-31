@@ -50,17 +50,28 @@ step "1. Normal service survives the strategy (payload integrity)"
   && pass "1 MiB payload received byte-for-byte through the duplicate strategy" \
   || fail "payload mismatch: the strategy corrupted normal service"
 
-step "Manipulation actually happened (control metrics)"
-metrics=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/metrics)
-echo "$metrics" | jq '{packets_in: .engine.packets_in, expanded: .engine.expanded, reinjected: .verdicts.reinjected, inject_fails: .verdicts.inject_fails}'
-pin=$(echo "$metrics" | jq '.engine.packets_in')
-exp=$(echo "$metrics" | jq '.engine.expanded')
-rei=$(echo "$metrics" | jq '.verdicts.reinjected')
-fails=$(echo "$metrics" | jq '.verdicts.inject_fails')
+step "Manipulation actually happened (health snapshot)"
+health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+echo "$health" | jq '{packets_in: .engine.packets_in, expanded: .engine.expanded, reinjected: .verdicts.reinjected, inject_fails: .verdicts.inject_fails}'
+pin=$(echo "$health" | jq '.engine.packets_in')
+exp=$(echo "$health" | jq '.engine.expanded')
+rei=$(echo "$health" | jq '.verdicts.reinjected')
+fails=$(echo "$health" | jq '.verdicts.inject_fails')
 [[ "$pin" -gt 0 ]]  && pass "packets entered the queue ($pin)"        || fail "no packets entered the queue"
 [[ "$exp" -gt 0 ]]  && pass "data packets were duplicated ($exp)"     || fail "strategy never fired"
 [[ "$rei" -gt 0 ]]  && pass "packets were reinjected ($rei)"          || fail "no reinjection occurred"
 [[ "$fails" -eq 0 ]] && pass "zero reinjection failures"              || fail "$fails reinjection failures"
+
+step "Inbound TCP classification (the censor-reachability signal)"
+echo "$health" | jq '.inbound_tcp'
+syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
+data=$(echo "$health" | jq '.inbound_tcp.events.data')
+undec=$(echo "$health" | jq '.inbound_tcp.undecodable')
+# The tester completed a real 1 MiB transfer, so the uncensored baseline is
+# syns followed by data. A burned box is the same shape with data at zero.
+[[ "$syn"   -gt 0 ]] && pass "inbound SYNs classified ($syn)"       || fail "no inbound SYNs classified"
+[[ "$data"  -gt 0 ]] && pass "inbound data segments classified ($data)" || fail "no inbound data classified"
+[[ "$undec" -eq 0 ]] && pass "every inbound packet was decodable"   || fail "$undec inbound packets undecodable"
 
 step "2. Steering is scoped to the proxy port only"
 ruleset=$("${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server)

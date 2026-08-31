@@ -79,6 +79,10 @@ type Stats struct {
 	Tampered   atomic.Uint64
 	Expanded   atomic.Uint64
 	Errors     atomic.Uint64
+	// Swaps counts strategies installed in place after the initial load, so a
+	// hot swap is observable without putting the DNA (or a candidate id) into a
+	// telemetry label.
+	Swaps atomic.Uint64
 }
 
 // Snapshot is a plain-value copy of Stats for serialization.
@@ -92,6 +96,7 @@ type Snapshot struct {
 	Tampered       uint64  `json:"tampered"`
 	Expanded       uint64  `json:"expanded"`
 	Errors         uint64  `json:"errors"`
+	Swaps          uint64  `json:"swaps"`
 	PacketOverhead float64 `json:"packet_overhead"`
 	ByteOverhead   float64 `json:"byte_overhead"`
 }
@@ -105,7 +110,7 @@ func (s *Stats) snapshot() Snapshot {
 		PacketsIn: in, PacketsOut: out, BytesIn: bin, BytesOut: bout,
 		Unchanged: s.Unchanged.Load(), Dropped: s.Dropped.Load(),
 		Tampered: s.Tampered.Load(), Expanded: s.Expanded.Load(),
-		Errors: s.Errors.Load(),
+		Errors: s.Errors.Load(), Swaps: s.Swaps.Load(),
 	}
 	if in > 0 {
 		snap.PacketOverhead = float64(out)/float64(in) - 1
@@ -152,8 +157,14 @@ func (e *Engine) SetStrategy(dna string) error {
 		return fmt.Errorf("validate strategy: %w", err)
 	}
 	e.mu.Lock()
+	// The initial load from New is not a swap, so the counter reads as the
+	// number of in-place replacements rather than of installs.
+	replaced := e.cur.Load() != nil
 	e.cur.Store(&loaded{dna: dna, s: s})
 	e.mu.Unlock()
+	if replaced {
+		e.Stats.Swaps.Add(1)
+	}
 	return nil
 }
 

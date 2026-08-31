@@ -7,7 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/getlantern/geneva/strategy"
+
 	"github.com/getlantern/geneva-server/internal/canary"
+	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/engine"
 )
 
@@ -160,4 +163,68 @@ func TestCanaryOnlyInEval(t *testing.T) {
 	if snap.Market != "RU" {
 		t.Fatalf("canary market = %q, want RU", snap.Market)
 	}
+}
+
+// TestMetricsEndpointGone pins the removal: the overhead numbers now ship over
+// OTLP and are read from SigNoz, and /healthz carries the synchronous copy the
+// pre-screen needs. A reintroduced /metrics would quietly re-create the
+// scrape-every-box path this replaced.
+func TestMetricsEndpointGone(t *testing.T) {
+	srv := newTestServer(t, "prod", `[TCP:flags:R]-drop-| \/`, false)
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET /metrics status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestHealthzReportsInboundTCP(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatalf("engine: %v", err)
+	}
+	obs := censor.New()
+	// One inbound SYN, so the reported counts are non-trivially populated.
+	obs.Observe(synPacket(t), strategy.DirectionInbound)
+
+	srv := httptest.NewServer(New(Providers{
+		Mode:       "eval",
+		Engine:     eng,
+		InboundTCP: func() any { return obs.Snapshot() },
+	}).Handler())
+	t.Cleanup(srv.Close)
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var body struct {
+		InboundTCP censor.Snapshot `json:"inbound_tcp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if got := body.InboundTCP.Events["syn"]; got != 1 {
+		t.Fatalf("inbound_tcp syn = %d, want 1", got)
+	}
+	if body.InboundTCP.Undecodable != 0 {
+		t.Fatalf("undecodable = %d, want 0", body.InboundTCP.Undecodable)
+	}
+}
+
+// synPacket builds a minimal inbound IPv4/TCP SYN.
+func synPacket(t *testing.T) []byte {
+	t.Helper()
+	pkt := make([]byte, 40)
+	pkt[0] = 0x45 // IPv4, 5-word header
+	pkt[2], pkt[3] = 0, 40
+	pkt[9] = 6          // TCP
+	pkt[20+12] = 5 << 4 // 5-word TCP header
+	pkt[20+13] = 1 << 1 // SYN
+	return pkt
 }

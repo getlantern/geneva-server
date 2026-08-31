@@ -74,13 +74,41 @@ network ACLs — never the public interface.
 
 Bind `--control-addr` to a private address (localhost or a management network).
 
-| Method + path   | Mode      | Purpose                                             |
-| --------------- | --------- | --------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine & verdict stats   |
-| `GET /metrics`  | both      | overhead measurements for GA pre-screen             |
-| `GET /strategy` | both      | current strategy DNA                                |
-| `PUT /strategy` | both      | assign/replace the strategy in place (validated)    |
-| `GET /canary`   | eval only | per-market captured field-value pool                |
+| Method + path   | Mode      | Purpose                                                     |
+| --------------- | --------- | ----------------------------------------------------------- |
+| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
+| `GET /strategy` | both      | current strategy DNA                                        |
+| `PUT /strategy` | both      | assign/replace the strategy in place (validated)            |
+| `GET /canary`   | eval only | per-market captured field-value pool                        |
+
+There is no scrape endpoint. Counters are exported as OTLP metrics to the box's
+local collector and read from the fleet's backend (see "Metric export" below);
+the surface here is only what a caller needs synchronously against one named
+box. `/healthz` keeps the engine snapshot because the GA pre-screen decides
+whether to keep a candidate within seconds of self-dialling it, which is shorter
+than an export interval plus query lag.
+
+## Metric export
+
+Export is opt-in via the standard `OTEL_EXPORTER_OTLP_*` environment variables,
+set in `/etc/geneva-server/geneva.env` alongside `GENEVA_ARGS`. With no endpoint
+configured the sidecar starts normally with metrics disabled — a box whose
+collector is not up yet still steers traffic.
+
+```sh
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://127.0.0.1:4318/v1/metrics
+OTEL_RESOURCE_ATTRIBUTES=deployment.environment=prod,host.name=<box>
+```
+
+Use an **IPv4 literal**, not `localhost`: the systemd unit's
+`RestrictAddressFamilies` deliberately omits `AF_INET6`, and `localhost` can
+resolve to `::1`.
+
+`service.name` is `geneva-server` and `service.version` is the build's VCS
+revision; both can be overridden through `OTEL_SERVICE_NAME` /
+`OTEL_RESOURCE_ATTRIBUTES`. Counters export with **delta** temporality, matching
+the rest of the fleet — a test box being torn down and replaced (which happens
+continuously as IPs burn) then reads as a series ending, not as a negative jump.
 
 ## Provisioning notes (bandit VPS)
 
@@ -88,8 +116,8 @@ Mirror the `lantern-box` provisioning flow:
 
 1. Install `nftables` and `ethtool` in `provision.sh` (or bake them into the
    image — the `Dockerfile` already does).
-2. Write `/etc/geneva-server/geneva.env` with `GENEVA_ARGS=...` and the strategy
-   file via cloud-init.
+2. Write `/etc/geneva-server/geneva.env` with `GENEVA_ARGS=...`, the
+   `OTEL_EXPORTER_OTLP_*` endpoint, and the strategy file via cloud-init.
 3. Enable `geneva-server.service`.
 
 The nftables rules are runtime-owned: the sidecar creates its table on start and

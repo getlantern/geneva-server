@@ -25,11 +25,17 @@ ProtectHome=true
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelTunables=true
+# AF_INET covers both the raw reinjection socket and the OTLP metric export.
+# AF_INET6 is deliberately absent, so OTEL_EXPORTER_OTLP_ENDPOINT must name an
+# IPv4 literal (127.0.0.1:4318, not "localhost", which can resolve to ::1).
 RestrictAddressFamilies=AF_INET AF_NETLINK
 ReadOnlyPaths=/etc/geneva-server
 
 # Configuration is written by the deployment's cloud-init before start:
 #   GENEVA_ARGS holds the run flags (mode, strategy-file, port, iface, ...).
+#   OTEL_EXPORTER_OTLP_* / OTEL_RESOURCE_ATTRIBUTES point metric export at the
+#   box's local collector. With no OTLP endpoint set the sidecar runs with
+#   metrics disabled rather than failing to start.
 EnvironmentFile=/etc/geneva-server/geneva.env
 ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
 

@@ -266,3 +266,31 @@ func TestOverheadMetrics(t *testing.T) {
 		t.Fatalf("packet overhead = %v, want 1.0", snap.PacketOverhead)
 	}
 }
+
+// TestSwapsCountsReplacementsOnly pins the counter's meaning: the metric is the
+// number of in-place strategy replacements, so the initial load from New must
+// not register as one.
+func TestSwapsCountsReplacementsOnly(t *testing.T) {
+	eng, err := New(`[TCP:flags:PA]-duplicate-| \/`)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := eng.Snapshot().Swaps; got != 0 {
+		t.Fatalf("Swaps after New = %d, want 0", got)
+	}
+
+	if err := eng.SetStrategy(`[TCP:flags:R]-drop-| \/`); err != nil {
+		t.Fatalf("SetStrategy: %v", err)
+	}
+	if got := eng.Snapshot().Swaps; got != 1 {
+		t.Fatalf("Swaps after one swap = %d, want 1", got)
+	}
+
+	// A rejected DNA leaves the installed strategy alone, so it is not a swap.
+	if err := eng.SetStrategy("this is not a strategy"); err == nil {
+		t.Fatal("SetStrategy accepted invalid DNA")
+	}
+	if got := eng.Snapshot().Swaps; got != 1 {
+		t.Fatalf("Swaps after a rejected swap = %d, want 1", got)
+	}
+}
