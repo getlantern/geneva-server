@@ -165,10 +165,15 @@ func (o *runCmd) validate() error {
 	if o.OutQueue == o.InQueue {
 		return fmt.Errorf("--out-queue and --in-queue must differ")
 	}
-	if !o.NoNFT && o.Mark == 0 {
-		// A zero mark would make the "accept marked packets" rule match every
-		// unmarked packet (mark defaults to 0), so the proxy's traffic would be
-		// accepted before the queue rule and nothing would ever be steered.
+	if o.Mark == 0 {
+		// Required whether or not this process programs the rules. With internal
+		// rules, a zero mark makes the "accept marked packets" rule match every
+		// unmarked packet (mark defaults to 0), so the proxy's traffic is
+		// accepted before the queue rule and nothing is ever steered. With
+		// --no-nft the mark is still what the reinjector stamps via SO_MARK, and
+		// it is the only thing an externally managed ruleset can use to tell a
+		// reinjected packet from an original one — a zero mark there means
+		// reinjected packets are re-queued forever.
 		return fmt.Errorf("--mark must be non-zero")
 	}
 	return nil

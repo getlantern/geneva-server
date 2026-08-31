@@ -16,10 +16,10 @@ func TestRulesetScoping(t *testing.T) {
 	// direction — nothing else may be diverted into the queues.
 	wants := []string{
 		"table inet geneva_test {",
-		"tcp sport 8080 queue num 100 bypass", // egress
-		"tcp dport 8080 queue num 101 bypass", // ingress
-		"meta mark 0x67656e accept",           // reinjection loop guard
-		"policy accept;",                      // fail-open chain policy
+		"meta nfproto ipv4 meta l4proto tcp tcp sport 8080 queue num 100 bypass", // egress
+		"meta nfproto ipv4 meta l4proto tcp tcp dport 8080 queue num 101 bypass", // ingress
+		"meta mark 0x67656e accept", // reinjection loop guard
+		"policy accept;",            // fail-open chain policy
 	}
 	for _, w := range wants {
 		if !strings.Contains(rs, w) {
@@ -29,6 +29,15 @@ func TestRulesetScoping(t *testing.T) {
 	// It must not steer UDP or any other port.
 	if strings.Contains(rs, "udp") {
 		t.Errorf("ruleset unexpectedly references udp:\n%s", rs)
+	}
+	// The table family is inet, which sees IPv6 too. The engine and the
+	// reinjector are IPv4-only, so every queue rule must carry the nfproto
+	// guard — without it, IPv6 TCP on the proxy's port takes a userspace round
+	// trip only to fail open.
+	for _, line := range strings.Split(rs, "\n") {
+		if strings.Contains(line, "queue num") && !strings.Contains(line, "meta nfproto ipv4") {
+			t.Errorf("queue rule not scoped to IPv4: %q", strings.TrimSpace(line))
+		}
 	}
 }
 

@@ -7,7 +7,10 @@
 // it owns atomically, and the table name is disjoint from any other subsystem's.
 //
 // The steering is scoped to one TCP port in each direction — the proxy's
-// listening port — so only that proxy's ingress/egress is diverted. Reinjected
+// listening port — and to IPv4. The table family is `inet`, which sees both
+// address families, so the queue rules match `meta nfproto ipv4` explicitly:
+// the engine and the reinjector are IPv4-only, so queueing IPv6 would spend
+// userspace round trips on packets the engine can only fail open on. Reinjected
 // packets carry a firewall mark and are accepted before the queue rule, which
 // prevents the raw-socket reinjection loop. Both queue rules use `bypass`, so if
 // the sidecar dies the kernel accepts the packets instead of dropping them: a
@@ -63,12 +66,12 @@ func (m *Manager) Ruleset() string {
 	fmt.Fprintf(&b, "\tchain output {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook output priority 0; policy accept;\n")
 	fmt.Fprintf(&b, "\t\tmeta mark %#x accept\n", m.cfg.Mark)
-	fmt.Fprintf(&b, "\t\tmeta l4proto tcp tcp sport %d queue num %d bypass\n", m.cfg.Port, m.cfg.OutQueue)
+	fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp sport %d queue num %d bypass\n", m.cfg.Port, m.cfg.OutQueue)
 	fmt.Fprintf(&b, "\t}\n")
 	// Ingress (inbound): packets arriving for the proxy's Port.
 	fmt.Fprintf(&b, "\tchain input {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook input priority 0; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tmeta l4proto tcp tcp dport %d queue num %d bypass\n", m.cfg.Port, m.cfg.InQueue)
+	fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d queue num %d bypass\n", m.cfg.Port, m.cfg.InQueue)
 	fmt.Fprintf(&b, "\t}\n")
 	fmt.Fprintf(&b, "}\n")
 	return b.String()

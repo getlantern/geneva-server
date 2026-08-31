@@ -40,3 +40,21 @@ func TestMarkFlagUnmarshalText(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateRequiresNonZeroMark pins that the mark is required even with
+// --no-nft. The mark is what the reinjector stamps via SO_MARK, and with rules
+// managed externally it is the only thing that ruleset can use to tell a
+// reinjected packet from an original one — at zero, reinjected packets are
+// re-queued forever.
+func TestValidateRequiresNonZeroMark(t *testing.T) {
+	for _, noNFT := range []bool{false, true} {
+		o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, NoNFT: noNFT}
+		if err := o.validate(); err == nil {
+			t.Errorf("validate accepted --mark=0 with --no-nft=%v", noNFT)
+		}
+		o.Mark = 0x67656e
+		if err := o.validate(); err != nil {
+			t.Errorf("validate rejected a valid config with --no-nft=%v: %v", noNFT, err)
+		}
+	}
+}
