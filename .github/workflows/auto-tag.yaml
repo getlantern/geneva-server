@@ -3,15 +3,18 @@ name: Auto-tag patch release
 on:
   push:
     branches: [main]
-    # Only changes that alter the shipped binary or its packaging. Docs, e2e
-    # harness and CI config produce an identical .deb, so they don't earn a
-    # version.
+    # Only changes that alter the shipped binary or its packaging. Docs, tests,
+    # the e2e harness and CI config produce an identical .deb, so they don't earn
+    # a version. Negations come last: later patterns win.
     paths:
       - "**.go"
       - "go.mod"
       - "go.sum"
       - ".goreleaser.yaml"
       - "deploy/**"
+      - "!**_test.go"
+      - "!e2e/**"
+      - "!deploy/README.md"
 
 permissions:
   contents: write

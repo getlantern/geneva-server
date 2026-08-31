@@ -129,7 +129,9 @@ The unit ships **disabled**: it cannot start until the deployment has written
 `/etc/geneva-server/geneva.env`, and in prod mode the strategy file it names. So
 install, write the config, then `systemctl enable --now geneva-server`.
 
-`main` auto-tags a patch release on any change to the binary or its packaging.
+`main` auto-tags a patch release on any change to the binary or its packaging
+(the workflow's path filter excludes tests, the e2e harness and this file, since
+those produce an identical package).
 The tag is pushed before the release build runs, so the newest tag is
 installable only once its release workflow has published — during a build, or
 after a failed one, the tag can exist with no assets. Assets are never
