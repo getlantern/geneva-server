@@ -13,10 +13,25 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
+      # GoReleaser runs in publishing mode, which requires a release tag. A
+      # workflow_dispatch can name a branch, so refuse that up front rather than
+      # failing several minutes into a build.
+      - name: Require a tag ref
+        run: |
+          set -euo pipefail
+          case "${{ github.ref }}" in
+            refs/tags/v*) ;;
+            *) echo "release.yaml must run on a v* tag, got ${{ github.ref }}" >&2; exit 1 ;;
+          esac
+
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0 # goreleaser derives the version from the tag history
+          # This job pushes nothing; GoReleaser gets the token explicitly. Not
+          # leaving credentials in the checkout's git config keeps them out of
+          # anything that runs later in the job.
+          persist-credentials: false
 
       - uses: actions/setup-go@v6
         with:

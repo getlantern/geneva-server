@@ -53,6 +53,12 @@ nfpms:
     dependencies:
       - nftables
       - ethtool
+    # preinstall runs addgroup/adduser before the package's files are unpacked,
+    # so adduser has to be fully configured by then — a plain dependency is only
+    # guaranteed to be unpacked.
+    deb:
+      predepends:
+        - adduser
     contents:
       - src: deploy/geneva-server.service
         dst: /usr/lib/systemd/system/geneva-server.service
