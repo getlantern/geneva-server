@@ -129,9 +129,12 @@ The unit ships **disabled**: it cannot start until the deployment has written
 `/etc/geneva-server/geneva.env`, and in prod mode the strategy file it names. So
 install, write the config, then `systemctl enable --now geneva-server`.
 
-`main` auto-tags a patch release on any change to the binary or its packaging,
-so the newest tag is always installable; there is no mutable "latest" asset to
-pin against.
+`main` auto-tags a patch release on any change to the binary or its packaging.
+The tag is pushed before the release build runs, so the newest tag is
+installable only once its release workflow has published — during a build, or
+after a failed one, the tag can exist with no assets. Assets are never
+overwritten, so a published tag stays installable forever; there is no mutable
+"latest" asset to pin against.
 
 ## Provisioning notes (bandit VPS)
 
@@ -146,7 +149,8 @@ Mirror the `lantern-box` provisioning flow:
    (`root:geneva-server`, mode `0640`); the unit's `ProtectSystem=strict` makes
    all of `/etc` read-only to the process, so nothing else is needed to protect
    them.
-3. Enable `geneva-server.service`.
+3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
+   the sidecar stopped until the next boot.
 
 In eval mode the strategy file is optional: the sidecar starts in pass-through
 until the GA brain assigns a candidate over `PUT /strategy`.
