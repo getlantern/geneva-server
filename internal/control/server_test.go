@@ -212,8 +212,8 @@ func TestHealthzReportsInboundTCP(t *testing.T) {
 	if got := body.InboundTCP.Events["syn"]; got != 1 {
 		t.Fatalf("inbound_tcp syn = %d, want 1", got)
 	}
-	if body.InboundTCP.Undecodable != 0 {
-		t.Fatalf("undecodable = %d, want 0", body.InboundTCP.Undecodable)
+	if got := body.InboundTCP.Events["undecodable"]; got != 0 {
+		t.Fatalf("undecodable = %d, want 0", got)
 	}
 }
 

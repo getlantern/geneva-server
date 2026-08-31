@@ -24,10 +24,15 @@ import (
 // keep packets MTU-sized; checksum/scatter-gather offloads keep checksums real.
 var offloadFeatures = []string{"gso", "tso", "gro", "gre", "tx", "rx", "sg", "lro", "ufo"}
 
-// DisableOffload turns off segmentation and checksum offloads on iface. It never
-// fails the caller: unchangeable features are reported in the returned summary
-// but do not produce an error, because the ones that matter on a given
-// interface are typically changeable and the rest are already effectively off.
+// DisableOffload turns off segmentation and checksum offloads on iface.
+//
+// Individual features that cannot be changed are reported in the returned
+// summary rather than as an error: some virtual interfaces expose a subset as
+// fixed, and the ones that matter on a given interface are typically
+// changeable. Three conditions are hard errors — a missing ethtool, a missing
+// interface, and no feature changeable at all — because each of them means
+// NFQUEUE would go on receiving GSO/checksum-offloaded packets that cannot be
+// reinjected intact.
 func DisableOffload(ctx context.Context, ethtoolPath, iface string) (string, error) {
 	if ethtoolPath == "" {
 		ethtoolPath = "ethtool"

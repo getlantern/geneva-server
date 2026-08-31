@@ -93,6 +93,7 @@ func Register(p Providers) error {
 	tcpEvents := []censor.Event{
 		censor.EventRST, censor.EventSYN, censor.EventFIN,
 		censor.EventData, censor.EventACKOnly,
+		censor.EventFragment, censor.EventUndecodable,
 	}
 	tcpAttrs := make([]metric.MeasurementOption, 0, len(tcpEvents))
 	for _, e := range tcpEvents {

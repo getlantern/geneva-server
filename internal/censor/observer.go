@@ -44,6 +44,16 @@ const (
 	EventData
 	// EventACKOnly is a bare acknowledgement.
 	EventACKOnly
+	// EventFragment is a non-initial IPv4 fragment: legitimate traffic that
+	// carries no TCP header of its own, so it cannot be classified further.
+	// Inbound fragmentation is worth counting in its own right — it is a censor
+	// evasion and a middlebox behaviour, not something a normal proxy flow
+	// produces.
+	EventFragment
+	// EventUndecodable is a packet whose IPv4/TCP headers could not be read. A
+	// nonzero count means the steering rules are delivering something other
+	// than what this observer assumes, not that a censor did anything.
+	EventUndecodable
 
 	eventCount
 )
@@ -60,6 +70,10 @@ func (e Event) String() string {
 		return "data"
 	case EventACKOnly:
 		return "ack_only"
+	case EventFragment:
+		return "fragment"
+	case EventUndecodable:
+		return "undecodable"
 	default:
 		return "unknown"
 	}
@@ -69,10 +83,6 @@ func (e Event) String() string {
 // Observer interface and is safe for concurrent use.
 type Observer struct {
 	counts [eventCount]atomic.Uint64
-	// undecodable counts inbound packets whose IPv4/TCP headers could not be
-	// read. A nonzero value means the steering rules are delivering something
-	// other than what this observer assumes, not that a censor did anything.
-	undecodable atomic.Uint64
 }
 
 // New returns an Observer with zeroed counters.
@@ -85,12 +95,10 @@ func (o *Observer) Observe(raw []byte, dir strategy.Direction) {
 	if dir != strategy.DirectionInbound {
 		return
 	}
-	ev, ok := classify(raw)
-	if !ok {
-		o.undecodable.Add(1)
-		return
-	}
-	o.counts[ev].Add(1)
+	// Every inbound packet lands in exactly one bucket, fragments and
+	// unreadable headers included, so the counts sum to everything observed and
+	// a ratio between two of them means what it appears to mean.
+	o.counts[classify(raw)].Add(1)
 }
 
 // Snapshot is a value copy of the counters.
@@ -98,8 +106,6 @@ type Snapshot struct {
 	// Events maps each event's name to its count. Every event is present, so a
 	// zero is reported as zero rather than as a missing series.
 	Events map[string]uint64 `json:"events"`
-	// Undecodable counts inbound packets whose headers could not be parsed.
-	Undecodable uint64 `json:"undecodable"`
 }
 
 // Snapshot returns the current counts.
@@ -108,7 +114,6 @@ func (o *Observer) Snapshot() Snapshot {
 	for e := Event(0); e < eventCount; e++ {
 		s.Events[e.String()] = o.counts[e].Load()
 	}
-	s.Undecodable = o.undecodable.Load()
 	return s
 }
 
@@ -132,18 +137,25 @@ const (
 // packet in prod mode as well as eval, where the engine may not otherwise
 // decode anything; a hand-rolled read of four fields allocates nothing and
 // keeps the observer off the proxy's latency budget.
-func classify(raw []byte) (Event, bool) {
+func classify(raw []byte) Event {
 	// IPv4 header: version/IHL, then total length at 2:4, protocol at 9.
 	if len(raw) < 20 || raw[0]>>4 != 4 {
-		return 0, false
+		return EventUndecodable
 	}
 	ihl := int(raw[0]&0x0f) * 4
 	if ihl < 20 || len(raw) < ihl {
-		return 0, false
+		return EventUndecodable
 	}
 	const protoTCP = 6
 	if raw[9] != protoTCP {
-		return 0, false
+		return EventUndecodable
+	}
+	// Only the first fragment of a fragmented datagram carries the TCP header;
+	// the protocol field still reads TCP on the rest, so without this check the
+	// bytes at ihl would be payload read as flags and a data offset.
+	fragOffset := int(raw[6]&0x1f)<<8 | int(raw[7])
+	if fragOffset != 0 {
+		return EventFragment
 	}
 	totalLen := int(raw[2])<<8 | int(raw[3])
 	// Trust the shorter of the header's claim and the bytes actually delivered:
@@ -155,24 +167,24 @@ func classify(raw []byte) (Event, bool) {
 
 	tcp := raw[ihl:]
 	if len(tcp) < 20 {
-		return 0, false
+		return EventUndecodable
 	}
 	dataOff := int(tcp[12]>>4) * 4
 	if dataOff < 20 || ihl+dataOff > totalLen {
-		return 0, false
+		return EventUndecodable
 	}
 	flags := tcp[13]
 
 	switch {
 	case flags&flagRST != 0:
-		return EventRST, true
+		return EventRST
 	case flags&flagSYN != 0:
-		return EventSYN, true
+		return EventSYN
 	case flags&flagFIN != 0:
-		return EventFIN, true
+		return EventFIN
 	case totalLen-ihl-dataOff > 0:
-		return EventData, true
+		return EventData
 	default:
-		return EventACKOnly, true
+		return EventACKOnly
 	}
 }

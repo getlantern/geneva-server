@@ -165,7 +165,10 @@ func (rt *Runtime) hook(q *nfq.Nfqueue, dir strategy.Direction) nfq.HookFunc {
 		}
 		id := *a.PacketID
 		if a.Payload == nil || len(*a.Payload) == 0 {
-			_ = q.SetVerdict(id, nfq.NfAccept)
+			// Counted like any other accept: this path is indistinguishable from
+			// a pass-through as far as the flow is concerned, and leaving it out
+			// makes the verdict counters undercount what was actually accepted.
+			rt.accept(q, id)
 			return 0
 		}
 		raw := *a.Payload

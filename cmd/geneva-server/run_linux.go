@@ -26,7 +26,16 @@ import (
 // slogLogger adapts slog to the runtime's Debugf/Errorf logger.
 type slogLogger struct{ l *slog.Logger }
 
-func (s slogLogger) Debugf(f string, a ...any) { s.l.Debug(fmt.Sprintf(f, a...)) }
+// Debugf checks the level before formatting. The runtime's debug path is the
+// NFQUEUE read timeout, which fires continuously on an idle queue, so at the
+// default Info level the Sprintf would be pure waste on every tick.
+func (s slogLogger) Debugf(f string, a ...any) {
+	if !s.l.Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+	s.l.Debug(fmt.Sprintf(f, a...))
+}
+
 func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
 
 func runServer(o *runCmd) error {

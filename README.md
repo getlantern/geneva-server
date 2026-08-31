@@ -132,10 +132,19 @@ from a routing fault, or from going offline. Silence is not evidence.
 
 The box sees the censor's work directly. `geneva.censor.inbound_tcp` counts
 inbound TCP packets on the steered port by `geneva.tcp_event` (`syn`, `rst`,
-`fin`, `ack_only`, `data`), so the `syn`-versus-`data` ratio per market is a
-usable estimate of the box's IP having been burned — and clean test-box IP
+`fin`, `ack_only`, `data`, plus `fragment` for non-initial IPv4 fragments and
+`undecodable` for headers that could not be read), so the `syn`-versus-`data`
+ratio per market is a usable estimate of the box's IP having been burned — and clean test-box IP
 supply is the binding cost of GA exploration, so that estimate is what an
 adaptive exploration posture budgets against. Injected resets show up as `rst`.
+
+Every inbound packet increments exactly one bucket — fragments and unreadable
+headers included — so the counts sum to everything observed and a ratio between
+two of them means what it appears to mean. `fragment` is worth watching in its
+own right: inbound fragmentation is a censor evasion and a middlebox behaviour,
+not something a normal proxy flow produces. A nonzero `undecodable` means the
+steering rules are delivering something other than IPv4/TCP, not that a censor
+did anything.
 
 The classifier is deliberately stateless — no per-flow table. Tracking handshake
 completion by 4-tuple would be a strictly better signal but means unbounded

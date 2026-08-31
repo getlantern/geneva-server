@@ -66,7 +66,7 @@ step "Inbound TCP classification (the censor-reachability signal)"
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
 data=$(echo "$health" | jq '.inbound_tcp.events.data')
-undec=$(echo "$health" | jq '.inbound_tcp.undecodable')
+undec=$(echo "$health" | jq '.inbound_tcp.events.undecodable')
 # The tester completed a real 1 MiB transfer, so the uncensored baseline is
 # syns followed by data. A burned box is the same shape with data at zero.
 [[ "$syn"   -gt 0 ]] && pass "inbound SYNs classified ($syn)"       || fail "no inbound SYNs classified"
