@@ -61,7 +61,7 @@ type runCmd struct {
 	CanaryCapacity int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
 	NFTPath        string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
 	NoNFT          bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
-	ObserveInbound bool     `arg:"--observe-inbound" help:"keep inbound packets flowing through userspace while a strategy is loaded, for the censor-reachability signal; costs a userspace round trip per inbound packet"`
+	ObserveInbound bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
 	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
 	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
 	PprofAddr      string   `arg:"--pprof-addr" help:"debug only: serve net/http/pprof on this address; never enable on a box carrying client traffic"`
@@ -168,6 +168,28 @@ func (o *runCmd) resolveStrategy() (string, error) {
 func (o *runCmd) validate() error {
 	if o.Mode != "prod" && o.Mode != "eval" {
 		return fmt.Errorf("invalid --mode %q (want prod or eval)", o.Mode)
+	}
+	if o.ObserveInbound && o.Mode == "prod" {
+		// Refused rather than warned about, because the cost lands on real
+		// users and the benefit does not need their traffic.
+		//
+		// Observing inbound means a userspace round trip for every inbound
+		// packet, whether or not the strategy can act on one. Measured on a
+		// 1-vCPU box: free where clients download (the inbound direction is
+		// only stretch-ACKs) but -40% where they upload, and a prod box does
+		// not get to choose which its users do. What it buys is the
+		// censor-reachability signal, which is an inference from a
+		// SYN-to-data ratio — and an eval box, which carries no client
+		// traffic, produces that same signal for nothing.
+		//
+		// A prod box that genuinely needs inbound packets in userspace has a
+		// precise way to ask: give its strategy an inbound tree. Steering then
+		// follows the strategy, and the packets are queued because something
+		// actually acts on them rather than because a flag was set. An inbound
+		// pass-through tree is spelled `\/ [TCP:flags:A*]-send-|`.
+		return fmt.Errorf("--observe-inbound is not available in prod mode: it costs a userspace round trip " +
+			"per inbound packet (measured up to -40%% on upload-heavy traffic) for a signal an eval box " +
+			"provides for free; to steer inbound on a prod box, give the strategy an inbound tree")
 	}
 	if o.OutQueue == o.InQueue {
 		return fmt.Errorf("--out-queue and --in-queue must differ")

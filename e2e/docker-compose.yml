@@ -44,10 +44,6 @@ services:
       - "--port=8080"
       - "--iface=eth0"
       - "--control-addr=0.0.0.0:8092"
-      # The strategy under test is outbound-only, so inbound traffic is not
-      # steered for its sake. The censor-reachability assertions need inbound
-      # packets to classify, which is exactly what this flag is for.
-      - "--observe-inbound"
 
   tester:
     image: geneva-e2e/echo:latest

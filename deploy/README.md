@@ -212,17 +212,29 @@ Both should be zero. A nonzero `overruns` means the strategy cannot keep up with
 the packet rate on this box; a nonzero `truncated` means the copy length is too
 small for its traffic.
 
-### `--observe-inbound`
+### `--observe-inbound` (eval mode only)
 
 The censor-reachability signal (inbound SYN-to-data ratio, the estimate of a
 box's IP being burned) needs inbound packets in userspace, which a strategy that
 only acts outbound would not otherwise ask for. `--observe-inbound` keeps inbound
-flowing while a strategy is loaded. It is off by default, and it never overrides
-the no-strategy case: an idle sidecar stays off the data path.
+flowing while a strategy is loaded. It is off by default, it never overrides the
+no-strategy case (an idle sidecar stays off the data path), and **it is refused
+outright in prod mode** — the sidecar exits at startup rather than warning.
 
-**What it costs depends entirely on which way the box's bulk traffic runs**, and
-the difference is large. The cost is one round trip per *inbound* packet, so it
-tracks the inbound packet rate, not the byte rate:
+**A prod box that needs inbound packets in userspace asks for them through its
+strategy**, by giving it an inbound tree; steering then follows the strategy, so
+the packets are queued because something acts on them rather than because a flag
+was set. An inbound pass-through tree is spelled `\/ [TCP:flags:A*]-send-|`.
+
+Note what that implies for the signal: it is only as complete as the strategy's
+inbound triggers. The burn estimate is a SYN-to-data ratio, and an `A*` tree
+never matches a client SYN — so a strategy that wants the full signal needs both,
+as e2e/strategy.txt does: `\/ [TCP:flags:S]-send-|[TCP:flags:A*]-send-|`.
+
+**Why prod cannot have the flag.** The cost is one round trip per *inbound*
+packet, so it tracks the inbound packet rate, not the byte rate — which makes it
+almost free or ruinous depending on which way the box's bulk traffic runs, and a
+prod box does not get to choose which its users generate:
 
 | Workload | without | with | |
 | --- | --- | --- | --- |
@@ -236,5 +248,5 @@ per ~33 outbound data packets — so observing it is free. An upload's inbound
 direction is the bulk stream, and then every packet pays.
 
 An eval box carries no client traffic at all, so turning it on there costs
-nothing worth counting. On a prod box, decide by direction: it is close to free
-where clients mostly download, and expensive where they mostly upload.
+nothing worth counting — which is the other half of the argument for the mode
+gate: the box that can afford the signal is the box that produces it for free.

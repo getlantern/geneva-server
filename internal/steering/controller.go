@@ -27,6 +27,10 @@ func (nopLogger) Errorf(string, ...any) {}
 
 // Config describes the box the controller steers on.
 type Config struct {
+	// Mode is GenevaModeProd or GenevaModeEval, spelled as the flag spells it.
+	// The controller needs it because one behaviour is mode-gated: see
+	// ObserveInbound.
+	Mode        string
 	Table       string
 	Port        uint16
 	OutQueue    uint16
@@ -43,7 +47,7 @@ type Config struct {
 	NoNFT bool
 	// ObserveInbound keeps every inbound packet flowing through userspace while
 	// a strategy is loaded, even when that strategy's triggers cannot act on
-	// inbound traffic at all.
+	// inbound traffic at all. Honoured in eval mode only.
 	//
 	// It buys the censor-reachability signal (internal/censor), whose
 	// inbound-SYN-to-inbound-data ratio is the only estimate we have of a box's
@@ -224,17 +228,31 @@ func (c *Controller) Close(ctx context.Context) error {
 	return nil
 }
 
-// widen applies the observation floor: with ObserveInbound set, a strategy that
-// is doing anything at all also keeps inbound traffic visible to the censor
-// classifier. An idle strategy is left idle — a box with nothing to apply stays
-// off the data path, which is the whole point of scoping.
+// widen applies the observation floor: on an eval box with ObserveInbound set, a
+// strategy that is doing anything at all also keeps inbound traffic visible to
+// the censor classifier.
+//
+// Two things it deliberately will not do. An idle strategy is left idle — a box
+// with nothing to apply stays off the data path, which is the whole point of
+// scoping. And in prod mode the floor is never applied, even if the flag
+// somehow arrives set: the cost is a userspace round trip per inbound packet
+// (measured free on download-heavy traffic but -40% on upload-heavy, and a prod
+// box does not get to choose which its users generate) in exchange for a signal
+// an eval box produces for free. main.go refuses the combination at startup;
+// this is the second lock, for a Controller built by something other than the
+// CLI. A prod box that needs inbound packets in userspace asks precisely, by
+// giving its strategy an inbound tree.
 func (c *Controller) widen(sc Scope) Scope {
-	if !c.cfg.ObserveInbound || sc.Idle() {
+	if !c.cfg.ObserveInbound || c.cfg.Mode != modeEval || sc.Idle() {
 		return sc
 	}
 	sc.Inbound = nftables.Selector{Any: true}
 	return sc
 }
+
+// modeEval is the eval-mode spelling shared with the CLI and the API. Kept
+// local rather than imported so this package does not depend on the command.
+const modeEval = "eval"
 
 // program makes the kernel match desired, replacing the table wholesale. An
 // idle scope removes it.

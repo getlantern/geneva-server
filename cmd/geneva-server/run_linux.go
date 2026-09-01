@@ -86,6 +86,7 @@ func runServer(o *runCmd) error {
 	// strategy can match nothing — which is what keeps an unassigned eval box
 	// and a rolled-back prod box off the data path entirely.
 	ctrl := steering.New(eng, steering.Config{
+		Mode:        o.Mode,
 		Table:       o.Table,
 		Port:        o.Port,
 		OutQueue:    o.OutQueue,

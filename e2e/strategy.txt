@@ -1,1 +1,1 @@
-[TCP:flags:PA]-duplicate-| \/
+[TCP:flags:PA]-duplicate-| \/ [TCP:flags:S]-send-|[TCP:flags:A*]-send-|

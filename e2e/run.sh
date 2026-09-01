@@ -62,9 +62,15 @@ fails=$(echo "$health" | jq '.verdicts.inject_fails')
 [[ "$rei" -gt 0 ]]  && pass "packets were reinjected ($rei)"          || fail "no reinjection occurred"
 [[ "$fails" -eq 0 ]] && pass "zero reinjection failures"              || fail "$fails reinjection failures"
 
-# Inbound is only visible to the classifier because the sidecar runs with
-# --observe-inbound; scoping alone would leave it in the kernel, since this
-# strategy's forest cannot act on an inbound packet.
+# Inbound is visible to the classifier because the strategy under test has an
+# inbound forest (pass-through `send` trees), so steering follows the strategy.
+# That is the only way a prod box gets inbound packets into userspace:
+# --observe-inbound is refused in prod mode, since it would cost a round trip per
+# inbound packet for every user of the box.
+#
+# Note what that implies, and why the inbound forest here has two trees: the
+# signal is only as complete as the strategy's inbound triggers. An `A*` tree
+# alone never sees a client SYN, and the burn estimate is a SYN-to-data ratio.
 step "Inbound TCP classification (the censor-reachability signal)"
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
@@ -81,11 +87,10 @@ ruleset=$("${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server)
 echo "$ruleset"
 echo "$ruleset" | grep -q "tcp sport 8080" && pass "egress steering scoped to sport 8080" || fail "missing egress rule"
 echo "$ruleset" | grep -q "9090" && fail "ruleset unexpectedly references port 9090" || pass "unrelated port 9090 not steered"
-# The strategy under test is outbound-only, so the inbound rule present here is
-# the observation floor (--observe-inbound), not the strategy's: it carries no
-# flag match, because the classifier wants every inbound packet.
-echo "$ruleset" | grep -qE "tcp dport 8080 queue" && pass "inbound steered unconditionally for the censor classifier" \
-  || fail "missing the inbound observation rule --observe-inbound asks for"
+# The inbound rule here is the strategy's own: its inbound tree triggers on any
+# ACK, so the rule carries that flag match rather than steering everything.
+echo "$ruleset" | grep -qE "tcp dport 8080 .*tcp flags .*queue" && pass "inbound steered per the strategy's inbound tree" \
+  || fail "missing the inbound queue rule the strategy's inbound tree asks for"
 # And the egress rule must carry the flag match, or bulk data is still being
 # queued for a strategy that only fires on PSH|ACK.
 echo "$ruleset" | grep -q "tcp flags" && pass "egress steering narrowed to the strategy's flags" \
