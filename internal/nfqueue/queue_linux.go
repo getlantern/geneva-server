@@ -131,10 +131,16 @@ func openQueue(num uint16, maxPacketLen uint32, maxQueueLen uint32) (*queue, err
 		return nil, fmt.Errorf("dial netlink: %w", err)
 	}
 	q := &queue{
-		con:  con,
-		num:  num,
-		rbuf: make([]byte, readBufSize),
-		vbuf: make([]byte, 0, 4096),
+		con: con,
+		num: num,
+		// AF_INET, matching an engine and reinjector that are IPv4-only. The
+		// kernel does not read this field for the messages it is sent with here
+		// — the queue bind and the verdicts — which is why v0.0.1 worked with it
+		// left at zero. Set explicitly all the same: an implicit AF_UNSPEC in an
+		// IPv4-only sidecar reads as an oversight rather than a decision.
+		family: unix.AF_INET,
+		rbuf:   make([]byte, readBufSize),
+		vbuf:   make([]byte, 0, 4096),
 	}
 	if err := con.SetReadBuffer(rcvBufSize); err != nil {
 		// Not fatal: a smaller buffer means ENOBUFS under burst, which is

@@ -73,6 +73,22 @@ type Config struct {
 }
 
 // Stats counts verdicts and reinjection outcomes.
+//
+// The counters are per mechanism, not per intent, and a manipulated packet
+// therefore lands in different ones depending on how it reached the wire:
+//
+//   - Modified: replaced in the queue by an overwrite-and-accept verdict. This
+//     is the normal path for a strategy that produces one packet.
+//   - Reinjected + Dropped: put on the wire through the raw socket while the
+//     queued original was dropped. This is the normal path for the extra packets
+//     of a fan-out strategy, and the fallback path when an overwrite verdict is
+//     refused.
+//
+// So "how many packets did the strategy change" is Modified plus the fan-out
+// share of Reinjected, and neither counter alone answers it. They are kept
+// per-mechanism deliberately: a packet counted in both would make Accepted +
+// Dropped + Modified stop reconciling with PacketsIn, which is what makes a
+// bypassed or lost packet visible.
 type Stats struct {
 	Accepted    atomic.Uint64
 	Dropped     atomic.Uint64
@@ -295,6 +311,10 @@ func (rt *Runtime) verdictOutbound(q *queue, id uint32, res engine.Result) {
 				return
 			}
 		} else {
+			// Counted as a reinjection rather than a modification: the packet
+			// reached the wire through the raw socket, and the original is
+			// dropped just below. See the Stats doc for why these stay
+			// per-mechanism instead of both being incremented.
 			rt.Stats.Reinjected.Add(1)
 		}
 		rt.drop(q, id)
