@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/alexflint/go-arg v1.6.1
-	github.com/getlantern/geneva v0.0.0-20260828121546-e4b88d19a7b3
+	github.com/getlantern/geneva v0.0.0-20260901121220-c04e0fa29f63
 	github.com/getlantern/semconv v0.0.0-20260831125104-59924138100b
 	github.com/gopacket/gopacket v1.7.1
 	github.com/mdlayher/netlink v1.9.0

@@ -7,8 +7,8 @@ github.com/cenkalti/backoff/v5 v5.0.3/go.mod h1:rkhZdG3JZukswDf7f0cwqPNk4K0sa+F9
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
 github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/getlantern/geneva v0.0.0-20260828121546-e4b88d19a7b3 h1:nFZptUuU9qIy+JS64rTHQfR4AjrvN1XFNX5Il/vpDDs=
-github.com/getlantern/geneva v0.0.0-20260828121546-e4b88d19a7b3/go.mod h1:+qFYj07mr5wkT1gpxHX6tJiGTb9j6RF17A1OOdLR7Sg=
+github.com/getlantern/geneva v0.0.0-20260901121220-c04e0fa29f63 h1:UDd4QL7Xbr7Hn6nGq0gPlHtA7sNlblMhZHe9f5TcIiQ=
+github.com/getlantern/geneva v0.0.0-20260901121220-c04e0fa29f63/go.mod h1:+qFYj07mr5wkT1gpxHX6tJiGTb9j6RF17A1OOdLR7Sg=
 github.com/getlantern/semconv v0.0.0-20260831125104-59924138100b h1:B86mZ37rhiKZgmjMAh69Rxc87GpudiUdiX9QPOv9GUc=
 github.com/getlantern/semconv v0.0.0-20260831125104-59924138100b/go.mod h1:GkPT5P9JoOTIRXRmFWxYgu1hhXgTFFTNc2hoG7WQc3g=
 github.com/go-logr/logr v1.2.2/go.mod h1:jdQByPbusPIv2/zmleS9BjJVeZ6kBagPoEUsqbVz/1A=
