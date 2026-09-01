@@ -29,9 +29,10 @@ bench:
 	go test ./internal/engine/ ./internal/nfqueue/ -run '^$$' -bench . -benchmem
 
 # Full data-plane benchmark over docker networking: throughput and sidecar CPU
-# per GB across every sidecar state. Args: GB per condition, concurrent streams.
+# per GiB across every sidecar state. Args: GiB per condition, concurrent
+# streams.
 bench-e2e:
-	./bench/run.sh $(GB) $(STREAMS)
+	./bench/run.sh $(GIB) $(STREAMS)
 
 # Full e2e over docker networking (requires docker + a netfilter-capable kernel).
 e2e:

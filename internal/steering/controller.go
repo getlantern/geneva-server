@@ -142,6 +142,14 @@ func (c *Controller) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if desired.Idle() {
+		// Program the idle scope rather than just recording it: an unclean exit
+		// (SIGKILL, an OOM, a crash) leaves the table behind, and a table with a
+		// reader attached is not the harmless orphan a table without one is —
+		// the runtime is about to open its queues, and those stale rules would
+		// put a box with no strategy right back on the data path.
+		if err := c.program(ctx, desired); err != nil {
+			return err
+		}
 		c.scope = desired
 		c.log.Infof("no steering installed: strategy can match nothing; box is off the data path")
 		return nil
@@ -150,6 +158,10 @@ func (c *Controller) Start(ctx context.Context) error {
 		return err
 	}
 	if err := c.program(ctx, desired); err != nil {
+		// The offloads are already down and the caller registers no teardown
+		// for a Start that failed, so put the NIC back here or it stays
+		// de-offloaded until the box is rebuilt.
+		c.restoreOffloads(ctx)
 		return err
 	}
 	c.scope = desired

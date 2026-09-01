@@ -34,7 +34,12 @@ func main() {
 	case *serve != "":
 		runServer(*serve)
 	case *get != "":
-		runClient(*get, *bytes, *streams)
+		if err := runClient(*get, *bytes, *streams); err != nil {
+			// Exit non-zero rather than printing a throughput figure: a
+			// half-finished transfer that reports a number is how a broken
+			// condition gets recorded as a benchmark result.
+			log.Fatal(err)
+		}
 	default:
 		log.Fatal("one of -serve or -get is required")
 	}
@@ -78,13 +83,16 @@ func runServer(addr string) {
 }
 
 // runClient reports MB/s on stdout as a bare number, so the runner can read it
-// without parsing prose.
-func runClient(base string, n int64, streams int) {
+// without parsing prose. Any stream that fails, returns a non-200, or comes up
+// short is an error: the number would be meaningless and the runner cannot tell
+// a slow condition from a broken one.
+func runClient(base string, n int64, streams int) error {
 	client := &http.Client{Timeout: 30 * time.Minute}
 	url := fmt.Sprintf("%s/bulk?bytes=%d", base, n)
 
 	var wg sync.WaitGroup
 	got := make([]int64, streams)
+	errs := make([]error, streams)
 	start := time.Now()
 	for i := range streams {
 		wg.Add(1)
@@ -92,28 +100,37 @@ func runClient(base string, n int64, streams int) {
 			defer wg.Done()
 			resp, err := client.Get(url)
 			if err != nil {
-				log.Printf("stream %d: %v", i, err)
+				errs[i] = fmt.Errorf("stream %d: %w", i, err)
 				return
 			}
 			defer func() { _ = resp.Body.Close() }()
-			c, err := io.Copy(io.Discard, resp.Body)
-			if err != nil {
-				log.Printf("stream %d: after %d bytes: %v", i, c, err)
+			if resp.StatusCode != http.StatusOK {
+				errs[i] = fmt.Errorf("stream %d: HTTP %d", i, resp.StatusCode)
+				return
 			}
+			c, err := io.Copy(io.Discard, resp.Body)
 			got[i] = c
+			if err != nil {
+				errs[i] = fmt.Errorf("stream %d: after %d bytes: %w", i, c, err)
+			}
 		}(i)
 	}
 	wg.Wait()
 	elapsed := time.Since(start)
 
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
 	var total int64
 	for _, c := range got {
 		total += c
 	}
-	want := n * int64(streams)
-	if total != want {
-		log.Printf("short transfer: got %d of %d bytes", total, want)
+	if want := n * int64(streams); total != want {
+		return fmt.Errorf("short transfer: got %d of %d bytes", total, want)
 	}
 	mbps := float64(total) / (1 << 20) / elapsed.Seconds()
 	_, _ = fmt.Fprintf(os.Stdout, "%.2f\n", mbps)
+	return nil
 }

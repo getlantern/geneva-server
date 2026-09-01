@@ -43,7 +43,7 @@ description = "engine microbenchmarks (per-packet cost, no kernel in the loop)"
 run = "make bench"
 
 [tasks."bench:e2e"]
-description = "data-plane benchmark over docker: throughput + sidecar CPU per GB"
+description = "data-plane benchmark over docker: throughput + sidecar CPU per GiB"
 run = "make bench-e2e"
 
 [tasks.e2e]

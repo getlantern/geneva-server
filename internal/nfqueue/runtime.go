@@ -176,11 +176,19 @@ func (rt *Runtime) Run(ctx context.Context) error {
 	defer func() { _ = inQ.Close() }()
 	defer func() { _ = rt.reinjector.Close() }()
 
+	// A context of our own, cancelled the moment either pump gives up. Without
+	// it, one pump failing would leave the other looping: interrupt makes its
+	// read return a deadline error, which pump treats as the ordinary idle-queue
+	// case and retries — against a deadline still in the past, so it spins and
+	// wg.Wait below never returns.
+	pumpCtx, stopPumps := context.WithCancel(ctx)
+	defer stopPumps()
+
 	errs := make(chan error, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); errs <- rt.pump(ctx, outQ, strategy.DirectionOutbound) }()
-	go func() { defer wg.Done(); errs <- rt.pump(ctx, inQ, strategy.DirectionInbound) }()
+	go func() { defer wg.Done(); errs <- rt.pump(pumpCtx, outQ, strategy.DirectionOutbound) }()
+	go func() { defer wg.Done(); errs <- rt.pump(pumpCtx, inQ, strategy.DirectionInbound) }()
 
 	var runErr error
 	select {
@@ -188,6 +196,7 @@ func (rt *Runtime) Run(ctx context.Context) error {
 		runErr = ctx.Err()
 	case runErr = <-errs:
 	}
+	stopPumps()
 
 	// Wake both readers and wait for them before the deferred Close runs. A
 	// reader still draining the socket would swallow teardown traffic and leave
