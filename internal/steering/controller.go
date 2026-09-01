@@ -45,6 +45,11 @@ type Config struct {
 	// NoNFT skips programming the kernel entirely, for a box where the rules are
 	// managed out of band.
 	NoNFT bool
+	// CensorCounters adds nftables classification counters to the table
+	// whenever one exists, so the censor-reachability signal survives steering
+	// being scoped to what the strategy can act on. They classify in the kernel
+	// and cost no userspace round trip; nothing is queued for them.
+	CensorCounters bool
 	// ObserveInbound keeps every inbound packet flowing through userspace while
 	// a strategy is loaded, even when that strategy's triggers cannot act on
 	// inbound traffic at all. Honoured in eval mode only.
@@ -281,6 +286,7 @@ func (c *Controller) program(ctx context.Context, desired Scope) error {
 		NFTPath:  c.cfg.NFTPath,
 		Outbound: desired.Outbound,
 		Inbound:  desired.Inbound,
+		Censor:   c.cfg.CensorCounters,
 	})
 	// Install removes any existing table first and programs nothing when the
 	// scope is idle, so this one call covers install, replace and remove.
@@ -316,6 +322,23 @@ func (c *Controller) restoreOffloads(ctx context.Context) {
 		c.log.Infof("NIC offloads restored on %s", c.cfg.Iface)
 	}
 	c.offloads = nil
+}
+
+// CensorCounts reads the kernel classification counters. It is the read half of
+// Config.CensorCounters, handed to censor.NewKernelSource.
+//
+// The manager is rebuilt on every program call, so this takes the current one
+// under the lock rather than caching a pointer. With no table installed there is
+// nothing to read and the counts are empty, which is the correct answer for a
+// box that is not steering.
+func (c *Controller) CensorCounts(ctx context.Context) (map[string]uint64, error) {
+	c.mu.Lock()
+	nft := c.nft
+	c.mu.Unlock()
+	if nft == nil {
+		return map[string]uint64{}, nil
+	}
+	return nft.ReadCounters(ctx)
 }
 
 // describe renders a selector for logs and the health surface.

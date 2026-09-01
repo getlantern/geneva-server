@@ -46,6 +46,12 @@ type steeringLogger struct{ l *slog.Logger }
 func (s steeringLogger) Infof(f string, a ...any)  { s.l.Info(fmt.Sprintf(f, a...)) }
 func (s steeringLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
 
+// censorReadInterval is how often the kernel classification counters are read.
+// One nft invocation per read, feeding a metric exported on a much slower
+// cadence, so this only has to be quick enough that two consecutive /healthz
+// calls do not return the same numbers.
+const censorReadInterval = 2 * time.Second
+
 func runServer(o *runCmd) error {
 	ctx := context.Background()
 	started := time.Now()
@@ -69,13 +75,6 @@ func runServer(o *runCmd) error {
 		observers = append(observers, pool)
 	}
 
-	// The inbound censor classifier runs in both modes: a prod box's IP gets
-	// burned the same way a test box's does, and the fleet-wide burn rate is
-	// what sizes the clean-IP budget for exploration.
-	censorObs := censor.New()
-	observers = append(observers, censorObs)
-	observer := nfqueue.Observers(observers...)
-
 	// Signals cancel the root context so cleanup (nft teardown) always runs.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -97,6 +96,7 @@ func runServer(o *runCmd) error {
 		Iface:       o.Iface,
 		NoNFT:       o.NoNFT,
 
+		CensorCounters: o.CensorCounters,
 		ObserveInbound: o.ObserveInbound,
 	}, steeringLogger{l: log})
 	if err := ctrl.Start(ctx); err != nil {
@@ -110,6 +110,27 @@ func runServer(o *runCmd) error {
 			log.Error("steering teardown failed", "err", err)
 		}
 	}()
+
+	// The inbound censor classifier runs in both modes: a prod box's IP gets
+	// burned the same way a test box's does, and the fleet-wide burn rate is
+	// what sizes the clean-IP budget for exploration.
+	//
+	// Where those counts come from is the interesting part. Steering is scoped
+	// to what the strategy can act on, so an outbound-only strategy delivers no
+	// inbound packet to userspace, and a classifier fed by NFQUEUE would see
+	// nothing at all. The kernel counters classify what arrives without queueing
+	// any of it, which is both the complete answer and the free one. The
+	// userspace classifier stays as the fallback for a box that turns them off,
+	// where it sees whatever the strategy happened to steer.
+	var censorSrc censor.Source
+	if o.CensorCounters {
+		censorSrc = censor.NewKernelSource(ctrl.CensorCounts, censorReadInterval)
+	} else {
+		obs := censor.New()
+		observers = append(observers, obs)
+		censorSrc = obs
+	}
+	observer := nfqueue.Observers(observers...)
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
@@ -161,7 +182,7 @@ func runServer(o *runCmd) error {
 			Mode:    o.Mode,
 			Market:  o.Market,
 			Engine:  eng,
-			Censor:  censorObs,
+			Censor:  censorSrc,
 			Started: started,
 			Verdicts: func() telemetry.Verdicts {
 				s := rt.Snapshot()
@@ -189,7 +210,7 @@ func runServer(o *runCmd) error {
 		Engine:     eng,
 		Canary:     pool,
 		Verdicts:   func() any { return rt.Snapshot() },
-		InboundTCP: func() any { return censorObs.Snapshot() },
+		InboundTCP: func() any { return censorSrc.Snapshot() },
 		// A strategy change is not just an engine swap: it can put the box on
 		// or take it off the data path, so it has to go through the controller.
 		Apply:    ctrl.Apply,

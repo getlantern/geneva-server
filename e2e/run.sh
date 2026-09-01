@@ -62,35 +62,35 @@ fails=$(echo "$health" | jq '.verdicts.inject_fails')
 [[ "$rei" -gt 0 ]]  && pass "packets were reinjected ($rei)"          || fail "no reinjection occurred"
 [[ "$fails" -eq 0 ]] && pass "zero reinjection failures"              || fail "$fails reinjection failures"
 
-# Inbound is visible to the classifier because the strategy under test has an
-# inbound forest (pass-through `send` trees), so steering follows the strategy.
-# That is the only way a prod box gets inbound packets into userspace:
-# --observe-inbound is refused in prod mode, since it would cost a round trip per
-# inbound packet for every user of the box.
-#
-# Note what that implies, and why the inbound forest here has two trees: the
-# signal is only as complete as the strategy's inbound triggers. An `A*` tree
-# alone never sees a client SYN, and the burn estimate is a SYN-to-data ratio.
-step "Inbound TCP classification (the censor-reachability signal)"
+# The strategy under test is outbound-only, and nothing inbound is steered for
+# it: no --observe-inbound, no inbound tree. The counts come from nftables
+# counters that classify what arrives in the kernel, which is the only reason
+# this signal survives steering being scoped to the strategy.
+step "Inbound TCP classification from kernel counters (the censor-reachability signal)"
+health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
 data=$(echo "$health" | jq '.inbound_tcp.events.data')
-undec=$(echo "$health" | jq '.inbound_tcp.events.undecodable')
-# The tester completed a real 1 MiB transfer, so the uncensored baseline is
-# syns followed by data. A burned box is the same shape with data at zero.
-[[ "$syn"   -gt 0 ]] && pass "inbound SYNs classified ($syn)"       || fail "no inbound SYNs classified"
-[[ "$data"  -gt 0 ]] && pass "inbound data segments classified ($data)" || fail "no inbound data classified"
-[[ "$undec" -eq 0 ]] && pass "every inbound packet was decodable"   || fail "$undec inbound packets undecodable"
+# The tester completed a real 1 MiB transfer, so the uncensored baseline is syns
+# followed by data. A burned box is the same shape with data at zero.
+[[ "$syn"  -gt 0 ]] && pass "inbound SYNs counted in the kernel ($syn)"          || fail "no inbound SYNs counted"
+[[ "$data" -gt 0 ]] && pass "inbound data segments counted in the kernel ($data)" || fail "no inbound data counted"
+# And the point of doing it in the kernel: none of those packets was queued.
+inpkts=$("${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server | grep -cE "tcp dport 8080 .*queue" || true)
+[[ "$inpkts" -eq 0 ]] && pass "no inbound queue rule: the signal cost no userspace round trip" \
+  || fail "inbound packets are being queued after all"
 
 step "2. Steering is scoped to the proxy port and to what the strategy can match"
 ruleset=$("${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server)
 echo "$ruleset"
 echo "$ruleset" | grep -q "tcp sport 8080" && pass "egress steering scoped to sport 8080" || fail "missing egress rule"
 echo "$ruleset" | grep -q "9090" && fail "ruleset unexpectedly references port 9090" || pass "unrelated port 9090 not steered"
-# The inbound rule here is the strategy's own: its inbound tree triggers on any
-# ACK, so the rule carries that flag match rather than steering everything.
-echo "$ruleset" | grep -qE "tcp dport 8080 .*tcp flags .*queue" && pass "inbound steered per the strategy's inbound tree" \
-  || fail "missing the inbound queue rule the strategy's inbound tree asks for"
+# The strategy is outbound-only, so nothing inbound may be queued — the counters
+# handle inbound without taking a packet out of the kernel.
+echo "$ruleset" | grep -qE "tcp dport 8080 .*queue" && fail "inbound queue rule installed for an outbound-only strategy" \
+  || pass "no inbound steering for an outbound-only strategy"
+echo "$ruleset" | grep -q "jump censor_in" && pass "inbound classified by the counter chain instead" \
+  || fail "missing the censor classification jump"
 # And the egress rule must carry the flag match, or bulk data is still being
 # queued for a strategy that only fires on PSH|ACK.
 echo "$ruleset" | grep -q "tcp flags" && pass "egress steering narrowed to the strategy's flags" \

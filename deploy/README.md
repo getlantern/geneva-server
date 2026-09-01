@@ -212,29 +212,56 @@ Both should be zero. A nonzero `overruns` means the strategy cannot keep up with
 the packet rate on this box; a nonzero `truncated` means the copy length is too
 small for its traffic.
 
+### The censor signal comes from nftables counters
+
+Steering follows the strategy, so an outbound-only strategy delivers no inbound
+packet to userspace — and the censor-reachability signal, the inbound
+SYN-to-data ratio that estimates whether a box's IP has been burned, is about
+inbound packets. Left there, scoping would have bought throughput by going
+blind.
+
+So the classification happens in the kernel instead. Whenever the sidecar has a
+table, it also installs named counters and a chain that sorts arriving packets
+into them — RST, SYN, FIN, data, ack_only, in that precedence, each rule
+returning so every packet lands in exactly one — and reads the counters once per
+export interval. **No packet is queued for the signal**, and it works the same in
+prod and eval, with or without an inbound tree in the strategy. On by default;
+`--censor-counters=false` falls back to the userspace classifier, which only sees
+what the strategy already steers.
+
+Two things the kernel path cannot count, and reports as zero:
+
+- `undecodable` — a decode failure cannot happen to a packet nobody decodes.
+- `fragment` — a non-initial fragment carries no TCP header to match a port
+  against, so counting them would mean counting every fragment on the box for
+  every port.
+
+And one approximation: nftables cannot subtract one header field from another, so
+"carries a payload" is `meta length > 80` rather than
+`ip length - ihl*4 - dataoffset*4 > 0`. A pure ACK with 32 bytes of options is 72
+bytes, so the threshold is safe; the failure mode is a data segment with fewer
+than ~28 payload bytes counting as `ack_only`, which proxy traffic does not
+produce.
+
+The counters ride along with a table that exists for steering. They never keep
+one alive on their own, so **a box with no strategy reports no censor signal** —
+it also has nothing of ours in the kernel, which is the trade that makes an
+unconfigured sidecar free. A box that should be reporting a burn rate is a box
+that should have a strategy.
+
 ### `--observe-inbound` (eval mode only)
 
-The censor-reachability signal (inbound SYN-to-data ratio, the estimate of a
-box's IP being burned) needs inbound packets in userspace, which a strategy that
-only acts outbound would not otherwise ask for. `--observe-inbound` keeps inbound
-flowing while a strategy is loaded. It is off by default, it never overrides the
-no-strategy case (an idle sidecar stays off the data path), and **it is refused
-outright in prod mode** — the sidecar exits at startup rather than warning.
+With the counters above providing the censor signal, this flag no longer has
+anything to do with it. What it still buys is *packets* in userspace rather than
+counts — which only the eval-mode canary pool wants, since that captures real
+header field values for the GA brain to mutate against. Prod has no canary pool
+at all, so in prod the flag would pay for something nothing reads: it is refused
+outright at startup rather than warned about.
 
-**A prod box that needs inbound packets in userspace asks for them through its
-strategy**, by giving it an inbound tree; steering then follows the strategy, so
-the packets are queued because something acts on them rather than because a flag
-was set. An inbound pass-through tree is spelled `\/ [TCP:flags:A*]-send-|`.
-
-Note what that implies for the signal: it is only as complete as the strategy's
-inbound triggers. The burn estimate is a SYN-to-data ratio, and an `A*` tree
-never matches a client SYN — so a strategy that wants the full signal needs both,
-as e2e/strategy.txt does: `\/ [TCP:flags:S]-send-|[TCP:flags:A*]-send-|`.
-
-**Why prod cannot have the flag.** The cost is one round trip per *inbound*
-packet, so it tracks the inbound packet rate, not the byte rate — which makes it
-almost free or ruinous depending on which way the box's bulk traffic runs, and a
-prod box does not get to choose which its users generate:
+**What it costs, if you are wondering why prod may not have it.** One round trip
+per *inbound* packet, so it tracks the inbound packet rate, not the byte rate —
+which makes it almost free or ruinous depending on which way the box's bulk
+traffic runs, and a prod box does not get to choose which its users generate:
 
 | Workload | without | with | |
 | --- | --- | --- | --- |

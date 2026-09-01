@@ -38,8 +38,10 @@ type Providers struct {
 	Market string
 	// Engine is required.
 	Engine *engine.Engine
-	// Censor is the inbound TCP observer. Nil disables the censor metric.
-	Censor *censor.Observer
+	// Censor is where the inbound TCP counts come from — the kernel's
+	// classification counters on a box that has them, the userspace classifier
+	// otherwise. Nil disables the censor metric.
+	Censor censor.Source
 	// Verdicts reads the runtime's counters. Nil disables the verdict metrics
 	// (the runtime is not up yet, or this is a non-Linux build).
 	Verdicts func() Verdicts

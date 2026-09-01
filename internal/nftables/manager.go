@@ -40,6 +40,10 @@ type Config struct {
 	// strategy can act on. A zero Selector steers nothing in that direction.
 	Outbound Selector
 	Inbound  Selector
+	// Censor adds the inbound classification counters: named counters and a
+	// chain that sorts arriving packets into them without queueing any of them.
+	// See censorRules.
+	Censor bool
 	// OutQueue receives egress (outbound) packets; InQueue receives ingress.
 	OutQueue uint16
 	InQueue  uint16
@@ -111,6 +115,54 @@ func flagNames(bits uint8) string {
 	return strings.Join(names, "|")
 }
 
+// CensorCounters are the named nftables counters the classification chain sorts
+// inbound packets into. The names are the censor event names, so nothing has to
+// translate between the kernel's view and the metric's.
+//
+// Counters live in the sidecar's own table, so these names cannot collide with
+// anything else on the box.
+var CensorCounters = []string{"rst", "syn", "fin", "data", "ack_only"}
+
+// censorDataMinLength is the packet length above which an inbound TCP packet is
+// counted as carrying data.
+//
+// nftables cannot subtract one header field from another, so "has a payload"
+// cannot be expressed exactly — it would be
+// `ip length - ihl*4 - dataoffset*4 > 0`. A pure ACK is 40 bytes of headers
+// plus options, and 32 bytes of options (timestamps, SACK) is the realistic
+// worst case, so anything above 80 bytes carries payload. The failure mode is a
+// data segment with fewer than ~28 payload bytes counting as ack_only, which
+// does not happen in proxy traffic: a TLS record is far larger.
+const censorDataMinLength = 80
+
+// censorRules renders the classification chain. Order is precedence, and each
+// rule returns, so every packet lands in exactly one counter — the same
+// property the userspace classifier has, and what makes a ratio between two
+// counters mean what it appears to mean.
+//
+// Two of the userspace classifier's buckets have no kernel equivalent and stay
+// at zero here. `undecodable` is a decode failure, which cannot happen to a
+// packet nobody decodes. `fragment` would need a rule with no port match, since
+// a non-initial fragment carries no TCP header to match a port against, and
+// counting every fragment on the box for every port is worse than not counting
+// it.
+func censorRules(port uint16) []string {
+	return []string{
+		"chain " + censorChain + " {",
+		"\t\ttcp flags & rst == rst counter name \"rst\" return",
+		// A listening port never receives a SYN-ACK, so an inbound SYN without
+		// ACK is a client opening a connection.
+		"\t\ttcp flags & (syn|ack) == syn counter name \"syn\" return",
+		"\t\ttcp flags & fin == fin counter name \"fin\" return",
+		fmt.Sprintf("\t\tmeta length > %d counter name \"data\" return", censorDataMinLength),
+		"\t\tcounter name \"ack_only\" return",
+		"\t}",
+	}
+}
+
+// censorChain is the regular (non-base) chain the input chain jumps into.
+const censorChain = "censor_in"
+
 // Manager owns the lifecycle of the steering table.
 type Manager struct {
 	cfg Config
@@ -139,6 +191,14 @@ func (m *Manager) Ruleset() string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "table inet %s {\n", m.cfg.Table)
+	if m.cfg.Censor {
+		for _, c := range CensorCounters {
+			fmt.Fprintf(&b, "\tcounter %s {}\n", c)
+		}
+		for _, line := range censorRules(m.cfg.Port) {
+			fmt.Fprintf(&b, "\t%s\n", line)
+		}
+	}
 	// Egress (outbound): the proxy sends from Port toward the client/censor.
 	fmt.Fprintf(&b, "\tchain output {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook output priority 0; policy accept;\n")
@@ -150,6 +210,12 @@ func (m *Manager) Ruleset() string {
 	// Ingress (inbound): packets arriving for the proxy's Port.
 	fmt.Fprintf(&b, "\tchain input {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook input priority 0; policy accept;\n")
+	if m.cfg.Censor {
+		// Counted before anything else in the chain, so the counts describe what
+		// arrived rather than what survived the strategy. Counting changes no
+		// verdict: the chain returns without one.
+		fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d jump %s\n", m.cfg.Port, censorChain)
+	}
 	for _, rule := range queueRules(m.cfg.Inbound, "dport", m.cfg.Port, m.cfg.InQueue) {
 		fmt.Fprintf(&b, "\t\t%s\n", rule)
 	}
@@ -160,6 +226,10 @@ func (m *Manager) Ruleset() string {
 
 // Idle reports whether the configured selectors steer nothing, in which case no
 // table should exist at all.
+//
+// The censor counters do not make a table non-idle. They ride along with a table
+// that exists for steering; they never keep one alive on their own, because a
+// box with no strategy is supposed to have nothing of ours in the kernel at all.
 func (m *Manager) Idle() bool {
 	return m.cfg.Outbound.Empty() && m.cfg.Inbound.Empty()
 }

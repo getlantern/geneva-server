@@ -61,6 +61,7 @@ type runCmd struct {
 	CanaryCapacity int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
 	NFTPath        string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
 	NoNFT          bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
+	CensorCounters bool     `arg:"--censor-counters" default:"true" help:"classify inbound packets with nftables counters, so the censor-reachability signal does not depend on steering inbound through userspace"`
 	ObserveInbound bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
 	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
 	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
