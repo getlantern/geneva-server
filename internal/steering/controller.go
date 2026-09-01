@@ -47,11 +47,12 @@ type Config struct {
 	//
 	// It buys the censor-reachability signal (internal/censor), whose
 	// inbound-SYN-to-inbound-data ratio is the only estimate we have of a box's
-	// IP being burned — and it is not free: inbound is roughly half the packets
-	// on a busy proxy, all of them taking the round trip that scoping exists to
-	// avoid. Off by default because the throughput cost is measured and large
-	// while the signal is an inference; on an eval box, which carries no client
-	// traffic, turning it on costs nothing worth counting.
+	// IP being burned. What it costs is one round trip per inbound packet,
+	// which makes it almost free or very expensive depending on which way the
+	// box's bulk traffic runs: measured on a 1-vCPU box, a download-heavy
+	// workload lost nothing at all (its inbound direction is stretch-ACKs, one
+	// packet per ~33 outbound), while an upload-heavy one lost 40%. Off by
+	// default for that reason; deploy/README.md has the numbers.
 	ObserveInbound bool
 }
 

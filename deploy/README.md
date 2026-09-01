@@ -217,9 +217,24 @@ small for its traffic.
 The censor-reachability signal (inbound SYN-to-data ratio, the estimate of a
 box's IP being burned) needs inbound packets in userspace, which a strategy that
 only acts outbound would not otherwise ask for. `--observe-inbound` keeps inbound
-flowing while a strategy is loaded, at the cost of a round trip per inbound
-packet — roughly half the packets on a busy proxy. It is off by default, and it
-never overrides the no-strategy case: an idle sidecar stays off the data path.
+flowing while a strategy is loaded. It is off by default, and it never overrides
+the no-strategy case: an idle sidecar stays off the data path.
 
-An eval box carries no client traffic, so turning it on there costs nothing
-worth counting. On a prod box it is a real throughput trade.
+**What it costs depends entirely on which way the box's bulk traffic runs**, and
+the difference is large. The cost is one round trip per *inbound* packet, so it
+tracks the inbound packet rate, not the byte rate:
+
+| Workload | without | with | |
+| --- | --- | --- | --- |
+| download-heavy, handshake-only strategy | 105.1 MB/s | 105.0 MB/s | free |
+| download-heavy, strategy tampering every data packet | 36.6 MB/s | 33.3 MB/s | −9% |
+| **upload-heavy, handshake-only strategy** | **79.3 MB/s** | **47.4 MB/s** | **−40%** |
+
+Measured on a 1-vCPU box (route `d711a4df`, vless+REALITY). A download's inbound
+direction is nothing but stretch-ACKs — 18.9k inbound packets across 900 MB, one
+per ~33 outbound data packets — so observing it is free. An upload's inbound
+direction is the bulk stream, and then every packet pays.
+
+An eval box carries no client traffic at all, so turning it on there costs
+nothing worth counting. On a prod box, decide by direction: it is close to free
+where clients mostly download, and expensive where they mostly upload.
