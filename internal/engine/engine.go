@@ -63,6 +63,9 @@ type Result struct {
 	// Packets holds the serialized replacement packets, in order. It is empty
 	// for a dropped packet and holds exactly the input bytes for an unchanged
 	// packet. Each entry is a complete IPv4 packet ready for reinjection.
+	//
+	// The entries alias the Scratch passed to Process and are only valid until
+	// the next Process call with that Scratch.
 	Packets [][]byte
 }
 
@@ -179,7 +182,14 @@ func (e *Engine) DNA() string {
 // Process decodes a raw IPv4 packet, applies the current strategy for the given
 // direction, and returns the verdict and replacement packets. raw must begin at
 // the IPv4 header, exactly as NFQUEUE delivers it.
-func (e *Engine) Process(raw []byte, dir strategy.Direction) (Result, error) {
+//
+// scratch carries the per-packet working memory. It may be nil, in which case
+// Process allocates; the NFQUEUE runtime passes one per queue goroutine, which
+// is what keeps the hot path from allocating a fresh 1500-byte buffer, a decode
+// copy and an output slice for every packet on the wire. A CPU profile of a
+// tamper-every-packet strategy spent ~30% of its time in the garbage collector
+// and the scheduler feeding it.
+func (e *Engine) Process(raw []byte, dir strategy.Direction, scratch *Scratch) (Result, error) {
 	e.Stats.PacketsIn.Add(1)
 	e.Stats.BytesIn.Add(uint64(len(raw)))
 
@@ -187,12 +197,21 @@ func (e *Engine) Process(raw []byte, dir strategy.Direction) (Result, error) {
 	if l == nil {
 		return Result{}, errors.New("engine has no strategy")
 	}
+	if scratch == nil {
+		scratch = &Scratch{}
+	}
 
-	// Decode a private copy: gopacket packets alias their input buffer and the
-	// tamper actions mutate layers in place.
-	buf := make([]byte, len(raw))
+	// Decode a private copy: the tamper actions mutate the decoded layers in
+	// place, and raw is the kernel's buffer, which classify still needs
+	// unmodified to tell "unchanged" from "tampered".
+	//
+	// NoCopy is what makes the copy above the only one: without it gopacket
+	// takes a second copy of the same bytes. Lazy defers decoding a layer until
+	// a trigger or action actually reads it, which for a strategy that only
+	// looks at TCP flags means the payload is never touched.
+	buf := scratch.packet(len(raw))
 	copy(buf, raw)
-	pkt := gopacket.NewPacket(buf, layers.LayerTypeIPv4, gopacket.Default)
+	pkt := gopacket.NewPacket(buf, layers.LayerTypeIPv4, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
 	if errLayer := pkt.ErrorLayer(); errLayer != nil {
 		e.Stats.Errors.Add(1)
 		return Result{}, fmt.Errorf("decode packet: %w", errLayer.Error())
@@ -204,25 +223,63 @@ func (e *Engine) Process(raw []byte, dir strategy.Direction) (Result, error) {
 		return Result{}, fmt.Errorf("apply strategy: %w", err)
 	}
 
-	res := classify(raw, out)
+	res := classify(raw, out, scratch)
 	e.record(res)
 	return res, nil
 }
 
-func classify(raw []byte, out []gopacket.Packet) Result {
+// Scratch is one packet's worth of reusable working memory, owned by a single
+// goroutine. The NFQUEUE runtime keeps one per queue, since each queue's
+// callback is serialized on one goroutine.
+//
+// The Result returned by Process aliases this memory: its Packets stay valid
+// only until the next Process call with the same Scratch. That is exactly the
+// lifetime the runtime needs — it issues the verdict, which copies into the
+// netlink message, before reading another packet.
+type Scratch struct {
+	buf  []byte
+	pkts [][]byte
+}
+
+// packet returns a buffer of exactly n bytes, growing the backing array only
+// when a packet is larger than anything seen before.
+func (s *Scratch) packet(n int) []byte {
+	if cap(s.buf) < n {
+		// Round up to the next MTU-ish size so a run of slightly larger packets
+		// does not reallocate on each one.
+		s.buf = make([]byte, n, max(n, 2048))
+	}
+	return s.buf[:n]
+}
+
+// outputs returns a zero-length slice with room for n packets.
+func (s *Scratch) outputs(n int) [][]byte {
+	if cap(s.pkts) < n {
+		s.pkts = make([][]byte, 0, max(n, 4))
+	}
+	return s.pkts[:0]
+}
+
+// classify decides the outcome and collects the serialized output packets.
+//
+// The output bytes are not copied: they are either the scratch buffer the packet
+// was decoded into or buffers the geneva library allocated while serializing,
+// and both outlive the caller's verdict. See Scratch for the lifetime contract.
+func classify(raw []byte, out []gopacket.Packet, scratch *Scratch) Result {
 	switch len(out) {
 	case 0:
 		return Result{Outcome: OutcomeDropped}
 	case 1:
 		data := out[0].Data()
+		outcome := OutcomeTampered
 		if bytesEqual(raw, data) {
-			return Result{Outcome: OutcomeUnchanged, Packets: [][]byte{cloneBytes(data)}}
+			outcome = OutcomeUnchanged
 		}
-		return Result{Outcome: OutcomeTampered, Packets: [][]byte{cloneBytes(data)}}
+		return Result{Outcome: outcome, Packets: append(scratch.outputs(1), data)}
 	default:
-		packets := make([][]byte, 0, len(out))
+		packets := scratch.outputs(len(out))
 		for _, p := range out {
-			packets = append(packets, cloneBytes(p.Data()))
+			packets = append(packets, p.Data())
 		}
 		return Result{Outcome: OutcomeExpanded, Packets: packets}
 	}
@@ -247,12 +304,6 @@ func (e *Engine) record(r Result) {
 
 // Snapshot returns a value copy of the cumulative stats with overhead ratios.
 func (e *Engine) Snapshot() Snapshot { return e.Stats.snapshot() }
-
-func cloneBytes(b []byte) []byte {
-	c := make([]byte, len(b))
-	copy(c, b)
-	return c
-}
 
 func bytesEqual(a, b []byte) bool {
 	if len(a) != len(b) {

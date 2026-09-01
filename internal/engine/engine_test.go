@@ -118,7 +118,7 @@ func ones(b []byte) uint16 {
 func TestUnchanged_EmptyStrategy(t *testing.T) {
 	e := mustEngine(t, "")
 	raw := buildTCP(t, 1000, tcpFlags{psh: true, ack: true}, []byte("hello world"))
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestUnchanged_EmptyStrategy(t *testing.T) {
 func TestUnchanged_PassthroughTree(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-| \/`)
 	raw := buildTCP(t, 1000, tcpFlags{psh: true, ack: true}, []byte("hello"))
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +145,7 @@ func TestUnchanged_PassthroughTree(t *testing.T) {
 func TestDropped(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:R]-drop-| \/`)
 	raw := buildTCP(t, 1000, tcpFlags{rst: true}, nil)
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +163,7 @@ func TestDropped(t *testing.T) {
 func TestDuplicated(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-duplicate-| \/`)
 	raw := buildTCP(t, 5000, tcpFlags{psh: true, ack: true}, []byte("payload"))
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestDuplicated(t *testing.T) {
 func TestTampered_Flags(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/`)
 	raw := buildTCP(t, 42, tcpFlags{syn: true}, nil)
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestTampered_Flags(t *testing.T) {
 func TestTampered_TTL(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-tamper{IP:ttl:replace:5}-| \/`)
 	raw := buildTCP(t, 42, tcpFlags{psh: true, ack: true}, []byte("data"))
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,7 +217,7 @@ func TestFragmented(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-fragment{TCP:8:true}-| \/`)
 	payload := []byte("0123456789ABCDEF") // 16 bytes
 	raw := buildTCP(t, 7000, tcpFlags{psh: true, ack: true}, payload)
-	res, err := e.Process(raw, strategy.DirectionOutbound)
+	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestInboundBranchingRejectedAtParse(t *testing.T) {
 func TestOverheadMetrics(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-duplicate-| \/`)
 	raw := buildTCP(t, 1, tcpFlags{psh: true, ack: true}, []byte("abcdefgh"))
-	if _, err := e.Process(raw, strategy.DirectionOutbound); err != nil {
+	if _, err := e.Process(raw, strategy.DirectionOutbound, nil); err != nil {
 		t.Fatal(err)
 	}
 	snap := e.Snapshot()

@@ -30,6 +30,55 @@ var offloadFeatures = []string{"gso", "tso", "gro", "gre", "tx", "rx", "sg", "lr
 // leaves them off.
 var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "gre", "lro", "ufo"}
 
+// ethtoolNames maps the short feature names used with `ethtool -K` to the long
+// names `ethtool -k` reports state under. Only the features whose state we need
+// to read are listed; anything absent is simply attempted blind.
+var ethtoolNames = map[string]string{
+	"gso": "generic-segmentation-offload",
+	"tso": "tcp-segmentation-offload",
+	"gro": "generic-receive-offload",
+	"lro": "large-receive-offload",
+	"sg":  "scatter-gather",
+	"tx":  "tx-checksumming",
+	"rx":  "rx-checksumming",
+	"ufo": "udp-fragmentation-offload",
+}
+
+// readFeatures returns which of the offload features are currently on, keyed by
+// short name. A feature the driver reports as "[fixed]" is reported by its
+// current value and cannot be changed either way, which is what Disable needs
+// to know. Features it cannot determine are simply absent from the map.
+func readFeatures(ctx context.Context, ethtoolPath, iface string) map[string]bool {
+	out, err := exec.CommandContext(ctx, ethtoolPath, "-k", iface).Output()
+	if err != nil {
+		return nil
+	}
+	long := make(map[string]bool, len(ethtoolNames))
+	for line := range strings.SplitSeq(string(out), "\n") {
+		name, value, found := strings.Cut(strings.TrimSpace(line), ":")
+		if !found {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		on := strings.HasPrefix(value, "on")
+		fixed := strings.Contains(value, "[fixed]")
+		// A fixed feature is unchangeable: record its value so Disable skips it
+		// when it is already off and Restore never tries to set it.
+		if fixed && !on {
+			long[name] = false
+			continue
+		}
+		long[name] = on
+	}
+	state := make(map[string]bool, len(ethtoolNames))
+	for short, name := range ethtoolNames {
+		if v, ok := long[name]; ok {
+			state[short] = v
+		}
+	}
+	return state
+}
+
 // Disabled records the features Disable actually turned off on an interface, so
 // Restore can put back exactly those and nothing else.
 type Disabled struct {
@@ -100,8 +149,19 @@ func Disable(ctx context.Context, ethtoolPath, iface string) (*Disabled, error) 
 	if _, err := os.Stat("/sys/class/net/" + iface); err != nil {
 		return nil, fmt.Errorf("interface %q not found: %w", iface, err)
 	}
+
+	// Read the current state first. A feature that is already off, or that the
+	// driver reports as fixed, must not be recorded as something we turned off:
+	// Restore would then try to switch it back on and fail. veth reports lro
+	// exactly that way.
+	state := readFeatures(ctx, ethtoolPath, iface)
+
 	var ok, skipped []string
 	for _, f := range offloadFeatures {
+		if on, known := state[f]; known && !on {
+			skipped = append(skipped, f)
+			continue
+		}
 		cmd := exec.CommandContext(ctx, ethtoolPath, "-K", iface, f, "off")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			// Feature fixed/unsupported on this interface; not fatal on its own.

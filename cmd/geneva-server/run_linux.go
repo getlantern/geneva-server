@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -119,6 +120,32 @@ func runServer(o *runCmd) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Profiling is opt-in and separate from the control surface: it is a
+	// benchmarking tool, and the control surface is unauthenticated on a box
+	// that carries traffic. The handlers are registered on a mux of our own
+	// rather than through the package's blank-import side effect, so nothing is
+	// reachable unless this flag is set.
+	if o.PprofAddr != "" {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		pprofSrv := &http.Server{Addr: o.PprofAddr, Handler: pprofMux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Warn("pprof enabled", "addr", o.PprofAddr)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("pprof listener failed", "err", err)
+			}
+		}()
+		defer func() {
+			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(shCtx)
+		}()
 	}
 
 	// Metric export is opt-in: with no OTLP endpoint configured there is no

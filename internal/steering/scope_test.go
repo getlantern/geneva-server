@@ -151,7 +151,7 @@ func TestScopeNeverNarrowerThanStrategy(t *testing.T) {
 				if err != nil {
 					t.Fatalf("engine.New(%q): %v", dna, err)
 				}
-				res, err := e.Process(p.raw, dir)
+				res, err := e.Process(p.raw, dir, nil)
 				if err != nil {
 					t.Fatalf("dna=%q %s %s: Process: %v", dna, dir, p.name, err)
 				}

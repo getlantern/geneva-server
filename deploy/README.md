@@ -190,6 +190,28 @@ box is unexpectedly fast or slow:
 "steering": {"steering": true, "outbound": "flags&0xff==0x02", "inbound": "none", "offloads_disabled": true}
 ```
 
+### Cost of a strategy that touches every packet
+
+A strategy whose triggers match bulk data cannot be scoped away — those packets
+genuinely have to reach userspace. What the sidecar does about it is spend as
+little as possible per packet: one `recvmsg` per batch of packets rather than
+per packet, accept verdicts batched into one message per batch, rewritten
+packets replaced in the queue rather than dropped and reinjected through a raw
+socket (which also skips a second trip through netfilter), and no allocation per
+packet on the hot path.
+
+Two counters on `/healthz` say when the box is losing packets rather than
+manipulating them:
+
+| Counter | Meaning |
+| --- | --- |
+| `verdicts.overruns` | the netlink socket buffer overflowed; those packets bypassed the strategy (the rules' `bypass` flag accepted them, so the proxy kept serving) |
+| `verdicts.truncated` | the kernel copied only part of a packet, so it was accepted unmodified rather than manipulated as a fragment |
+
+Both should be zero. A nonzero `overruns` means the strategy cannot keep up with
+the packet rate on this box; a nonzero `truncated` means the copy length is too
+small for its traffic.
+
 ### `--observe-inbound`
 
 The censor-reachability signal (inbound SYN-to-data ratio, the estimate of a

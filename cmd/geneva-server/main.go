@@ -64,6 +64,7 @@ type runCmd struct {
 	ObserveInbound bool     `arg:"--observe-inbound" help:"keep inbound packets flowing through userspace while a strategy is loaded, for the censor-reachability signal; costs a userspace round trip per inbound packet"`
 	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
 	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
+	PprofAddr      string   `arg:"--pprof-addr" help:"debug only: serve net/http/pprof on this address; never enable on a box carrying client traffic"`
 }
 
 // validateCmd holds the flags for the validate subcommand.

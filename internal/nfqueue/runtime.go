@@ -9,11 +9,24 @@
 // nftables rules send egress to the out-queue and ingress to the in-queue, so
 // each callback knows its direction unambiguously.
 //
-// Outbound packets can fan out (duplicate/fragment) or change size (tamper), so
-// a matched outbound packet is dropped in the queue and its replacements are
-// reinjected through the raw socket. Inbound is single-in/single-out (branching
-// is rejected at parse time), so it is handled entirely with the in-queue
-// verdict: accept, drop, or overwrite-and-accept.
+// Verdicts are issued in the queue wherever the queue can express them, because
+// syscalls are what this package costs. A CPU profile of a tamper-every-packet
+// strategy put 41% of the sidecar's time in syscalls and under 10% in the Geneva
+// engine, so the useful optimizations are all about doing fewer of them:
+//
+//   - Unchanged: a bare accept.
+//   - One packet out (tamper, the common manipulation): overwrite-and-accept in
+//     the queue. No raw socket, and — because the packet resumes where it was
+//     queued instead of being injected at the top of the stack — no second trip
+//     through netfilter and no routing lookup.
+//   - More than one packet out (duplicate/fragment): all but the last are
+//     injected through the raw socket, and the last replaces the queued packet.
+//     Injecting the earlier ones first preserves the order the strategy chose,
+//     since the overwritten packet is only released once this callback returns.
+//   - Dropped: a bare drop.
+//
+// Inbound is single-in/single-out (branching is rejected at parse time), so it
+// never needs the raw socket at all.
 package nfqueue
 
 import (
@@ -21,11 +34,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 
-	nfq "github.com/florianl/go-nfqueue/v2"
-	"github.com/getlantern/geneva-server/internal/engine"
 	"github.com/getlantern/geneva/strategy"
+	"golang.org/x/sys/unix"
+
+	"github.com/getlantern/geneva-server/internal/engine"
 )
 
 // Observer is notified of every packet before manipulation, for eval-mode canary
@@ -64,6 +79,15 @@ type Stats struct {
 	Modified    atomic.Uint64
 	Reinjected  atomic.Uint64
 	InjectFails atomic.Uint64
+	// Overruns counts socket-buffer overflows. The packets lost to one were
+	// accepted by the queue rules' bypass flag, so the proxy kept serving —
+	// they simply never reached the strategy.
+	Overruns atomic.Uint64
+	// Truncated counts packets the kernel copied only part of. They are
+	// accepted unmodified, since manipulating a prefix would put a corrupt
+	// packet on the wire, and a nonzero count means the copy length is too
+	// small for the traffic on this box.
+	Truncated atomic.Uint64
 }
 
 // Snapshot is a value copy of Stats.
@@ -73,6 +97,8 @@ type Snapshot struct {
 	Modified    uint64 `json:"modified"`
 	Reinjected  uint64 `json:"reinjected"`
 	InjectFails uint64 `json:"inject_fails"`
+	Overruns    uint64 `json:"overruns"`
+	Truncated   uint64 `json:"truncated"`
 }
 
 // Runtime binds the engine to the two queues and the reinjector.
@@ -108,106 +134,145 @@ func (rt *Runtime) Snapshot() Snapshot {
 		Modified:    rt.Stats.Modified.Load(),
 		Reinjected:  rt.Stats.Reinjected.Load(),
 		InjectFails: rt.Stats.InjectFails.Load(),
+		Overruns:    rt.Stats.Overruns.Load(),
+		Truncated:   rt.Stats.Truncated.Load(),
 	}
 }
 
-// Run opens both queues, registers the callbacks, and blocks until ctx is
-// cancelled. It always releases the queues and the raw socket before returning.
+// Run opens both queues and pumps them until ctx is cancelled. It always
+// releases the queues and the raw socket before returning.
+//
+// One goroutine per queue, and one read buffer and one Scratch per goroutine:
+// each queue is processed strictly in order, which is what lets the verdict
+// batching hold accepts back safely and lets the engine reuse its working
+// memory without synchronization.
 func (rt *Runtime) Run(ctx context.Context) error {
-	outQ, err := rt.open(rt.cfg.OutQueue)
+	outQ, err := openQueue(rt.cfg.OutQueue, rt.cfg.MaxPacketLen, maxQueueLen)
 	if err != nil {
 		return fmt.Errorf("open out-queue %d: %w", rt.cfg.OutQueue, err)
 	}
 	defer func() { _ = outQ.Close() }()
 
-	inQ, err := rt.open(rt.cfg.InQueue)
+	inQ, err := openQueue(rt.cfg.InQueue, rt.cfg.MaxPacketLen, maxQueueLen)
 	if err != nil {
 		return fmt.Errorf("open in-queue %d: %w", rt.cfg.InQueue, err)
 	}
 	defer func() { _ = inQ.Close() }()
 	defer func() { _ = rt.reinjector.Close() }()
 
-	if err := outQ.RegisterWithErrorFunc(ctx, rt.hook(outQ, strategy.DirectionOutbound), rt.errHook); err != nil {
-		return fmt.Errorf("register out-queue: %w", err)
-	}
-	if err := inQ.RegisterWithErrorFunc(ctx, rt.hook(inQ, strategy.DirectionInbound), rt.errHook); err != nil {
-		return fmt.Errorf("register in-queue: %w", err)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); errs <- rt.pump(ctx, outQ, strategy.DirectionOutbound) }()
+	go func() { defer wg.Done(); errs <- rt.pump(ctx, inQ, strategy.DirectionInbound) }()
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		runErr = ctx.Err()
+	case runErr = <-errs:
 	}
 
-	<-ctx.Done()
-	return ctx.Err()
+	// Wake both readers and wait for them before the deferred Close runs. A
+	// reader still draining the socket would swallow teardown traffic and leave
+	// shutdown hanging until something killed the process.
+	outQ.interrupt()
+	inQ.interrupt()
+	wg.Wait()
+	return runErr
 }
 
-func (rt *Runtime) open(queue uint16) (*nfq.Nfqueue, error) {
-	return nfq.Open(&nfq.Config{
-		NfQueue:      queue,
-		MaxPacketLen: rt.cfg.MaxPacketLen,
-		MaxQueueLen:  0xffff,
-		Copymode:     nfq.NfQnlCopyPacket,
-	})
+// pump reads one queue until the context is cancelled.
+func (rt *Runtime) pump(ctx context.Context, q *queue, dir strategy.Direction) error {
+	scratch := &engine.Scratch{}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := q.read(ctx, func(p packet) error {
+			rt.handle(q, dir, p, scratch)
+			return nil
+		})
+		switch {
+		case err == nil:
+		case errors.Is(err, unix.ENOBUFS):
+			// The socket buffer overflowed and the kernel dropped packets.
+			// Those packets were accepted by the bypass flag, so the proxy is
+			// unharmed; the strategy simply did not see them.
+			rt.Stats.Overruns.Add(1)
+			rt.log.Errorf("nfqueue socket overrun: packets bypassed the strategy")
+		case errors.Is(err, unix.EAGAIN), errors.Is(err, os.ErrDeadlineExceeded):
+			// Expected on an idle queue.
+			rt.log.Debugf("nfqueue read: %v", err)
+		case ctx.Err() != nil:
+			return ctx.Err()
+		default:
+			return fmt.Errorf("read %s queue: %w", dir, err)
+		}
+	}
 }
 
-func (rt *Runtime) errHook(e error) int {
-	// A read timeout is expected and not fatal — log it quietly. Everything else
-	// is logged at error level. Either way the queue stays open.
-	if errors.Is(e, os.ErrDeadlineExceeded) {
-		rt.log.Debugf("nfqueue read timeout: %v", e)
+// handle runs one packet through the engine and issues its verdict.
+func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *engine.Scratch) {
+	if p.truncated {
+		// Fail open: a prefix of a packet cannot be manipulated or reinjected.
+		rt.Stats.Truncated.Add(1)
+		q.accept(p.id)
+		rt.Stats.Accepted.Add(1)
+		return
+	}
+	if len(p.payload) == 0 {
+		// Counted like any other accept: this path is indistinguishable from a
+		// pass-through as far as the flow is concerned, and leaving it out
+		// makes the verdict counters undercount what was actually accepted.
+		q.accept(p.id)
+		rt.Stats.Accepted.Add(1)
+		return
+	}
+
+	if rt.cfg.Observer != nil {
+		rt.cfg.Observer.Observe(p.payload, dir)
+	}
+
+	res, err := rt.eng.Process(p.payload, dir, scratch)
+	if err != nil {
+		// Fail open: a strategy or decode error must never black-hole the
+		// proxy's traffic.
+		rt.log.Errorf("process %s packet: %v", dir, err)
+		q.accept(p.id)
+		rt.Stats.Accepted.Add(1)
+		return
+	}
+
+	if dir == strategy.DirectionOutbound {
+		rt.verdictOutbound(q, p.id, res)
 	} else {
-		rt.log.Errorf("nfqueue error: %v", e)
-	}
-	return 0
-}
-
-func (rt *Runtime) hook(q *nfq.Nfqueue, dir strategy.Direction) nfq.HookFunc {
-	return func(a nfq.Attribute) int {
-		if a.PacketID == nil {
-			return 0
-		}
-		id := *a.PacketID
-		if a.Payload == nil || len(*a.Payload) == 0 {
-			// Counted like any other accept: this path is indistinguishable from
-			// a pass-through as far as the flow is concerned, and leaving it out
-			// makes the verdict counters undercount what was actually accepted.
-			rt.accept(q, id)
-			return 0
-		}
-		raw := *a.Payload
-
-		if rt.cfg.Observer != nil {
-			rt.cfg.Observer.Observe(raw, dir)
-		}
-
-		res, err := rt.eng.Process(raw, dir)
-		if err != nil {
-			// Fail open: a strategy or decode error must never black-hole the
-			// proxy's traffic.
-			rt.log.Errorf("process %s packet: %v", dir, err)
-			rt.accept(q, id)
-			return 0
-		}
-
-		if dir == strategy.DirectionOutbound {
-			rt.verdictOutbound(q, id, res)
-		} else {
-			rt.verdictInbound(q, id, res)
-		}
-		return 0
+		rt.verdictInbound(q, p.id, res)
 	}
 }
 
-// verdictOutbound: unchanged packets are accepted as-is; everything else drops
-// the original and reinjects the replacement packets (possibly none, for a drop).
+// verdictOutbound issues the outbound verdict, using the queue itself for
+// everything but the extra packets a fan-out strategy produces.
 //
-// If a strategy produced replacement packets but every reinjection failed, the
-// original is accepted instead of dropped: dropping it would black-hole the
-// flow, and failing open keeps the proxy serving.
-func (rt *Runtime) verdictOutbound(q *nfq.Nfqueue, id uint32, res engine.Result) {
+// If a strategy produced replacement packets but none of them could be
+// delivered, the original is accepted instead of dropped: dropping it would
+// black-hole the flow, and failing open keeps the proxy serving.
+func (rt *Runtime) verdictOutbound(q *queue, id uint32, res engine.Result) {
 	if res.Outcome == engine.OutcomeUnchanged {
 		rt.accept(q, id)
 		return
 	}
+	if len(res.Packets) == 0 {
+		rt.drop(q, id)
+		return
+	}
+
+	// Everything except the last replacement goes out through the raw socket,
+	// in order; the last one replaces the queued packet.
+	extras := res.Packets[:len(res.Packets)-1]
+	last := res.Packets[len(res.Packets)-1]
 	injected := 0
-	for _, p := range res.Packets {
+	for _, p := range extras {
 		if err := rt.reinjector.Inject(p); err != nil {
 			rt.log.Errorf("reinject: %v", err)
 			rt.Stats.InjectFails.Add(1)
@@ -216,26 +281,38 @@ func (rt *Runtime) verdictOutbound(q *nfq.Nfqueue, id uint32, res engine.Result)
 		injected++
 		rt.Stats.Reinjected.Add(1)
 	}
-	if len(res.Packets) > 0 && injected == 0 {
-		rt.log.Errorf("all %d replacement packets failed to reinject; accepting original to avoid black-hole", len(res.Packets))
-		rt.accept(q, id)
+	if err := q.verdict(id, nfAccept, last); err != nil {
+		// The queued packet could not be replaced. Fall back to the older path
+		// — inject the replacement and drop the original — so a kernel that
+		// rejects the modified verdict still applies the strategy.
+		rt.log.Errorf("mod-accept outbound: %v", err)
+		if err := rt.reinjector.Inject(last); err != nil {
+			rt.log.Errorf("reinject after mod-accept failure: %v", err)
+			rt.Stats.InjectFails.Add(1)
+			if injected == 0 {
+				rt.log.Errorf("no replacement packet reached the wire; accepting original to avoid black-hole")
+				rt.accept(q, id)
+				return
+			}
+		} else {
+			rt.Stats.Reinjected.Add(1)
+		}
+		rt.drop(q, id)
 		return
 	}
-	_ = q.SetVerdict(id, nfq.NfDrop)
-	rt.Stats.Dropped.Add(1)
+	rt.Stats.Modified.Add(1)
 }
 
 // verdictInbound handles the single-in/single-out inbound path with in-queue
 // verdicts only — no reinjection.
-func (rt *Runtime) verdictInbound(q *nfq.Nfqueue, id uint32, res engine.Result) {
+func (rt *Runtime) verdictInbound(q *queue, id uint32, res engine.Result) {
 	switch res.Outcome {
 	case engine.OutcomeUnchanged:
 		rt.accept(q, id)
 	case engine.OutcomeDropped:
-		_ = q.SetVerdict(id, nfq.NfDrop)
-		rt.Stats.Dropped.Add(1)
+		rt.drop(q, id)
 	case engine.OutcomeTampered:
-		if err := q.SetVerdictWithOption(id, nfq.NfAccept, nfq.WithAlteredPacket(res.Packets[0])); err != nil {
+		if err := q.verdict(id, nfAccept, res.Packets[0]); err != nil {
 			rt.log.Errorf("mod-accept inbound: %v", err)
 			rt.accept(q, id)
 			return
@@ -250,7 +327,16 @@ func (rt *Runtime) verdictInbound(q *nfq.Nfqueue, id uint32, res engine.Result) 
 	}
 }
 
-func (rt *Runtime) accept(q *nfq.Nfqueue, id uint32) {
-	_ = q.SetVerdict(id, nfq.NfAccept)
+// accept defers the accept into the queue's batch; it is flushed at the end of
+// the read, or ahead of any individual verdict for a later packet.
+func (rt *Runtime) accept(q *queue, id uint32) {
+	q.accept(id)
 	rt.Stats.Accepted.Add(1)
+}
+
+func (rt *Runtime) drop(q *queue, id uint32) {
+	if err := q.verdict(id, nfDrop, nil); err != nil {
+		rt.log.Errorf("drop verdict: %v", err)
+	}
+	rt.Stats.Dropped.Add(1)
 }

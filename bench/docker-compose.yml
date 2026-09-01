@@ -45,6 +45,9 @@ services:
       # Always a file, never a flag toggle: the runner rewrites strategy.dna
       # between conditions, and an empty file is exactly the pass-through case.
       - "--strategy-file=/strategy.dna"
+      # Debug-only, and only ever in this harness: the profile is what tells us
+      # whether a cost is in the engine or in the plumbing around it.
+      - "--pprof-addr=0.0.0.0:6060"
 
   client:
     image: geneva-bench/bulk:latest

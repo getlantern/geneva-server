@@ -25,7 +25,12 @@ STREAMS="${2:-1}"
 BYTES=$(( GB * (1 << 30) / STREAMS ))
 
 HANDSHAKE='[TCP:flags:S]-duplicate-| \/'
-TAMPER_ALL='[TCP:flags:PA]-duplicate-| \/'
+# One packet in, one packet out, on every data packet: the common manipulation,
+# and the one the in-queue modified verdict is meant to make cheap.
+TAMPER_ALL='[TCP:flags:PA]-tamper{TCP:window:replace:100}-| \/'
+# Two packets out on every data packet: the worst case, since the extra packet
+# has to reach the wire through the raw socket.
+DUP_ALL='[TCP:flags:PA]-duplicate-| \/'
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 results=()
@@ -126,6 +131,7 @@ start_sidecar eval ""
 measure "eval/no-strategy"
 put "$HANDSHAKE"; measure "eval/handshake-only"
 put "$TAMPER_ALL"; measure "eval/tamper-every-packet"
+put "$DUP_ALL"; measure "eval/duplicate-every-packet"
 "${COMPOSE[@]}" stop -t 10 sidecar >/dev/null
 
 # prod refuses to boot without a strategy, so it starts on the handshake one.
@@ -135,6 +141,7 @@ step "mode=prod"
 start_sidecar prod "$HANDSHAKE"
 measure "prod/handshake-only"
 put "$TAMPER_ALL"; measure "prod/tamper-every-packet"
+put "$DUP_ALL"; measure "prod/duplicate-every-packet"
 put ""; measure "prod/rolled-back-to-empty"
 "${COMPOSE[@]}" stop -t 10 sidecar >/dev/null
 

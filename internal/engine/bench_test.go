@@ -35,18 +35,26 @@ func BenchmarkProcess(b *testing.B) {
 		// every byte of bulk traffic is decoded for nothing.
 		{"handshake-trigger/data1460", `[TCP:flags:S]-duplicate-| \/`, data},
 		{"handshake-trigger/syn", `[TCP:flags:S]-duplicate-| \/`, syn},
+		// The common manipulation: one packet in, one packet out, every data
+		// packet rewritten. This is the shape the in-queue modified verdict
+		// makes cheap.
+		{"tamper-data/data1460", `[TCP:flags:PA]-tamper{TCP:window:replace:100}-| \/`, data},
 		// Worst case: the trigger matches every data packet and the action
-		// duplicates it.
+		// duplicates it, so a second packet has to reach the wire somehow.
 		{"duplicate-data/data1460", `[TCP:flags:PA]-duplicate-| \/`, data},
 	}
 	for _, c := range cases {
 		b.Run(c.name, func(b *testing.B) {
 			e := mustEngine(b, c.dna)
+			// A reused scratch, as the NFQUEUE runtime does: one per queue
+			// goroutine. Benchmarking with nil would measure an allocator the
+			// hot path does not touch.
+			scratch := &Scratch{}
 			b.SetBytes(int64(len(c.raw)))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := e.Process(c.raw, strategy.DirectionOutbound); err != nil {
+				if _, err := e.Process(c.raw, strategy.DirectionOutbound, scratch); err != nil {
 					b.Fatal(err)
 				}
 			}
