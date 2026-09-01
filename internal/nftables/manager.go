@@ -104,6 +104,9 @@ func flagExpr(m FlagMatch) string {
 
 // flagNames spells a flags bitmask the way nft accepts it on both sides of a
 // comparison: a pipe-joined list of flag names, or a literal for the empty set.
+// A multi-flag list is parenthesized — without the parentheses nft parses the
+// bare pipes with its own operator precedence and installs a different match
+// than the one written (`flags & syn|ack` becomes `(flags & syn)|ack`).
 func flagNames(bits uint8) string {
 	if bits == 0 {
 		return "0x0"
@@ -114,7 +117,10 @@ func flagNames(bits uint8) string {
 			names = append(names, f.name)
 		}
 	}
-	return strings.Join(names, "|")
+	if len(names) > 1 {
+		return "(" + strings.Join(names, "|") + ")"
+	}
+	return names[0]
 }
 
 // CensorCounters are the named nftables counters the classification chain sorts

@@ -153,7 +153,14 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 		// body is piped from a file), which would otherwise fail validation.
 		dna := strings.TrimSpace(string(body))
 		if err := s.p.Apply(r.Context(), dna); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid strategy: "+err.Error())
+			// Only a strategy the client got wrong is the client's fault. A
+			// failure to program the kernel for a valid one is ours, and a 400
+			// there would send the caller off fixing a DNA that is fine.
+			if errors.Is(err, engine.ErrInvalidStrategy) {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "apply strategy: "+err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})

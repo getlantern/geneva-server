@@ -177,10 +177,10 @@ func (c *Controller) Start(ctx context.Context) error {
 func (c *Controller) Apply(ctx context.Context, dna string) error {
 	parsed, err := geneva.NewStrategy(dna)
 	if err != nil {
-		return fmt.Errorf("parse strategy: %w", err)
+		return fmt.Errorf("%w: parse: %w", engine.ErrInvalidStrategy, err)
 	}
 	if err := geneva.Validate(parsed); err != nil {
-		return fmt.Errorf("validate strategy: %w", err)
+		return fmt.Errorf("%w: validate: %w", engine.ErrInvalidStrategy, err)
 	}
 	desired := c.widen(Of(parsed))
 

@@ -133,6 +133,29 @@ func TestRulesetFlagScoping(t *testing.T) {
 	}
 }
 
+// TestRulesetMultiFlagParenthesized pins that multi-flag sets are rendered in
+// parentheses. Bare pipes parse under nft's own operator precedence, so
+// `tcp flags & syn|ack == syn|ack` installs cleanly as a completely different
+// match — a wildcard multi-flag trigger like SA* would silently mis-scope.
+func TestRulesetMultiFlagParenthesized(t *testing.T) {
+	m := New(Config{
+		Table: "geneva_multi", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		// A wildcard SYN+ACK trigger and an exact PSH+ACK one.
+		Outbound: Selector{Flags: []FlagMatch{{Mask: 0x12, Value: 0x12}}},
+		Inbound:  Selector{Flags: []FlagMatch{{Mask: 0xff, Value: 0x18}}},
+	})
+	rs := m.Ruleset()
+	wants := []string{
+		"tcp flags & (syn|ack) == (syn|ack)",
+		"tcp flags & 0xff == (psh|ack)",
+	}
+	for _, w := range wants {
+		if !strings.Contains(rs, w) {
+			t.Errorf("ruleset missing %q\n---\n%s", w, rs)
+		}
+	}
+}
+
 // TestRulesetOneDirection covers an outbound-only strategy: the inbound chain
 // must exist (it is where the reinjection guard and policy live) but carry no
 // queue rule.

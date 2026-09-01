@@ -76,7 +76,9 @@ func BenchmarkDecode(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				buf := make([]byte, len(raw))
 				copy(buf, raw)
-				pkt := gopacket.NewPacket(buf, layers.LayerTypeIPv4, gopacket.Default)
+				// The same decode options Process uses, so this measures the
+				// hot path's decode rather than gopacket's eager default.
+				pkt := gopacket.NewPacket(buf, layers.LayerTypeIPv4, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
 				if pkt.ErrorLayer() != nil {
 					b.Fatal("decode failed")
 				}

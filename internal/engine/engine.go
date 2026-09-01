@@ -149,16 +149,22 @@ func New(dna string) (*Engine, error) {
 	return e, nil
 }
 
+// ErrInvalidStrategy marks a strategy the caller supplied as unparseable or
+// invalid. The control surface uses it to tell a client error (a bad PUT body,
+// worth a 4xx) from an infrastructure failure applying a valid strategy (a
+// 5xx); anything that rejects a DNA on its content should wrap it.
+var ErrInvalidStrategy = errors.New("invalid strategy")
+
 // SetStrategy parses, validates, and atomically installs a new strategy. It is
 // safe to call concurrently with Process; in-flight packets finish against the
 // previous strategy and subsequent packets use the new one.
 func (e *Engine) SetStrategy(dna string) error {
 	s, err := geneva.NewStrategy(dna)
 	if err != nil {
-		return fmt.Errorf("parse strategy: %w", err)
+		return fmt.Errorf("%w: parse: %w", ErrInvalidStrategy, err)
 	}
 	if err := geneva.Validate(s); err != nil {
-		return fmt.Errorf("validate strategy: %w", err)
+		return fmt.Errorf("%w: validate: %w", ErrInvalidStrategy, err)
 	}
 	e.mu.Lock()
 	// The initial load from New is not a swap, so the counter reads as the
