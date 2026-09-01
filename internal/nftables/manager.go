@@ -7,7 +7,12 @@
 // it owns atomically, and the table name is disjoint from any other subsystem's.
 //
 // The steering is scoped to one TCP port in each direction — the proxy's
-// listening port — and to IPv4. The table family is `inet`, which sees both
+// listening port — to IPv4, and, when the loaded strategy allows it, to the
+// TCP flag combinations that strategy's triggers can actually match. A packet
+// no trigger can match is passed through byte-for-byte by the engine, so
+// leaving it in the kernel reaches the same result without the round trip; see
+// internal/steering. A direction whose forest is empty gets no rule at all,
+// which is what makes an unconfigured sidecar free. The table family is `inet`, which sees both
 // address families, so the queue rules match `meta nfproto ipv4` explicitly:
 // the engine and the reinjector are IPv4-only, so queueing IPv6 would spend
 // userspace round trips on packets the engine can only fail open on. Reinjected
@@ -31,6 +36,10 @@ type Config struct {
 	// Port is the proxy's TCP listening port. Egress is matched by source port,
 	// ingress by destination port.
 	Port uint16
+	// Outbound and Inbound narrow each direction to the packets the loaded
+	// strategy can act on. A zero Selector steers nothing in that direction.
+	Outbound Selector
+	Inbound  Selector
 	// OutQueue receives egress (outbound) packets; InQueue receives ingress.
 	OutQueue uint16
 	InQueue  uint16
@@ -39,6 +48,67 @@ type Config struct {
 	Mark uint32
 	// NFTPath is the nft binary to invoke (default "nft").
 	NFTPath string
+}
+
+// Selector narrows a direction's steering to the packets a strategy can match.
+//
+// It is derived from the strategy's triggers (see internal/steering), not
+// configured by hand: Any means "the strategy has a trigger nftables cannot
+// express, queue everything", a non-empty Flags means "queue only these flag
+// combinations", and the zero value means "this direction can match nothing, so
+// steer none of it".
+type Selector struct {
+	Any   bool
+	Flags []FlagMatch
+}
+
+// Empty reports whether this direction needs no rule at all.
+func (s Selector) Empty() bool { return !s.Any && len(s.Flags) == 0 }
+
+// FlagMatch matches the packets for which `tcp flags & Mask == Value`.
+type FlagMatch struct {
+	Mask  uint8
+	Value uint8
+}
+
+// nftFlagNames are the bits of the TCP flags byte in nftables' spelling.
+var nftFlagNames = []struct {
+	bit  uint8
+	name string
+}{
+	{0x01, "fin"},
+	{0x02, "syn"},
+	{0x04, "rst"},
+	{0x08, "psh"},
+	{0x10, "ack"},
+	{0x20, "urg"},
+	{0x40, "ecn"},
+	{0x80, "cwr"},
+}
+
+// flagExpr renders one FlagMatch as an nftables match expression.
+func flagExpr(m FlagMatch) string {
+	if m.Mask == 0xff {
+		// Equality over the whole byte: nft compares the masked value against
+		// the named set, and an empty set is spelled "0x0".
+		return fmt.Sprintf("tcp flags & 0xff == %s", flagNames(m.Value))
+	}
+	return fmt.Sprintf("tcp flags & %s == %s", flagNames(m.Mask), flagNames(m.Value))
+}
+
+// flagNames spells a flags bitmask the way nft accepts it on both sides of a
+// comparison: a pipe-joined list of flag names, or a literal for the empty set.
+func flagNames(bits uint8) string {
+	if bits == 0 {
+		return "0x0"
+	}
+	var names []string
+	for _, f := range nftFlagNames {
+		if bits&f.bit != 0 {
+			names = append(names, f.name)
+		}
+	}
+	return strings.Join(names, "|")
 }
 
 // Manager owns the lifecycle of the steering table.
@@ -59,22 +129,58 @@ func New(cfg Config) *Manager {
 
 // Ruleset returns the nft script that Install applies. Exposed so the exact
 // rules can be inspected and asserted in tests without touching the kernel.
+//
+// A direction with an empty Selector contributes no queue rule. When both are
+// empty the ruleset is empty too, and Install removes the table instead of
+// programming one.
 func (m *Manager) Ruleset() string {
+	if m.Idle() {
+		return ""
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "table inet %s {\n", m.cfg.Table)
 	// Egress (outbound): the proxy sends from Port toward the client/censor.
 	fmt.Fprintf(&b, "\tchain output {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook output priority 0; policy accept;\n")
 	fmt.Fprintf(&b, "\t\tmeta mark %#x accept\n", m.cfg.Mark)
-	fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp sport %d queue num %d bypass\n", m.cfg.Port, m.cfg.OutQueue)
+	for _, rule := range queueRules(m.cfg.Outbound, "sport", m.cfg.Port, m.cfg.OutQueue) {
+		fmt.Fprintf(&b, "\t\t%s\n", rule)
+	}
 	fmt.Fprintf(&b, "\t}\n")
 	// Ingress (inbound): packets arriving for the proxy's Port.
 	fmt.Fprintf(&b, "\tchain input {\n")
 	fmt.Fprintf(&b, "\t\ttype filter hook input priority 0; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d queue num %d bypass\n", m.cfg.Port, m.cfg.InQueue)
+	for _, rule := range queueRules(m.cfg.Inbound, "dport", m.cfg.Port, m.cfg.InQueue) {
+		fmt.Fprintf(&b, "\t\t%s\n", rule)
+	}
 	fmt.Fprintf(&b, "\t}\n")
 	fmt.Fprintf(&b, "}\n")
 	return b.String()
+}
+
+// Idle reports whether the configured selectors steer nothing, in which case no
+// table should exist at all.
+func (m *Manager) Idle() bool {
+	return m.cfg.Outbound.Empty() && m.cfg.Inbound.Empty()
+}
+
+// queueRules renders the queue rules for one direction: one per flag match, or
+// a single unconditional rule when the selector is Any.
+func queueRules(sel Selector, portKeyword string, port, queue uint16) []string {
+	base := fmt.Sprintf("meta nfproto ipv4 meta l4proto tcp tcp %s %d", portKeyword, port)
+	verdict := fmt.Sprintf("queue num %d bypass", queue)
+	switch {
+	case sel.Empty():
+		return nil
+	case sel.Any:
+		return []string{fmt.Sprintf("%s %s", base, verdict)}
+	default:
+		rules := make([]string, 0, len(sel.Flags))
+		for _, f := range sel.Flags {
+			rules = append(rules, fmt.Sprintf("%s %s %s", base, flagExpr(f), verdict))
+		}
+		return rules
+	}
 }
 
 // Install programs the steering table. Any pre-existing table of the same name
@@ -82,6 +188,11 @@ func (m *Manager) Ruleset() string {
 // stacks duplicate rules.
 func (m *Manager) Install(ctx context.Context) error {
 	_ = m.Remove(ctx) // best-effort: clear a stale table from a previous run
+	if m.Idle() {
+		// Nothing can match, so there is nothing to steer: leaving the table
+		// absent is what keeps an unconfigured sidecar off the data path.
+		return nil
+	}
 	if err := m.run(ctx, m.Ruleset()); err != nil {
 		return fmt.Errorf("install nftables rules: %w", err)
 	}

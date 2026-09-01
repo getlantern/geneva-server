@@ -10,7 +10,7 @@ import (
 )
 
 // buildTCP builds a serialized IPv4/TCP packet with a valid checksum and length.
-func buildTCP(t *testing.T, seq uint32, flags tcpFlags, payload []byte) []byte {
+func buildTCP(t testing.TB, seq uint32, flags tcpFlags, payload []byte) []byte {
 	t.Helper()
 	ip := &layers.IPv4{
 		Version:  4,
@@ -45,7 +45,7 @@ func buildTCP(t *testing.T, seq uint32, flags tcpFlags, payload []byte) []byte {
 
 type tcpFlags struct{ syn, ack, psh, rst, fin bool }
 
-func mustEngine(t *testing.T, dna string) *Engine {
+func mustEngine(t testing.TB, dna string) *Engine {
 	t.Helper()
 	e, err := New(dna)
 	if err != nil {

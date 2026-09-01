@@ -62,6 +62,9 @@ fails=$(echo "$health" | jq '.verdicts.inject_fails')
 [[ "$rei" -gt 0 ]]  && pass "packets were reinjected ($rei)"          || fail "no reinjection occurred"
 [[ "$fails" -eq 0 ]] && pass "zero reinjection failures"              || fail "$fails reinjection failures"
 
+# Inbound is only visible to the classifier because the sidecar runs with
+# --observe-inbound; scoping alone would leave it in the kernel, since this
+# strategy's forest cannot act on an inbound packet.
 step "Inbound TCP classification (the censor-reachability signal)"
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
@@ -73,12 +76,20 @@ undec=$(echo "$health" | jq '.inbound_tcp.events.undecodable')
 [[ "$data"  -gt 0 ]] && pass "inbound data segments classified ($data)" || fail "no inbound data classified"
 [[ "$undec" -eq 0 ]] && pass "every inbound packet was decodable"   || fail "$undec inbound packets undecodable"
 
-step "2. Steering is scoped to the proxy port only"
+step "2. Steering is scoped to the proxy port and to what the strategy can match"
 ruleset=$("${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server)
 echo "$ruleset"
 echo "$ruleset" | grep -q "tcp sport 8080" && pass "egress steering scoped to sport 8080" || fail "missing egress rule"
-echo "$ruleset" | grep -q "tcp dport 8080" && pass "ingress steering scoped to dport 8080" || fail "missing ingress rule"
 echo "$ruleset" | grep -q "9090" && fail "ruleset unexpectedly references port 9090" || pass "unrelated port 9090 not steered"
+# The strategy under test is outbound-only, so the inbound rule present here is
+# the observation floor (--observe-inbound), not the strategy's: it carries no
+# flag match, because the classifier wants every inbound packet.
+echo "$ruleset" | grep -qE "tcp dport 8080 queue" && pass "inbound steered unconditionally for the censor classifier" \
+  || fail "missing the inbound observation rule --observe-inbound asks for"
+# And the egress rule must carry the flag match, or bulk data is still being
+# queued for a strategy that only fires on PSH|ACK.
+echo "$ruleset" | grep -q "tcp flags" && pass "egress steering narrowed to the strategy's flags" \
+  || fail "egress rule not narrowed to the strategy's trigger flags"
 "${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:9090/healthz' >/dev/null \
   && pass "unrelated :9090 service still serves normally" \
   || fail ":9090 service broke"
@@ -94,7 +105,24 @@ got=$("${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8092/strateg
   && pass "service still serves after the in-place swap" \
   || fail "service broke after strategy swap"
 
-step "3. Clean teardown leaves no stale rules"
+step "3. An empty strategy takes the box off the data path entirely"
+"${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS -X PUT --data-binary "" http://server:8092/strategy' >/dev/null \
+  && pass "PUT of an empty strategy accepted" \
+  || fail "PUT of an empty strategy rejected"
+if "${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server >/dev/null 2>&1; then
+  fail "steering table still present with a strategy that can match nothing"
+else
+  pass "steering table removed: no packet takes the round trip"
+fi
+steering=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq -r .steering.steering)
+[[ "$steering" == "false" ]] && pass "health surface reports steering=false" || fail "health surface reports steering=$steering"
+"${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8080/healthz' >/dev/null \
+  && pass "service still serves with the sidecar idle" \
+  || fail "service broke after the strategy was withdrawn"
+# Put a strategy back, so the teardown check below exercises a live table.
+"${COMPOSE[@]}" exec -T tester sh -c "curl -fsS -X PUT --data-binary '$newdna' http://server:8092/strategy" >/dev/null
+
+step "4. Clean teardown leaves no stale rules"
 "${COMPOSE[@]}" stop -t 10 sidecar >/dev/null
 "${COMPOSE[@]}" logs sidecar 2>&1 | grep -q "nftables steering removed" \
   && pass "sidecar logged rule teardown on shutdown" \

@@ -17,9 +17,8 @@ import (
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/control"
 	"github.com/getlantern/geneva-server/internal/engine"
-	"github.com/getlantern/geneva-server/internal/netdev"
 	"github.com/getlantern/geneva-server/internal/nfqueue"
-	"github.com/getlantern/geneva-server/internal/nftables"
+	"github.com/getlantern/geneva-server/internal/steering"
 	"github.com/getlantern/geneva-server/internal/telemetry"
 )
 
@@ -37,6 +36,14 @@ func (s slogLogger) Debugf(f string, a ...any) {
 }
 
 func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
+
+// steeringLogger adapts slog to the steering controller's Infof/Errorf logger.
+// The controller's messages are lifecycle events, not per-packet, so they are
+// formatted unconditionally.
+type steeringLogger struct{ l *slog.Logger }
+
+func (s steeringLogger) Infof(f string, a ...any)  { s.l.Info(fmt.Sprintf(f, a...)) }
+func (s steeringLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
 
 func runServer(o *runCmd) error {
 	ctx := context.Background()
@@ -72,42 +79,35 @@ func runServer(o *runCmd) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Disable NIC offloads on the steered interface so NFQUEUE yields real,
-	// MTU-sized, fully-checksummed packets that reinjection can put back on the
-	// wire intact.
-	if o.Iface != "" {
-		summary, err := netdev.DisableOffload(ctx, o.EthtoolPath, o.Iface)
-		if err != nil {
-			return err
-		}
-		log.Info("NIC offloads adjusted", "iface", o.Iface, "result", summary)
-	}
+	// The controller owns both halves of "what reaches userspace": the NIC's
+	// offload state and the steering rules. It installs rules only for the
+	// packets the strategy's triggers can match, and nothing at all when the
+	// strategy can match nothing — which is what keeps an unassigned eval box
+	// and a rolled-back prod box off the data path entirely.
+	ctrl := steering.New(eng, steering.Config{
+		Table:       o.Table,
+		Port:        o.Port,
+		OutQueue:    o.OutQueue,
+		InQueue:     o.InQueue,
+		Mark:        uint32(o.Mark),
+		NFTPath:     o.NFTPath,
+		EthtoolPath: o.EthtoolPath,
+		Iface:       o.Iface,
+		NoNFT:       o.NoNFT,
 
-	// Program the steering rules. They are torn down on any exit path.
-	nft := nftables.New(nftables.Config{
-		Table:    o.Table,
-		Port:     o.Port,
-		OutQueue: o.OutQueue,
-		InQueue:  o.InQueue,
-		Mark:     uint32(o.Mark),
-		NFTPath:  o.NFTPath,
-	})
-	if !o.NoNFT {
-		if err := nft.Install(ctx); err != nil {
-			return err
-		}
-		log.Info("nftables steering installed", "table", o.Table, "port", o.Port)
-		defer func() {
-			// Use a fresh context: the root one is already cancelled at shutdown.
-			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := nft.Remove(rmCtx); err != nil {
-				log.Error("nftables teardown failed", "err", err)
-			} else {
-				log.Info("nftables steering removed")
-			}
-		}()
+		ObserveInbound: o.ObserveInbound,
+	}, steeringLogger{l: log})
+	if err := ctrl.Start(ctx); err != nil {
+		return err
 	}
+	defer func() {
+		// Use a fresh context: the root one is already cancelled at shutdown.
+		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ctrl.Close(rmCtx); err != nil {
+			log.Error("steering teardown failed", "err", err)
+		}
+	}()
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
@@ -154,7 +154,7 @@ func runServer(o *runCmd) error {
 	}
 
 	// Control/health surface.
-	ctrl := control.New(control.Providers{
+	api := control.New(control.Providers{
 		Mode:       o.Mode,
 		Version:    version,
 		Commit:     commit,
@@ -162,10 +162,14 @@ func runServer(o *runCmd) error {
 		Canary:     pool,
 		Verdicts:   func() any { return rt.Snapshot() },
 		InboundTCP: func() any { return censorObs.Snapshot() },
+		// A strategy change is not just an engine swap: it can put the box on
+		// or take it off the data path, so it has to go through the controller.
+		Apply:    ctrl.Apply,
+		Steering: func() any { return ctrl.State() },
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,
-		Handler:           ctrl.Handler(),
+		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bound the whole request read: strategy uploads call io.ReadAll, so a
 		// slow client must not be able to hold a handler open indefinitely.

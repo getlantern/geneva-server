@@ -61,6 +61,7 @@ type runCmd struct {
 	CanaryCapacity int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
 	NFTPath        string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
 	NoNFT          bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
+	ObserveInbound bool     `arg:"--observe-inbound" help:"keep inbound packets flowing through userspace while a strategy is loaded, for the censor-reachability signal; costs a userspace round trip per inbound packet"`
 	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
 	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
 }
@@ -144,18 +145,23 @@ func (o *runCmd) resolveStrategy() (string, error) {
 	if o.Strategy != "" && o.StrategyFile != "" {
 		return "", fmt.Errorf("--strategy and --strategy-file are mutually exclusive")
 	}
+	dna := strings.TrimSpace(o.Strategy)
 	if o.StrategyFile != "" {
 		b, err := os.ReadFile(o.StrategyFile)
 		if err != nil {
 			return "", fmt.Errorf("read strategy file: %w", err)
 		}
 		// Tolerate a trailing newline in an operator-managed file.
-		return strings.TrimSpace(string(b)), nil
+		dna = strings.TrimSpace(string(b))
 	}
-	if o.Strategy == "" && o.Mode == "prod" {
-		return "", fmt.Errorf("prod mode requires --strategy or --strategy-file")
+	// Checked against the resolved DNA, not against the flags: an empty
+	// strategy file passed --strategy-file used to satisfy the flag check and
+	// boot prod in pass-through. That now also means no steering at all, so a
+	// truncated file would take a prod box off the data path silently.
+	if dna == "" && o.Mode == "prod" {
+		return "", fmt.Errorf("prod mode requires a non-empty strategy (--strategy or --strategy-file)")
 	}
-	return strings.TrimSpace(o.Strategy), nil
+	return dna, nil
 }
 
 func (o *runCmd) validate() error {

@@ -38,6 +38,14 @@ run = "golangci-lint run ./..."
 description = "go vet over the module"
 run = "make vet"
 
+[tasks.bench]
+description = "engine microbenchmarks (per-packet cost, no kernel in the loop)"
+run = "make bench"
+
+[tasks."bench:e2e"]
+description = "data-plane benchmark over docker: throughput + sidecar CPU per GB"
+run = "make bench-e2e"
+
 [tasks.e2e]
 description = "full docker-networking e2e (needs docker + a netfilter-capable kernel)"
 run = "make e2e"

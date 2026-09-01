@@ -24,7 +24,62 @@ import (
 // keep packets MTU-sized; checksum/scatter-gather offloads keep checksums real.
 var offloadFeatures = []string{"gso", "tso", "gro", "gre", "tx", "rx", "sg", "lro", "ufo"}
 
-// DisableOffload turns off segmentation and checksum offloads on iface.
+// restoreOrder re-enables features in dependency order. Segmentation offloads
+// require scatter-gather and tx checksumming, so restoring in the disable order
+// makes the kernel reject `tso on` and `gso on` as unsupported and silently
+// leaves them off.
+var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "gre", "lro", "ufo"}
+
+// Disabled records the features Disable actually turned off on an interface, so
+// Restore can put back exactly those and nothing else.
+type Disabled struct {
+	ethtoolPath string
+	iface       string
+	features    []string
+	skipped     []string
+}
+
+// Summary describes what changed, for logging.
+func (d *Disabled) Summary() string {
+	if d == nil {
+		return "unchanged=[all]"
+	}
+	return fmt.Sprintf("disabled=[%s] unchanged=[%s]",
+		strings.Join(d.features, " "), strings.Join(d.skipped, " "))
+}
+
+// Restore re-enables the features Disable turned off. Failures are collected
+// rather than returned on the first one: a partial restore is better than
+// stopping halfway, and the caller logs rather than aborts — the sidecar is on
+// its way out by the time this runs.
+func (d *Disabled) Restore(ctx context.Context) error {
+	if d == nil || len(d.features) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(d.features))
+	for _, f := range d.features {
+		want[f] = true
+	}
+	var failed []string
+	for _, f := range restoreOrder {
+		if !want[f] {
+			continue
+		}
+		cmd := exec.CommandContext(ctx, d.ethtoolPath, "-K", d.iface, f, "on")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			_ = out
+			failed = append(failed, f)
+		}
+	}
+	d.features = nil
+	if len(failed) > 0 {
+		return fmt.Errorf("could not re-enable offloads on %s: %s", d.iface, strings.Join(failed, " "))
+	}
+	return nil
+}
+
+// Disable turns off segmentation and checksum offloads on iface and returns
+// what it changed.
 //
 // Individual features that cannot be changed are reported in the returned
 // summary rather than as an error: some virtual interfaces expose a subset as
@@ -33,17 +88,17 @@ var offloadFeatures = []string{"gso", "tso", "gro", "gre", "tx", "rx", "sg", "lr
 // interface, and no feature changeable at all — because each of them means
 // NFQUEUE would go on receiving GSO/checksum-offloaded packets that cannot be
 // reinjected intact.
-func DisableOffload(ctx context.Context, ethtoolPath, iface string) (string, error) {
+func Disable(ctx context.Context, ethtoolPath, iface string) (*Disabled, error) {
 	if ethtoolPath == "" {
 		ethtoolPath = "ethtool"
 	}
 	if _, err := exec.LookPath(ethtoolPath); err != nil {
-		return "", fmt.Errorf("ethtool not found (needed to disable NIC offloads on %s): %w", iface, err)
+		return nil, fmt.Errorf("ethtool not found (needed to disable NIC offloads on %s): %w", iface, err)
 	}
 	// A missing interface is a hard error, not a "feature unchanged": otherwise a
 	// typo in --iface would silently leave every offload on.
 	if _, err := os.Stat("/sys/class/net/" + iface); err != nil {
-		return "", fmt.Errorf("interface %q not found: %w", iface, err)
+		return nil, fmt.Errorf("interface %q not found: %w", iface, err)
 	}
 	var ok, skipped []string
 	for _, f := range offloadFeatures {
@@ -60,8 +115,8 @@ func DisableOffload(ctx context.Context, ethtoolPath, iface string) (string, err
 	// context cancellation, an interface that rejects every request) — surface it
 	// rather than letting NFQUEUE receive GSO/checksum-offloaded packets.
 	if len(ok) == 0 {
-		return "", fmt.Errorf("failed to disable any offload on %q (check CAP_NET_ADMIN); attempted: %s",
+		return nil, fmt.Errorf("failed to disable any offload on %q (check CAP_NET_ADMIN); attempted: %s",
 			iface, strings.Join(offloadFeatures, " "))
 	}
-	return fmt.Sprintf("disabled=[%s] unchanged=[%s]", strings.Join(ok, " "), strings.Join(skipped, " ")), nil
+	return &Disabled{ethtoolPath: ethtoolPath, iface: iface, features: ok, skipped: skipped}, nil
 }

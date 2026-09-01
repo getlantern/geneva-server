@@ -36,6 +36,9 @@ sidecar run `ethtool -K` to turn the offloads off, so NFQUEUE yields real,
 MTU-sized, fully-checksummed packets. Always set it to the interface carrying the
 proxy's traffic.
 
+The offloads come down only while something is actually being steered, and go
+back up when it stops — a sidecar with no strategy leaves the NIC alone.
+
 ## Modes
 
 - **prod** — the assigned strategy on a fleet box:
@@ -154,8 +157,47 @@ Mirror the `lantern-box` provisioning flow:
 3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
    the sidecar stopped until the next boot.
 
-In eval mode the strategy file is optional: the sidecar starts in pass-through
-until the GA brain assigns a candidate over `PUT /strategy`.
+In eval mode the strategy file is optional: the sidecar starts with no strategy,
+steering nothing at all, until the GA brain assigns a candidate over
+`PUT /strategy`.
 
-The nftables rules are runtime-owned: the sidecar creates its table on start and
-deletes it on stop, so provisioning must **not** install steering rules itself.
+The nftables rules are runtime-owned: the sidecar programs its table from the
+loaded strategy and deletes it on stop, so provisioning must **not** install
+steering rules itself.
+
+## What gets steered
+
+Steering follows the strategy, because the NFQUEUE round trip — not the
+manipulation — is what the sidecar costs. Measured on a 1-vCPU box running
+vless+REALITY, queueing every packet on the proxy's port cost 76% of a bulk
+transfer's throughput *with no strategy loaded*, while a strategy that duplicated
+every data packet cost only ~4% more than that.
+
+A Geneva strategy hands back any packet its triggers do not match, byte for byte.
+So the rules are narrowed to what can match:
+
+| Strategy | Steered |
+| --- | --- |
+| no strategy (eval boot, or `PUT ""`) | nothing: no table, no rules, offloads untouched |
+| triggers on TCP flags, e.g. `[TCP:flags:S]` | only those flag combinations, per direction |
+| an outbound-only forest | outbound only; inbound stays in the kernel |
+| a trigger nftables cannot express (`TCP:load`, `IP:ttl`, options) | everything on the port, in that direction |
+
+`GET /healthz` reports this under `steering`, which is where to look first when a
+box is unexpectedly fast or slow:
+
+```json
+"steering": {"steering": true, "outbound": "flags&0xff==0x02", "inbound": "none", "offloads_disabled": true}
+```
+
+### `--observe-inbound`
+
+The censor-reachability signal (inbound SYN-to-data ratio, the estimate of a
+box's IP being burned) needs inbound packets in userspace, which a strategy that
+only acts outbound would not otherwise ask for. `--observe-inbound` keeps inbound
+flowing while a strategy is loaded, at the cost of a round trip per inbound
+packet — roughly half the packets on a busy proxy. It is off by default, and it
+never overrides the no-strategy case: an idle sidecar stays off the data path.
+
+An eval box carries no client traffic, so turning it on there costs nothing
+worth counting. On a prod box it is a real throughput trade.

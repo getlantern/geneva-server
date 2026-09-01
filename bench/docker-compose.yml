@@ -1,0 +1,61 @@
+# Benchmark topology. Mirrors e2e/docker-compose.yml, with the echo server
+# replaced by a streaming bulk server and the sidecar's arguments driven from
+# the environment so the runner can sweep modes without editing this file.
+#
+#   server  — the "proxy": bulk data on :8080, and owner of the network namespace
+#   sidecar — geneva-server sharing the server's netns, steering :8080
+#   client  — pulls bulk data across the bridge; the load generator
+#   probe    — on-demand container in the server's netns for nft/ethtool state
+name: geneva-bench
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.bulk
+    image: geneva-bench/bulk:latest
+    command: ["-serve", ":8080"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
+      interval: "1s"
+      timeout: "2s"
+      retries: 30
+
+  sidecar:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: geneva-bench/sidecar:latest
+    network_mode: "service:server"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    depends_on:
+      server:
+        condition: service_healthy
+    volumes:
+      - ./strategy.dna:/strategy.dna:ro
+    command:
+      - "run"
+      - "--mode=${GENEVA_MODE:-eval}"
+      - "--market=RU"
+      - "--port=8080"
+      - "--iface=eth0"
+      - "--control-addr=0.0.0.0:8092"
+      # Always a file, never a flag toggle: the runner rewrites strategy.dna
+      # between conditions, and an empty file is exactly the pass-through case.
+      - "--strategy-file=/strategy.dna"
+
+  client:
+    image: geneva-bench/bulk:latest
+    depends_on:
+      server:
+        condition: service_healthy
+    profiles: ["tools"]
+    entrypoint: ["sleep", "infinity"]
+
+  probe:
+    image: geneva-bench/sidecar:latest
+    network_mode: "service:server"
+    profiles: ["tools"]
+    entrypoint: ["sleep", "infinity"]
