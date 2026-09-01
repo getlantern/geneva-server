@@ -19,11 +19,13 @@ import (
 	"github.com/getlantern/geneva-server/internal/control"
 	"github.com/getlantern/geneva-server/internal/engine"
 	"github.com/getlantern/geneva-server/internal/nfqueue"
+	"github.com/getlantern/geneva-server/internal/nftables"
 	"github.com/getlantern/geneva-server/internal/steering"
 	"github.com/getlantern/geneva-server/internal/telemetry"
 )
 
-// slogLogger adapts slog to the runtime's Debugf/Errorf logger.
+// slogLogger adapts slog to the printf-style loggers the runtime and the
+// steering controller want; one adapter satisfies both interfaces.
 type slogLogger struct{ l *slog.Logger }
 
 // Debugf checks the level before formatting. The runtime's debug path is the
@@ -36,15 +38,10 @@ func (s slogLogger) Debugf(f string, a ...any) {
 	s.l.Debug(fmt.Sprintf(f, a...))
 }
 
+// Infof formats unconditionally: its callers log lifecycle events, not
+// per-packet ones.
+func (s slogLogger) Infof(f string, a ...any)  { s.l.Info(fmt.Sprintf(f, a...)) }
 func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
-
-// steeringLogger adapts slog to the steering controller's Infof/Errorf logger.
-// The controller's messages are lifecycle events, not per-packet, so they are
-// formatted unconditionally.
-type steeringLogger struct{ l *slog.Logger }
-
-func (s steeringLogger) Infof(f string, a ...any)  { s.l.Info(fmt.Sprintf(f, a...)) }
-func (s steeringLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
 
 // censorReadInterval is how often the kernel classification counters are read.
 // One nft invocation per read, feeding a metric exported on a much slower
@@ -85,20 +82,22 @@ func runServer(o *runCmd) error {
 	// strategy can match nothing — which is what keeps an unassigned eval box
 	// and a rolled-back prod box off the data path entirely.
 	ctrl := steering.New(eng, steering.Config{
-		Mode:        o.Mode,
-		Table:       o.Table,
-		Port:        o.Port,
-		OutQueue:    o.OutQueue,
-		InQueue:     o.InQueue,
-		Mark:        uint32(o.Mark),
-		NFTPath:     o.NFTPath,
+		Mode: o.Mode,
+		NFT: nftables.Config{
+			Table:    o.Table,
+			Port:     o.Port,
+			OutQueue: o.OutQueue,
+			InQueue:  o.InQueue,
+			Mark:     uint32(o.Mark),
+			NFTPath:  o.NFTPath,
+			Censor:   o.CensorCounters,
+		},
 		EthtoolPath: o.EthtoolPath,
 		Iface:       o.Iface,
 		NoNFT:       o.NoNFT,
 
-		CensorCounters: o.CensorCounters,
 		ObserveInbound: o.ObserveInbound,
-	}, steeringLogger{l: log})
+	}, slogLogger{l: log})
 	if err := ctrl.Start(ctx); err != nil {
 		return err
 	}

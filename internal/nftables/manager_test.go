@@ -6,16 +6,18 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/getlantern/geneva-server/internal/testutil"
 )
 
-// anyBoth is the widest selector pair: a strategy whose triggers cannot be
-// expressed in nftables, so every packet on the port must be queued.
-var anyBoth = Config{Outbound: Selector{Any: true}, Inbound: Selector{Any: true}}
+// anySel is the widest selector: a strategy whose triggers cannot be expressed
+// in nftables, so every packet on the port must be queued.
+var anySel = Selector{Any: true}
 
 func TestRulesetScoping(t *testing.T) {
 	m := New(Config{
 		Table: "geneva_test", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
-		Outbound: anyBoth.Outbound, Inbound: anyBoth.Inbound,
+		Outbound: anySel, Inbound: anySel,
 	})
 	rs := m.Ruleset()
 
@@ -61,7 +63,7 @@ func TestInstallRemoveLifecycle(t *testing.T) {
 	ctx := context.Background()
 	m := New(Config{
 		Table: "geneva_lifecycle_test", Port: 18080, OutQueue: 200, InQueue: 201, Mark: 0x67656e,
-		Outbound: anyBoth.Outbound, Inbound: anyBoth.Inbound,
+		Outbound: anySel, Inbound: anySel,
 	})
 	t.Cleanup(func() { _ = m.Remove(ctx) })
 
@@ -72,28 +74,19 @@ func TestInstallRemoveLifecycle(t *testing.T) {
 	if err := m.Install(ctx); err != nil {
 		t.Fatalf("second install: %v", err)
 	}
-	if !tableExists(t, "geneva_lifecycle_test") {
+	if !testutil.TableExists(t, "geneva_lifecycle_test") {
 		t.Fatal("table absent after install")
 	}
 	if err := m.Remove(ctx); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if tableExists(t, "geneva_lifecycle_test") {
+	if testutil.TableExists(t, "geneva_lifecycle_test") {
 		t.Fatal("table present after remove: stale rules leaked")
 	}
 	// Remove on an absent table is a no-op, not an error.
 	if err := m.Remove(ctx); err != nil {
 		t.Fatalf("remove of absent table errored: %v", err)
 	}
-}
-
-func tableExists(t *testing.T, name string) bool {
-	t.Helper()
-	out, err := exec.Command("nft", "list", "tables", "inet").CombinedOutput()
-	if err != nil {
-		t.Fatalf("nft list tables: %v: %s", err, out)
-	}
-	return strings.Contains(string(out), "table inet "+name)
 }
 
 // TestIdleSelectorsProgramNothing pins the property that makes an unconfigured

@@ -6,11 +6,11 @@ import (
 	"context"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 
 	"github.com/getlantern/geneva-server/internal/engine"
 	"github.com/getlantern/geneva-server/internal/nftables"
+	"github.com/getlantern/geneva-server/internal/testutil"
 )
 
 // TestObservationFloorIsEvalOnly is the controller-side half of the mode gate.
@@ -84,7 +84,7 @@ func TestStartClearsStaleTableWhenIdle(t *testing.T) {
 		t.Fatalf("install stale table: %v", err)
 	}
 	t.Cleanup(func() { _ = stale.Remove(ctx) })
-	if !tableExists(t, table) {
+	if !testutil.TableExists(t, table) {
 		t.Fatal("stale table absent after install")
 	}
 
@@ -93,23 +93,14 @@ func TestStartClearsStaleTableWhenIdle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("engine.New: %v", err)
 	}
-	ctrl := New(eng, Config{Mode: "eval", Table: table, Port: 18081, OutQueue: 300, InQueue: 301, Mark: 0x67656e}, nil)
+	ctrl := New(eng, Config{Mode: "eval", NFT: nftables.Config{Table: table, Port: 18081, OutQueue: 300, InQueue: 301, Mark: 0x67656e}}, nil)
 	if err := ctrl.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	if tableExists(t, table) {
+	if testutil.TableExists(t, table) {
 		t.Error("stale table survived a start with no strategy: the box is steering with nothing to apply")
 	}
 	if st := ctrl.State(); st.Steering {
 		t.Errorf("State reports steering with no strategy: %+v", st)
 	}
-}
-
-func tableExists(t *testing.T, name string) bool {
-	t.Helper()
-	out, err := exec.Command("nft", "list", "tables", "inet").CombinedOutput()
-	if err != nil {
-		t.Fatalf("nft list tables: %v: %s", err, out)
-	}
-	return strings.Contains(string(out), "table inet "+name)
 }

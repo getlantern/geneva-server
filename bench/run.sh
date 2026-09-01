@@ -23,6 +23,7 @@ cd "$(dirname "$0")"
 # rewritten per condition and deliberately not tracked.
 : > strategy.dna
 COMPOSE=(docker compose -f docker-compose.yml)
+source ../scripts/harness-lib.sh
 GIB="${1:-2}"
 STREAMS="${2:-1}"
 BYTES=$(( GIB * (1 << 30) / STREAMS ))
@@ -35,15 +36,7 @@ TAMPER_ALL='[TCP:flags:PA]-tamper{TCP:window:replace:100}-| \/'
 # has to reach the wire through the raw socket.
 DUP_ALL='[TCP:flags:PA]-duplicate-| \/'
 
-step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 results=()
-
-cleanup() {
-  if [[ "${KEEP:-0}" != "1" ]]; then
-    "${COMPOSE[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
 
 # SIDECAR_EXPECTED says whether a sidecar should be answering. While it is "1",
 # telemetry that cannot be collected aborts the run instead of reading as zero:
@@ -80,16 +73,15 @@ packets_in() {
 # seconds per GiB, and nanoseconds of sidecar CPU per steered packet.
 measure() {
   local label="$1"
-  local cpu0 cpu1 pkt0 pkt1 mbps cpu_s gb_moved
+  local cpu0 cpu1 pkt0 pkt1 mbps cpu_s
   cpu0=$(sidecar_cpu); pkt0=$(packets_in)
   mbps=$("${COMPOSE[@]}" exec -T client /usr/local/bin/bulk \
            -get http://server:8080 -bytes "$BYTES" -streams "$STREAMS" | tail -1)
   cpu1=$(sidecar_cpu); pkt1=$(packets_in)
 
-  gb_moved=$(awk -v g="$GIB" 'BEGIN{print g}')
   cpu_s=$(awk -v a="$cpu0" -v b="$cpu1" 'BEGIN{printf "%.3f", b-a}')
   local per_gb ns_pkt pkts
-  per_gb=$(awk -v c="$cpu_s" -v g="$gb_moved" 'BEGIN{printf "%.3f", (g>0)?c/g:0}')
+  per_gb=$(awk -v c="$cpu_s" -v g="$GIB" 'BEGIN{printf "%.3f", (g>0)?c/g:0}')
   pkts=$(( pkt1 - pkt0 ))
   ns_pkt=$(awk -v c="$cpu_s" -v p="$pkts" 'BEGIN{printf "%.0f", (p>0)?c*1e9/p:0}')
   printf '  %-26s %8s MiB/s  cpu %6ss   %6s s/GiB  %9s pkts   %5s ns/pkt\n' \
@@ -103,23 +95,15 @@ put() {
     "curl -fsS -X PUT --data-binary '$1' http://server:8092/strategy >/dev/null"
 }
 
-wait_healthy() {
-  for _ in $(seq 1 30); do
-    if "${COMPOSE[@]}" exec -T client curl -fsS http://server:8092/healthz >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  echo "sidecar control surface never came up" >&2
-  "${COMPOSE[@]}" logs sidecar | tail -20 >&2
-  exit 1
-}
-
 start_sidecar() {
   local mode="$1" dna="$2"
   printf '%s' "$dna" > strategy.dna
   GENEVA_MODE="$mode" "${COMPOSE[@]}" up -d --no-deps sidecar >/dev/null
-  wait_healthy
+  if ! wait_healthy client; then
+    echo "sidecar control surface never came up" >&2
+    "${COMPOSE[@]}" logs sidecar | tail -20 >&2
+    exit 1
+  fi
   SIDECAR_EXPECTED=1
 }
 

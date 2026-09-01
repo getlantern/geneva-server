@@ -14,6 +14,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -272,7 +273,7 @@ func classify(raw []byte, out []gopacket.Packet, scratch *Scratch) Result {
 	case 1:
 		data := out[0].Data()
 		outcome := OutcomeTampered
-		if bytesEqual(raw, data) {
+		if bytes.Equal(raw, data) {
 			outcome = OutcomeUnchanged
 		}
 		return Result{Outcome: outcome, Packets: append(scratch.outputs(1), data)}
@@ -304,15 +305,3 @@ func (e *Engine) record(r Result) {
 
 // Snapshot returns a value copy of the cumulative stats with overhead ratios.
 func (e *Engine) Snapshot() Snapshot { return e.Stats.snapshot() }
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}

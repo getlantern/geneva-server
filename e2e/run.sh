@@ -14,17 +14,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 COMPOSE=(docker compose -f docker-compose.yml)
-
-pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
-fail() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; exit 1; }
-step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
-
-cleanup() {
-  if [[ "${KEEP:-0}" != "1" ]]; then
-    "${COMPOSE[@]}" --profile tools down -v --remove-orphans >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT
+source ../scripts/harness-lib.sh
 
 step "Build and start server + sidecar"
 "${COMPOSE[@]}" up -d --build server sidecar
@@ -32,13 +22,7 @@ step "Build and start server + sidecar"
 
 # Wait for the control surface (proves the sidecar came up and installed rules).
 step "Wait for the control/health surface"
-for i in $(seq 1 30); do
-  if "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz >/dev/null 2>&1; then
-    break
-  fi
-  [[ $i -eq 30 ]] && fail "control surface never became healthy"
-  sleep 1
-done
+wait_healthy tester || fail "control surface never became healthy"
 mode=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq -r .mode)
 [[ "$mode" == "prod" ]] && pass "control surface healthy (mode=$mode)" || fail "unexpected mode: $mode"
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"strings"
 )
 
 // ReadCounters returns the packet counts of the table's named counters, keyed by
@@ -37,7 +36,6 @@ type counterList struct {
 	Nftables []struct {
 		Counter *struct {
 			Name    string `json:"name"`
-			Table   string `json:"table"`
 			Packets uint64 `json:"packets"`
 		} `json:"counter"`
 	} `json:"nftables"`
@@ -62,9 +60,5 @@ func parseCounters(out []byte) (map[string]uint64, error) {
 // message goes to stderr, which exec.Cmd.Output captures into ExitError.Stderr.
 func isMissingTableOutput(err error) bool {
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		return false
-	}
-	s := string(exitErr.Stderr)
-	return strings.Contains(s, "No such file or directory") || strings.Contains(s, "does not exist")
+	return errors.As(err, &exitErr) && missingTableMessage(string(exitErr.Stderr))
 }

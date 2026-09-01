@@ -114,9 +114,7 @@ func (d *Disabled) Restore(ctx context.Context) error {
 		if !want[f] {
 			continue
 		}
-		cmd := exec.CommandContext(ctx, d.ethtoolPath, "-K", d.iface, f, "on")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			_ = out
+		if err := exec.CommandContext(ctx, d.ethtoolPath, "-K", d.iface, f, "on").Run(); err != nil {
 			failed = append(failed, f)
 		}
 	}
@@ -162,10 +160,8 @@ func Disable(ctx context.Context, ethtoolPath, iface string) (*Disabled, error) 
 			skipped = append(skipped, f)
 			continue
 		}
-		cmd := exec.CommandContext(ctx, ethtoolPath, "-K", iface, f, "off")
-		if out, err := cmd.CombinedOutput(); err != nil {
+		if err := exec.CommandContext(ctx, ethtoolPath, "-K", iface, f, "off").Run(); err != nil {
 			// Feature fixed/unsupported on this interface; not fatal on its own.
-			_ = out
 			skipped = append(skipped, f)
 			continue
 		}

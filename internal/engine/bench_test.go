@@ -7,6 +7,8 @@ import (
 	"github.com/getlantern/geneva/strategy"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
+
+	"github.com/getlantern/geneva-server/internal/testutil"
 )
 
 // The per-packet cost of the engine is what NFQUEUE steering multiplies by the
@@ -19,8 +21,8 @@ import (
 // pass-through engine pays the first two and nothing else, which is why an
 // unconfigured sidecar is not free.
 func BenchmarkProcess(b *testing.B) {
-	data := buildTCP(b, 1, tcpFlags{ack: true, psh: true}, make([]byte, 1460))
-	syn := buildTCP(b, 1, tcpFlags{syn: true}, nil)
+	data := testutil.BuildTCP(b, 1, testutil.TCPFlags{ACK: true, PSH: true}, make([]byte, 1460))
+	syn := testutil.BuildTCP(b, 1, testutil.TCPFlags{SYN: true}, nil)
 
 	cases := []struct {
 		name string
@@ -66,7 +68,7 @@ func BenchmarkProcess(b *testing.B) {
 // beyond this is the copy plus the strategy itself.
 func BenchmarkDecode(b *testing.B) {
 	for _, size := range []int{0, 1460} {
-		raw := buildTCP(b, 1, tcpFlags{ack: true, psh: true}, make([]byte, size))
+		raw := testutil.BuildTCP(b, 1, testutil.TCPFlags{ACK: true, PSH: true}, make([]byte, size))
 		b.Run(fmt.Sprintf("payload%d", size), func(b *testing.B) {
 			b.SetBytes(int64(len(raw)))
 			b.ReportAllocs()

@@ -44,11 +44,11 @@ import (
 // The result is one syscall per read plus one per manipulated packet, instead
 // of three or more per packet, and no per-packet allocation at all.
 
-// Netlink and nfnetlink constants. Spelled out here rather than pulled from a
-// dependency: they are kernel ABI, they do not change, and the hot path should
-// not have to guess at another library's mapping of them.
+// Netlink and nfnetlink constants. The generic framing values are aliased from
+// x/sys/unix, which is the authoritative source; the NFQNL_* message, attribute
+// and verdict values are spelled out because x/sys does not export them.
 const (
-	nfnlSubsysQueue = 0x03
+	nfnlSubsysQueue = unix.NFNL_SUBSYS_QUEUE
 
 	nfqnlMsgPacket       = 0
 	nfqnlMsgVerdict      = 1
@@ -80,10 +80,10 @@ const (
 	nfDrop   = 0
 	nfAccept = 1
 
-	nlmsgHdrLen  = 16
+	nlmsgHdrLen  = unix.NLMSG_HDRLEN
 	nfgenmsgLen  = 4
-	nlaHdrLen    = 4
-	nlmsgAlignTo = 4
+	nlaHdrLen    = unix.NLA_HDRLEN
+	nlmsgAlignTo = unix.NLMSG_ALIGNTO
 
 	// readBufSize holds many MTU-sized packets, or one 64 KB packet from an
 	// interface whose offloads are still on, in a single read.
@@ -392,9 +392,11 @@ func (q *queue) marshalVerdict(msgType int, id uint32, v int, replacement []byte
 		q.vbuf = make([]byte, 0, total*2)
 	}
 	b := q.vbuf[:total]
-	for i := range b {
-		b[i] = 0
-	}
+	// Every other byte of the message is written below, so only the fields that
+	// must be zero are cleared: sequence and port id, plus the alignment tail
+	// after a replacement payload. Clearing the whole buffer would double the
+	// memory traffic of the marshal for a full-size replaced packet.
+	clear(b[8:16])
 
 	binary.LittleEndian.PutUint32(b[0:4], uint32(total))
 	binary.LittleEndian.PutUint16(b[4:6], uint16((nfnlSubsysQueue<<8)|msgType))
@@ -419,6 +421,7 @@ func (q *queue) marshalVerdict(msgType int, id uint32, v int, replacement []byte
 		binary.LittleEndian.PutUint16(b[off:off+2], uint16(nlaHdrLen+len(replacement)))
 		binary.LittleEndian.PutUint16(b[off+2:off+4], nfqaPayload)
 		copy(b[off+nlaHdrLen:], replacement)
+		clear(b[off+nlaHdrLen+len(replacement):])
 	}
 	return b
 }
@@ -451,8 +454,4 @@ func cfgParams(maxPacketLen uint32) []byte {
 	return b
 }
 
-func be32(v uint32) []byte {
-	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, v)
-	return b
-}
+func be32(v uint32) []byte { return binary.BigEndian.AppendUint32(nil, v) }

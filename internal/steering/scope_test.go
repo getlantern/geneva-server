@@ -5,11 +5,10 @@ import (
 
 	"github.com/getlantern/geneva"
 	"github.com/getlantern/geneva/strategy"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
 
 	"github.com/getlantern/geneva-server/internal/engine"
 	"github.com/getlantern/geneva-server/internal/nftables"
+	"github.com/getlantern/geneva-server/internal/testutil"
 )
 
 func mustScope(t *testing.T, dna string) Scope {
@@ -126,12 +125,12 @@ func TestScopeNeverNarrowerThanStrategy(t *testing.T) {
 		flags uint8
 		raw   []byte
 	}{
-		{"syn", 0x02, buildTCP(t, tcpBits{syn: true}, nil)},
-		{"syn-ack", 0x12, buildTCP(t, tcpBits{syn: true, ack: true}, nil)},
-		{"ack", 0x10, buildTCP(t, tcpBits{ack: true}, nil)},
-		{"psh-ack-data", 0x18, buildTCP(t, tcpBits{psh: true, ack: true}, []byte("GET"))},
-		{"rst", 0x04, buildTCP(t, tcpBits{rst: true}, nil)},
-		{"fin-ack", 0x11, buildTCP(t, tcpBits{fin: true, ack: true}, nil)},
+		{"syn", 0x02, testutil.BuildTCP(t, 1, testutil.TCPFlags{SYN: true}, nil)},
+		{"syn-ack", 0x12, testutil.BuildTCP(t, 1, testutil.TCPFlags{SYN: true, ACK: true}, nil)},
+		{"ack", 0x10, testutil.BuildTCP(t, 1, testutil.TCPFlags{ACK: true}, nil)},
+		{"psh-ack-data", 0x18, testutil.BuildTCP(t, 1, testutil.TCPFlags{PSH: true, ACK: true}, []byte("GET"))},
+		{"rst", 0x04, testutil.BuildTCP(t, 1, testutil.TCPFlags{RST: true}, nil)},
+		{"fin-ack", 0x11, testutil.BuildTCP(t, 1, testutil.TCPFlags{FIN: true, ACK: true}, nil)},
 	}
 
 	for _, dna := range dnas {
@@ -176,29 +175,4 @@ func selectorMatches(sel nftables.Selector, flags uint8) bool {
 		}
 	}
 	return false
-}
-
-type tcpBits struct{ syn, ack, psh, rst, fin bool }
-
-func buildTCP(t *testing.T, bits tcpBits, payload []byte) []byte {
-	t.Helper()
-	ip := &layers.IPv4{
-		Version: 4, IHL: 5, TTL: 64, Id: 1,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    []byte{10, 0, 0, 1},
-		DstIP:    []byte{10, 0, 0, 2},
-	}
-	tcp := &layers.TCP{
-		SrcPort: 8080, DstPort: 44000, Seq: 1, Window: 65535,
-		SYN: bits.syn, ACK: bits.ack, PSH: bits.psh, RST: bits.rst, FIN: bits.fin,
-	}
-	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
-		t.Fatalf("set network layer: %v", err)
-	}
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
-	if err := gopacket.SerializeLayers(buf, opts, ip, tcp, gopacket.Payload(payload)); err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	return buf.Bytes()
 }

@@ -46,8 +46,9 @@ type Providers struct {
 	// Apply installs a strategy end to end: it reprograms the kernel's steering
 	// for what the new strategy can match and then swaps the engine. PUT goes
 	// through it rather than straight to the engine, because a strategy change
-	// can put the box on or take it off the data path. When nil, PUT falls back
-	// to swapping the engine alone, which is what the unit tests use.
+	// can put the box on or take it off the data path. It is required for PUT:
+	// a caller that forgets to wire it gets a loud 503, never a silent
+	// engine-only swap that leaves the kernel steering for the old strategy.
 	Apply func(ctx context.Context, dna string) error
 	// Steering returns what the box is currently steering (JSON-marshalable).
 	// It may be nil.
@@ -131,6 +132,10 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
 	case http.MethodPut:
+		if s.p.Apply == nil {
+			writeError(w, http.StatusServiceUnavailable, "strategy updates are not wired up")
+			return
+		}
 		// MaxBytesReader returns an error once the limit is exceeded, so an oversized
 		// body is rejected rather than silently truncated (as io.LimitReader would).
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -147,7 +152,7 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 		// Tolerate a trailing newline or surrounding whitespace (common when the
 		// body is piped from a file), which would otherwise fail validation.
 		dna := strings.TrimSpace(string(body))
-		if err := s.apply(r.Context(), dna); err != nil {
+		if err := s.p.Apply(r.Context(), dna); err != nil {
 			writeError(w, http.StatusBadRequest, "invalid strategy: "+err.Error())
 			return
 		}
@@ -155,15 +160,6 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
-}
-
-// apply installs dna through the controller when one is wired up, and through
-// the engine alone otherwise.
-func (s *Server) apply(ctx context.Context, dna string) error {
-	if s.p.Apply != nil {
-		return s.p.Apply(ctx, dna)
-	}
-	return s.p.Engine.SetStrategy(dna)
 }
 
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {

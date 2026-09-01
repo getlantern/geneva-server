@@ -210,14 +210,15 @@ func (rt *Runtime) Run(ctx context.Context) error {
 // pump reads one queue until the context is cancelled.
 func (rt *Runtime) pump(ctx context.Context, q *queue, dir strategy.Direction) error {
 	scratch := &engine.Scratch{}
+	handle := func(p packet) error {
+		rt.handle(q, dir, p, scratch)
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := q.read(ctx, func(p packet) error {
-			rt.handle(q, dir, p, scratch)
-			return nil
-		})
+		err := q.read(ctx, handle)
 		switch {
 		case err == nil:
 		case errors.Is(err, unix.ENOBUFS):
@@ -242,16 +243,14 @@ func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *e
 	if p.truncated {
 		// Fail open: a prefix of a packet cannot be manipulated or reinjected.
 		rt.Stats.Truncated.Add(1)
-		q.accept(p.id)
-		rt.Stats.Accepted.Add(1)
+		rt.accept(q, p.id)
 		return
 	}
 	if len(p.payload) == 0 {
 		// Counted like any other accept: this path is indistinguishable from a
 		// pass-through as far as the flow is concerned, and leaving it out
 		// makes the verdict counters undercount what was actually accepted.
-		q.accept(p.id)
-		rt.Stats.Accepted.Add(1)
+		rt.accept(q, p.id)
 		return
 	}
 
@@ -264,8 +263,7 @@ func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *e
 		// Fail open: a strategy or decode error must never black-hole the
 		// proxy's traffic.
 		rt.log.Errorf("process %s packet: %v", dir, err)
-		q.accept(p.id)
-		rt.Stats.Accepted.Add(1)
+		rt.accept(q, p.id)
 		return
 	}
 

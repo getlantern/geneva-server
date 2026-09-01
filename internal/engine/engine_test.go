@@ -1,49 +1,16 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/binary"
 	"testing"
 
 	"github.com/getlantern/geneva/strategy"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
+
+	"github.com/getlantern/geneva-server/internal/testutil"
 )
-
-// buildTCP builds a serialized IPv4/TCP packet with a valid checksum and length.
-func buildTCP(t testing.TB, seq uint32, flags tcpFlags, payload []byte) []byte {
-	t.Helper()
-	ip := &layers.IPv4{
-		Version:  4,
-		IHL:      5,
-		TTL:      64,
-		Id:       1234,
-		Protocol: layers.IPProtocolTCP,
-		SrcIP:    []byte{10, 0, 0, 1},
-		DstIP:    []byte{10, 0, 0, 2},
-	}
-	tcp := &layers.TCP{
-		SrcPort: 8080,
-		DstPort: 44000,
-		Seq:     seq,
-		Window:  65535,
-		SYN:     flags.syn,
-		ACK:     flags.ack,
-		PSH:     flags.psh,
-		RST:     flags.rst,
-		FIN:     flags.fin,
-	}
-	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
-		t.Fatalf("set network layer: %v", err)
-	}
-	buf := gopacket.NewSerializeBuffer()
-	opts := gopacket.SerializeOptions{ComputeChecksums: true, FixLengths: true}
-	if err := gopacket.SerializeLayers(buf, opts, ip, tcp, gopacket.Payload(payload)); err != nil {
-		t.Fatalf("serialize: %v", err)
-	}
-	return buf.Bytes()
-}
-
-type tcpFlags struct{ syn, ack, psh, rst, fin bool }
 
 func mustEngine(t testing.TB, dna string) *Engine {
 	t.Helper()
@@ -117,7 +84,7 @@ func ones(b []byte) uint16 {
 
 func TestUnchanged_EmptyStrategy(t *testing.T) {
 	e := mustEngine(t, "")
-	raw := buildTCP(t, 1000, tcpFlags{psh: true, ack: true}, []byte("hello world"))
+	raw := testutil.BuildTCP(t, 1000, testutil.TCPFlags{PSH: true, ACK: true}, []byte("hello world"))
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -125,14 +92,14 @@ func TestUnchanged_EmptyStrategy(t *testing.T) {
 	if res.Outcome != OutcomeUnchanged {
 		t.Fatalf("outcome = %v, want unchanged", res.Outcome)
 	}
-	if len(res.Packets) != 1 || !bytesEqual(res.Packets[0], raw) {
+	if len(res.Packets) != 1 || !bytes.Equal(res.Packets[0], raw) {
 		t.Fatalf("packet altered by empty strategy")
 	}
 }
 
 func TestUnchanged_PassthroughTree(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-| \/`)
-	raw := buildTCP(t, 1000, tcpFlags{psh: true, ack: true}, []byte("hello"))
+	raw := testutil.BuildTCP(t, 1000, testutil.TCPFlags{PSH: true, ACK: true}, []byte("hello"))
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +111,7 @@ func TestUnchanged_PassthroughTree(t *testing.T) {
 
 func TestDropped(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:R]-drop-| \/`)
-	raw := buildTCP(t, 1000, tcpFlags{rst: true}, nil)
+	raw := testutil.BuildTCP(t, 1000, testutil.TCPFlags{RST: true}, nil)
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -162,7 +129,7 @@ func TestDropped(t *testing.T) {
 
 func TestDuplicated(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-duplicate-| \/`)
-	raw := buildTCP(t, 5000, tcpFlags{psh: true, ack: true}, []byte("payload"))
+	raw := testutil.BuildTCP(t, 5000, testutil.TCPFlags{PSH: true, ACK: true}, []byte("payload"))
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +151,7 @@ func TestDuplicated(t *testing.T) {
 
 func TestTampered_Flags(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/`)
-	raw := buildTCP(t, 42, tcpFlags{syn: true}, nil)
+	raw := testutil.BuildTCP(t, 42, testutil.TCPFlags{SYN: true}, nil)
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +168,7 @@ func TestTampered_Flags(t *testing.T) {
 
 func TestTampered_TTL(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-tamper{IP:ttl:replace:5}-| \/`)
-	raw := buildTCP(t, 42, tcpFlags{psh: true, ack: true}, []byte("data"))
+	raw := testutil.BuildTCP(t, 42, testutil.TCPFlags{PSH: true, ACK: true}, []byte("data"))
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +183,7 @@ func TestTampered_TTL(t *testing.T) {
 func TestFragmented(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-fragment{TCP:8:true}-| \/`)
 	payload := []byte("0123456789ABCDEF") // 16 bytes
-	raw := buildTCP(t, 7000, tcpFlags{psh: true, ack: true}, payload)
+	raw := testutil.BuildTCP(t, 7000, testutil.TCPFlags{PSH: true, ACK: true}, payload)
 	res, err := e.Process(raw, strategy.DirectionOutbound, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +221,7 @@ func TestInboundBranchingRejectedAtParse(t *testing.T) {
 
 func TestOverheadMetrics(t *testing.T) {
 	e := mustEngine(t, `[TCP:flags:PA]-duplicate-| \/`)
-	raw := buildTCP(t, 1, tcpFlags{psh: true, ack: true}, []byte("abcdefgh"))
+	raw := testutil.BuildTCP(t, 1, testutil.TCPFlags{PSH: true, ACK: true}, []byte("abcdefgh"))
 	if _, err := e.Process(raw, strategy.DirectionOutbound, nil); err != nil {
 		t.Fatal(err)
 	}

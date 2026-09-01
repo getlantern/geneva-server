@@ -30,13 +30,12 @@ type Config struct {
 	// Mode is GenevaModeProd or GenevaModeEval, spelled as the flag spells it.
 	// The controller needs it because one behaviour is mode-gated: see
 	// ObserveInbound.
-	Mode        string
-	Table       string
-	Port        uint16
-	OutQueue    uint16
-	InQueue     uint16
-	Mark        uint32
-	NFTPath     string
+	Mode string
+	// NFT is the base kernel-programming config: table, port, queues, mark, nft
+	// path, and whether the censor classification counters ride along. The
+	// selectors are owned by the controller — whatever is set here is replaced
+	// with the loaded strategy's scope on every program.
+	NFT         nftables.Config
 	EthtoolPath string
 	// Iface is the interface whose offloads are torn down while steering is
 	// active. Empty leaves the NIC alone, which is only correct where something
@@ -45,11 +44,6 @@ type Config struct {
 	// NoNFT skips programming the kernel entirely, for a box where the rules are
 	// managed out of band.
 	NoNFT bool
-	// CensorCounters adds nftables classification counters to the table
-	// whenever one exists, so the censor-reachability signal survives steering
-	// being scoped to what the strategy can act on. They classify in the kernel
-	// and cost no userspace round trip; nothing is queued for them.
-	CensorCounters bool
 	// ObserveInbound keeps every inbound packet flowing through userspace while
 	// a strategy is loaded, even when that strategy's triggers cannot act on
 	// inbound traffic at all. Honoured in eval mode only.
@@ -93,16 +87,6 @@ func New(eng *engine.Engine, cfg Config, log Logger) *Controller {
 		log = nopLogger{}
 	}
 	return &Controller{cfg: cfg, eng: eng, log: log}
-}
-
-// DNA returns the currently installed strategy.
-func (c *Controller) DNA() string { return c.eng.DNA() }
-
-// Scope returns what the current strategy can act on, for the health surface.
-func (c *Controller) Scope() Scope {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.scope
 }
 
 // State is the health surface's view of what the box is actually steering.
@@ -277,23 +261,12 @@ func (c *Controller) program(ctx context.Context, desired Scope) error {
 	if c.cfg.NoNFT {
 		return nil
 	}
-	c.nft = nftables.New(nftables.Config{
-		Table:    c.cfg.Table,
-		Port:     c.cfg.Port,
-		OutQueue: c.cfg.OutQueue,
-		InQueue:  c.cfg.InQueue,
-		Mark:     c.cfg.Mark,
-		NFTPath:  c.cfg.NFTPath,
-		Outbound: desired.Outbound,
-		Inbound:  desired.Inbound,
-		Censor:   c.cfg.CensorCounters,
-	})
+	cfg := c.cfg.NFT
+	cfg.Outbound, cfg.Inbound = desired.Outbound, desired.Inbound
+	c.nft = nftables.New(cfg)
 	// Install removes any existing table first and programs nothing when the
 	// scope is idle, so this one call covers install, replace and remove.
-	if err := c.nft.Install(ctx); err != nil {
-		return err
-	}
-	return nil
+	return c.nft.Install(ctx)
 }
 
 func (c *Controller) ensureOffloadsDown(ctx context.Context) error {
@@ -325,17 +298,18 @@ func (c *Controller) restoreOffloads(ctx context.Context) {
 }
 
 // CensorCounts reads the kernel classification counters. It is the read half of
-// Config.CensorCounters, handed to censor.NewKernelSource.
+// Config.NFT.Censor, handed to censor.NewKernelSource.
 //
 // The manager is rebuilt on every program call, so this takes the current one
-// under the lock rather than caching a pointer. With no table installed there is
-// nothing to read and the counts are empty, which is the correct answer for a
-// box that is not steering.
+// under the lock rather than caching a pointer. With an idle scope no table
+// exists and there is nothing to read: empty counts are the correct answer for
+// a box that is not steering, and answering without forking nft is what keeps
+// an idle box's telemetry free.
 func (c *Controller) CensorCounts(ctx context.Context) (map[string]uint64, error) {
 	c.mu.Lock()
-	nft := c.nft
+	nft, idle := c.nft, c.scope.Idle()
 	c.mu.Unlock()
-	if nft == nil {
+	if nft == nil || idle {
 		return map[string]uint64{}, nil
 	}
 	return nft.ReadCounters(ctx)

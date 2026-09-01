@@ -27,6 +27,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/getlantern/geneva-server/internal/censor"
 )
 
 // Config describes the steering rules to program.
@@ -116,12 +118,20 @@ func flagNames(bits uint8) string {
 }
 
 // CensorCounters are the named nftables counters the classification chain sorts
-// inbound packets into. The names are the censor event names, so nothing has to
-// translate between the kernel's view and the metric's.
+// inbound packets into. The names are the censor event names — derived from the
+// censor package's own list rather than respelled here, so nothing has to
+// translate between the kernel's view and the metric's and the two cannot
+// drift apart.
 //
 // Counters live in the sidecar's own table, so these names cannot collide with
 // anything else on the box.
-var CensorCounters = []string{"rst", "syn", "fin", "data", "ack_only"}
+var CensorCounters = func() []string {
+	names := make([]string, len(censor.KernelEvents))
+	for i, e := range censor.KernelEvents {
+		names[i] = e.String()
+	}
+	return names
+}()
 
 // censorDataMinLength is the packet length above which an inbound TCP packet is
 // counted as carrying data.
@@ -146,7 +156,7 @@ const censorDataMinLength = 80
 // a non-initial fragment carries no TCP header to match a port against, and
 // counting every fragment on the box for every port is worse than not counting
 // it.
-func censorRules(port uint16) []string {
+func censorRules() []string {
 	return []string{
 		"chain " + censorChain + " {",
 		"\t\ttcp flags & rst == rst counter name \"rst\" return",
@@ -195,7 +205,7 @@ func (m *Manager) Ruleset() string {
 		for _, c := range CensorCounters {
 			fmt.Fprintf(&b, "\tcounter %s {}\n", c)
 		}
-		for _, line := range censorRules(m.cfg.Port) {
+		for _, line := range censorRules() {
 			fmt.Fprintf(&b, "\t%s\n", line)
 		}
 	}
@@ -290,7 +300,12 @@ func (m *Manager) run(ctx context.Context, script string) error {
 	return nil
 }
 
-func isMissingTable(err error) bool {
-	s := err.Error()
+func isMissingTable(err error) bool { return missingTableMessage(err.Error()) }
+
+// missingTableMessage reports whether an nft error message means "no such
+// table". Shared by the two call paths that see the message differently: run
+// wraps CombinedOutput into the error string, ReadCounters gets it on
+// ExitError.Stderr.
+func missingTableMessage(s string) bool {
 	return strings.Contains(s, "No such file or directory") || strings.Contains(s, "does not exist")
 }

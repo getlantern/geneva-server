@@ -39,8 +39,11 @@ type KernelSource struct {
 	// lastRaw is the previous reading, to difference against.
 	lastRaw  [eventCount]uint64
 	lastRead time.Time
+	// reading marks a read in flight, so concurrent callers return the
+	// last-known totals instead of queueing behind the nft subprocess.
+	reading bool
 	// reads and readErrors are for diagnosis: a source that cannot read is
-	// reporting stale numbers, and that has to be visible somewhere.
+	// reporting stale numbers, and Reads is how a test proves that happened.
 	reads, readErrors uint64
 }
 
@@ -55,31 +58,40 @@ func NewKernelSource(read func(context.Context) (map[string]uint64, error), ttl 
 	return &KernelSource{read: read, ttl: ttl}
 }
 
-// eventNames maps the kernel counter names to events. The kernel counters are
-// named for the events, so this is the identity for those it can classify;
+// eventByName maps the kernel counter names back to events. The kernel counters
+// are named for the events, so this is the identity for those it can classify;
 // fragment and undecodable have no kernel equivalent and stay at zero.
-func eventFor(name string) (Event, bool) {
+var eventByName = func() map[string]Event {
+	m := make(map[string]Event, eventCount)
 	for e := Event(0); e < eventCount; e++ {
-		if e.String() == name {
-			return e, true
-		}
+		m[e.String()] = e
 	}
-	return 0, false
-}
+	return m
+}()
 
 // refresh reads the counters if the cached values are older than the TTL.
 // Failures leave the previous totals in place: stale counts are a better answer
 // than zeroes, which would read as "the censor stopped".
+//
+// The read itself — a fork+exec of nft — runs outside the lock: Count feeds the
+// metric callback and Snapshot feeds /healthz, and neither may stall behind a
+// slow subprocess. One caller reads; everyone else gets the last-known totals.
 func (k *KernelSource) refresh() {
 	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.ttl > 0 && !k.lastRead.IsZero() && time.Since(k.lastRead) < k.ttl {
+	if k.reading || (k.ttl > 0 && !k.lastRead.IsZero() && time.Since(k.lastRead) < k.ttl) {
+		k.mu.Unlock()
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	k.reading = true
+	k.mu.Unlock()
 
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	raw, err := k.read(ctx)
+	cancel()
+
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.reading = false
 	k.lastRead = time.Now()
 	k.reads++
 	if err != nil {
@@ -87,7 +99,7 @@ func (k *KernelSource) refresh() {
 		return
 	}
 	for name, v := range raw {
-		e, ok := eventFor(name)
+		e, ok := eventByName[name]
 		if !ok {
 			continue
 		}
@@ -126,8 +138,9 @@ func (k *KernelSource) Snapshot() Snapshot {
 	return s
 }
 
-// Reads reports how many times the counters have been read and how many of those
-// failed, for the health surface.
+// Reads reports how many times the counters have been read and how many of
+// those failed. A source whose reads fail is reporting stale numbers, and this
+// is what makes that observable.
 func (k *KernelSource) Reads() (total, failed uint64) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
