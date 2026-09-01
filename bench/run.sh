@@ -16,6 +16,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+# The compose mount needs the file to exist before the sidecar starts; it is
+# rewritten per condition and deliberately not tracked.
+: > strategy.dna
 COMPOSE=(docker compose -f docker-compose.yml)
 GB="${1:-2}"
 STREAMS="${2:-1}"
