@@ -8,8 +8,8 @@
 // the NIC would fill in later. Reinjecting such a packet through a raw socket
 // fails or puts a corrupt frame on the wire. Disabling these offloads makes
 // NFQUEUE hand us real, MTU-sized, fully-checksummed packets — the same thing
-// the canonical Geneva engine requires. This is best-effort: some virtual
-// interfaces expose a subset of features as fixed, and that is fine.
+// the canonical Geneva engine requires. An enabled fixed feature is a hard
+// setup error because the controller cannot establish that packet invariant.
 package netdev
 
 import (
@@ -33,7 +33,8 @@ var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "tx-gre-segme
 
 // ethtoolNames maps the short feature names used with `ethtool -K` to the long
 // names `ethtool -k` reports state under. Only the features whose state we need
-// to read are listed; anything absent is simply attempted blind.
+// to read are listed; anything absent is left untouched and reported as
+// unchanged because the controller cannot safely claim ownership of it.
 var ethtoolNames = map[string]string{
 	"gso":                 "generic-segmentation-offload",
 	"tso":                 "tcp-segmentation-offload",
@@ -46,11 +47,15 @@ var ethtoolNames = map[string]string{
 	"ufo":                 "udp-fragmentation-offload",
 }
 
-// readFeatures returns which of the offload features are currently on, keyed by
-// short name. A feature the driver reports as "[fixed]" is reported by its
-// current value and cannot be changed either way, which is what Disable needs
-// to know. Features it cannot determine are simply absent from the map.
-func readFeatures(ctx context.Context, ethtoolPath, iface string) (map[string]bool, error) {
+type featureState struct {
+	enabled bool
+	fixed   bool
+}
+
+// readFeatures returns the offload feature states keyed by short name. A
+// feature the driver reports as "[fixed]" retains its current value and fixed
+// flag. Features whose state cannot be determined are absent from the map.
+func readFeatures(ctx context.Context, ethtoolPath, iface string) (map[string]featureState, error) {
 	out, err := exec.CommandContext(ctx, ethtoolPath, "-k", iface).Output()
 	if err != nil {
 		return nil, fmt.Errorf("read offloads on %s: %w", iface, err)
@@ -58,26 +63,20 @@ func readFeatures(ctx context.Context, ethtoolPath, iface string) (map[string]bo
 	return parseFeatureOutput(out), nil
 }
 
-func parseFeatureOutput(out []byte) map[string]bool {
-	long := make(map[string]bool, len(ethtoolNames))
+func parseFeatureOutput(out []byte) map[string]featureState {
+	long := make(map[string]featureState, len(ethtoolNames))
 	for line := range strings.SplitSeq(string(out), "\n") {
 		name, value, found := strings.Cut(strings.TrimSpace(line), ":")
 		if !found {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		on := strings.HasPrefix(value, "on")
-		fixed := strings.Contains(value, "[fixed]")
-		// A fixed feature is unchangeable in either direction. Never claim it as
-		// controller-owned even when the driver reports it on: Disable cannot
-		// turn it off and Restore must not later pretend that we did.
-		if fixed {
-			long[name] = false
-			continue
+		long[name] = featureState{
+			enabled: strings.HasPrefix(value, "on"),
+			fixed:   strings.Contains(value, "[fixed]"),
 		}
-		long[name] = on
 	}
-	state := make(map[string]bool, len(ethtoolNames))
+	state := make(map[string]featureState, len(ethtoolNames))
 	for short, name := range ethtoolNames {
 		if v, ok := long[name]; ok {
 			state[short] = v
@@ -138,13 +137,10 @@ func (o *Original) Restore(ctx context.Context, ethtoolPath string) error {
 
 // Capture records the exact known-on offloads before mutation.
 //
-// Individual features that cannot be changed are reported in the returned
-// summary rather than as an error: some virtual interfaces expose a subset as
-// fixed, and the ones that matter on a given interface are typically
-// changeable. Three conditions are hard errors — a missing ethtool, a missing
-// interface, and no feature changeable at all — because each of them means
-// NFQUEUE would go on receiving GSO/checksum-offloaded packets that cannot be
-// reinjected intact.
+// Disabled fixed features and unknown features are reported in the returned
+// summary rather than claimed. Enabled fixed features are rejected because
+// NFQUEUE would keep receiving offloaded packets that cannot be reinjected
+// intact.
 func Capture(ctx context.Context, ethtoolPath, iface string) (*Original, error) {
 	if ethtoolPath == "" {
 		ethtoolPath = "ethtool"
@@ -166,13 +162,19 @@ func Capture(ctx context.Context, ethtoolPath, iface string) (*Original, error) 
 	if err != nil {
 		return nil, err
 	}
+	return originalFromState(iface, state)
+}
 
+func originalFromState(iface string, state map[string]featureState) (*Original, error) {
 	var on, skipped []string
 	for _, f := range offloadFeatures {
-		enabled, known := state[f]
-		if !known || !enabled {
+		feature, known := state[f]
+		if !known || !feature.enabled {
 			skipped = append(skipped, f)
 			continue
+		}
+		if feature.fixed {
+			return nil, fmt.Errorf("required NIC offload %q is enabled and fixed on %s", f, iface)
 		}
 		on = append(on, f)
 	}

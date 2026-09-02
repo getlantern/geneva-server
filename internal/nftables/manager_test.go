@@ -105,6 +105,33 @@ func TestIdleSelectorsProgramNothing(t *testing.T) {
 	}
 }
 
+func TestNeutralBoundaryProgramsAssignmentWithoutSelectors(t *testing.T) {
+	m := New(Config{Table: "geneva_neutral", Port: 8080, OutQueue: 100, InQueue: 101, NeutralizeNew: true})
+	if m.Idle() {
+		t.Fatal("neutral activation boundary was treated as idle")
+	}
+	rs := m.Ruleset()
+	if !strings.Contains(rs, "ct mark set (ct mark & 0xfff) | 0x67000000") {
+		t.Fatalf("neutral activation boundary lacks generation-zero assignment:\n%s", rs)
+	}
+	if strings.Contains(rs, "queue num") {
+		t.Fatalf("neutral activation boundary unexpectedly queues packets:\n%s", rs)
+	}
+}
+
+func TestLegacySelectorsAssignFallbackGeneration(t *testing.T) {
+	rs := New(Config{
+		Table: "geneva_legacy", Port: 8080, OutQueue: 100, InQueue: 101,
+		Outbound: anySel,
+	}).Ruleset()
+	if !strings.Contains(rs, "ct mark set (ct mark & 0xfff) | 0x67001000") {
+		t.Fatalf("legacy selector ruleset lacks generation-one assignment:\n%s", rs)
+	}
+	if !strings.Contains(rs, "ct mark & 0xfffff000 == 0x67001000 queue num 100 bypass") {
+		t.Fatalf("legacy selector ruleset lacks matching generation-one queue rule:\n%s", rs)
+	}
+}
+
 // TestRulesetFlagScoping is the optimization proper: a strategy that only
 // triggers on handshake packets must leave bulk data in the kernel.
 func TestRulesetFlagScoping(t *testing.T) {

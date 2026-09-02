@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -130,5 +131,22 @@ func TestLegacyStrategyRequiresExplicitExclusiveMode(t *testing.T) {
 	base.LegacyStrategyAPI = true
 	if err := base.validate(); err != nil {
 		t.Fatalf("explicit legacy compatibility rejected: %v", err)
+	}
+}
+
+func TestLegacyStrategyRejectsEmptyStrategyFile(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "empty-strategy-*.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	o := &runCmd{
+		Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101,
+		LegacyStrategyAPI: true, StrategyFile: f.Name(), ReinjectBypassUID: -1,
+	}
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "empty strategy") {
+		t.Fatalf("empty legacy strategy file error = %v", err)
 	}
 }

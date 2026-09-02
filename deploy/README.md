@@ -203,8 +203,9 @@ current Lantern users: `docker/src/socks-proxy/start.sh` uses packet marks
 `0x438`/1088 for TPROXY, while phost's iptables/gateway updater uses low-valued
 packet marks (route tables start at 745). No current Lantern rule saves those
 marks to conntrack. Geneva still preserves them deliberately: SYN assignment is
-`(ct mark & 0xfff) | generation`, while NFQUEUE conntrack metadata supplies the
-generation without changing the skb mark. Ordinary verdicts, no-listener bypass
+`(ct mark & ~0xfffff000) | 0x67GGG000`, guarded so a foreign nonzero value in
+the reserved mask is never replaced, while NFQUEUE conntrack metadata supplies
+the generation without changing the skb mark. Ordinary verdicts, no-listener bypass
 and queue-full fail-open therefore retain exact external marks, and coincidental
 foreign `0x67...` packet marks are untouched. Raw reinjection keeps NFQUEUE's
 exact original routing `SO_MARK` (`0x438`, `0x440`, or phost value) and avoids

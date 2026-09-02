@@ -273,7 +273,9 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		} else {
 			conntrackAuthoritative = true
 		}
-		c.reconcileReservedGenerationsLocked(counts)
+		if conntrackAuthoritative {
+			c.reconcileReservedGenerationsLocked(counts)
+		}
 		if !loaded {
 			n := 0
 			for _, count := range counts {
@@ -407,7 +409,14 @@ func (c *Controller) restoreActiveAfterRestartLocked(ctx context.Context) error 
 		return fmt.Errorf("restore restart active assignment: %w", err)
 	}
 	if err := c.eng.Activate(active); err != nil {
-		return err
+		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		removeErr := c.removeRulesLocked(recoveryCtx)
+		var restoreErr error
+		if removeErr == nil {
+			restoreErr = c.restoreOffloads(recoveryCtx)
+		}
+		return errors.Join(err, removeErr, restoreErr)
 	}
 	c.log.Infof("restored active generation %d through neutral restart boundary", active)
 	return nil
@@ -610,7 +619,7 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 		return err
 	} else if gen != nil {
 		if gen.DNA != dna || gen.Metadata != artifact.Metadata() {
-			return fmt.Errorf("artifact identity is already mapped to generation %d with different immutable artifact metadata or content", id)
+			return fmt.Errorf("%w: artifact identity is already mapped to generation %d with different immutable artifact metadata or content", adapter.ErrLifecycleConflict, id)
 		}
 		if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 			return errors.New("integrity failure interrupted recovery prepare")
@@ -618,11 +627,11 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 		return nil
 	}
 	if len(c.generations) >= c.cfg.MaxGenerations {
-		return fmt.Errorf("live generation budget is full (%d); drain and garbage-collect one before prepare", c.cfg.MaxGenerations)
+		return fmt.Errorf("%w: live generation budget is full (%d); drain and garbage-collect one before prepare", adapter.ErrLifecycleConflict, c.cfg.MaxGenerations)
 	}
 	id := c.nextGenerationLocked()
 	if id == 0 {
-		return errors.New("no private generation ID is available")
+		return fmt.Errorf("%w: no private generation ID is available", adapter.ErrLifecycleConflict)
 	}
 	if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 		return errors.New("integrity failure interrupted recovery prepare")
@@ -638,7 +647,7 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	if err := c.validateResourceBudgetsLocked(); err != nil {
 		delete(c.generations, id)
 		_ = c.eng.Remove(id)
-		return err
+		return fmt.Errorf("%w: %v", adapter.ErrLifecycleConflict, err)
 	}
 	if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 		delete(c.generations, id)
@@ -667,7 +676,7 @@ func (c *Controller) Verify(ctx context.Context, artifact adapter.Artifact) erro
 		return err
 	}
 	if gen == nil || gen.DNA != string(artifact.Payload()) || gen.Metadata != artifact.Metadata() {
-		return errors.New("artifact has not been prepared")
+		return fmt.Errorf("%w: artifact has not been prepared", adapter.ErrLifecycleConflict)
 	}
 	return nil
 }
@@ -687,7 +696,7 @@ func (c *Controller) ActivateForNewConnections(ctx context.Context, artifact ada
 		return err
 	}
 	if gen == nil || gen.DNA != string(artifact.Payload()) || gen.Metadata != artifact.Metadata() {
-		return errors.New("artifact has not been prepared")
+		return fmt.Errorf("%w: artifact has not been prepared", adapter.ErrLifecycleConflict)
 	}
 	if c.activeNew == id {
 		return nil
@@ -733,13 +742,13 @@ func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) er
 	if gen != nil {
 		defer c.mu.Unlock()
 		if gen.DNA != dna || gen.Metadata != artifact.Metadata() {
-			return errors.New("rollback artifact identity is retained with different content")
+			return fmt.Errorf("%w: rollback artifact identity is retained with different content", adapter.ErrLifecycleConflict)
 		}
 		return c.activateLocked(ctx, id, true)
 	}
 	if len(c.generations) >= c.cfg.MaxGenerations {
 		c.mu.Unlock()
-		return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+		return fmt.Errorf("%w: live generation budget is full (%d); cannot restore rollback artifact", adapter.ErrLifecycleConflict, c.cfg.MaxGenerations)
 	}
 	c.mu.Unlock()
 
@@ -774,17 +783,17 @@ func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) er
 	}
 	if gen != nil {
 		if gen.DNA != dna || gen.Metadata != artifact.Metadata() {
-			return errors.New("rollback artifact identity is retained with different content")
+			return fmt.Errorf("%w: rollback artifact identity is retained with different content", adapter.ErrLifecycleConflict)
 		}
 		return c.activateLocked(ctx, id, true)
 	}
 	if len(c.generations) >= c.cfg.MaxGenerations {
-		return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+		return fmt.Errorf("%w: live generation budget is full (%d); cannot restore rollback artifact", adapter.ErrLifecycleConflict, c.cfg.MaxGenerations)
 	}
 	c.reconcileReservedGenerationsLocked(counts)
 	id = c.nextGenerationLocked()
 	if id == 0 {
-		return errors.New("no proven-zero private generation ID is available for rollback")
+		return fmt.Errorf("%w: no proven-zero private generation ID is available for rollback", adapter.ErrLifecycleConflict)
 	}
 	if err := c.prepareArtifactLocked(id, artifact.Metadata(), dna); err != nil {
 		return err
@@ -792,7 +801,7 @@ func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) er
 	if err := c.validateResourceBudgetsLocked(); err != nil {
 		delete(c.generations, id)
 		_ = c.eng.Remove(id)
-		return err
+		return fmt.Errorf("%w: %v", adapter.ErrLifecycleConflict, err)
 	}
 	if err := c.persistLocked(); err != nil {
 		delete(c.generations, id)
@@ -869,10 +878,10 @@ func (c *Controller) ActivateNew(ctx context.Context, id uint32) error {
 func (c *Controller) activateLocked(ctx context.Context, id uint32, repair bool) error {
 	target := c.generations[id]
 	if target == nil {
-		return fmt.Errorf("generation %d is not prepared", id)
+		return fmt.Errorf("%w: generation %d is not prepared", adapter.ErrLifecycleConflict, id)
 	}
 	if target.Scope.Idle() {
-		return fmt.Errorf("generation %d has an empty steering scope; use deactivate-new", id)
+		return fmt.Errorf("%w: generation %d has an empty steering scope; use deactivate-new", adapter.ErrLifecycleConflict, id)
 	}
 	hadSteering := c.hasSteeringLocked()
 	oldActive, oldPrevious := c.activeNew, c.previous
@@ -1100,7 +1109,7 @@ func (c *Controller) DrainGeneration(ctx context.Context, id uint32) (int, error
 	}
 	if c.activeNew == id {
 		c.mu.Unlock()
-		return 0, fmt.Errorf("generation %d still accepts new connections", id)
+		return 0, fmt.Errorf("%w: generation %d still accepts new connections", adapter.ErrLifecycleConflict, id)
 	}
 	identity := gen.Identity
 	c.mu.Unlock()
@@ -1176,7 +1185,7 @@ func (c *Controller) GarbageCollectGeneration(ctx context.Context, id uint32) er
 		return err
 	}
 	if n != 0 {
-		return fmt.Errorf("generation %d still has %d connections", id, n)
+		return fmt.Errorf("%w: generation %d still has %d connections", adapter.ErrLifecycleConflict, id, n)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()

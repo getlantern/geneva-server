@@ -25,6 +25,50 @@ func TestCountIsBoundedWhileConntrackDumpIsBusy(t *testing.T) {
 	}
 }
 
+func TestNeutralizeDeadlineRetainsDumpSlotUntilTransactionReturns(t *testing.T) {
+	original := neutralizeNetlink
+	t.Cleanup(func() { neutralizeNetlink = original })
+	started := make(chan struct{})
+	release := make(chan struct{})
+	neutralizeNetlink = func(uint16) (int, error) {
+		close(started)
+		<-release
+		return 1, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := (Counter{}).Neutralize(ctx, 443)
+		done <- err
+	}()
+	<-started
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Neutralize error = %v, want deadline exceeded", err)
+	}
+	select {
+	case dumpSlot <- struct{}{}:
+		<-dumpSlot
+		t.Fatal("neutralization released the dump slot before its kernel transaction returned")
+	default:
+	}
+
+	close(release)
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case dumpSlot <- struct{}{}:
+			<-dumpSlot
+			return
+		case <-deadline:
+			t.Fatal("neutralization did not release the dump slot after its transaction returned")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
 func TestAdapterFlowIsOuterIPv4TCPToProxyPort(t *testing.T) {
 	flow := ct.Flow{TupleOrig: ct.Tuple{
 		IP:    ct.IPTuple{SourceAddress: net.ParseIP("192.0.2.1"), DestinationAddress: net.ParseIP("192.0.2.2")},

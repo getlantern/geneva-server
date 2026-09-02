@@ -13,7 +13,10 @@ import (
 	"strings"
 )
 
-var ErrPayloadTooLarge = errors.New("artifact payload too large")
+var (
+	ErrPayloadTooLarge   = errors.New("artifact payload too large")
+	ErrLifecycleConflict = errors.New("adapter lifecycle conflict")
+)
 
 type Version = uint32
 

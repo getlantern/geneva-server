@@ -3,6 +3,7 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"time"
 
 	semconv "github.com/getlantern/semconv"
@@ -59,7 +60,7 @@ type Providers struct {
 // into the OTel SDK per packet would put an allocation and a lock on the
 // proxy's latency budget at line rate. Observation happens once per export.
 func Register(p Providers) error {
-	if p.Engine == nil {
+	if p.Engine == nil || (reflect.ValueOf(p.Engine).Kind() == reflect.Pointer && reflect.ValueOf(p.Engine).IsNil()) {
 		return fmt.Errorf("telemetry: Engine is required")
 	}
 	meter := sdkotel.Meter(meterName)

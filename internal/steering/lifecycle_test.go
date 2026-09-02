@@ -2126,6 +2126,57 @@ func TestStartConntrackAuditHasControllerDeadline(t *testing.T) {
 	}
 }
 
+func TestFailedStartupConntrackAuditPreservesReservedGenerations(t *testing.T) {
+	flows := &fakeConnections{countsErr: errors.New("temporary conntrack failure")}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: flows}, nil)
+	c.reservedGenerations[7] = struct{}{}
+	if err := c.Start(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.reservedGenerations[7]; !ok {
+		t.Fatal("non-authoritative startup audit released a reserved generation ID")
+	}
+}
+
+func TestRestartActivationFailureRemovesRestoredSteering(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	seed := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := seed.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := engine.NewRegistry()
+	var programs []nftables.Config
+	restarted := New(registry, Config{StateFile: state, Connections: flows}, nil)
+	restarted.cfg.Program = func(_ context.Context, cfg nftables.Config, _ bool) error {
+		programs = append(programs, cfg)
+		if cfg.ActiveGeneration == 1 {
+			if err := registry.Remove(1); err != nil {
+				t.Fatalf("remove restored engine before activation: %v", err)
+			}
+		}
+		return nil
+	}
+	if err := restarted.Start(ctx, ""); !errors.Is(err, engine.ErrGenerationNotFound) {
+		t.Fatalf("restart activation error = %v", err)
+	}
+	if len(programs) < 4 {
+		t.Fatalf("restart programs = %+v, want stale removal, neutral, active, compensation", programs)
+	}
+	last := programs[len(programs)-1]
+	if last.ActiveGeneration != 0 || last.NeutralizeNew || len(last.Generations) != 0 {
+		t.Fatalf("activation failure left steering installed: %+v", last)
+	}
+}
+
 func TestStartRemovesStaleAssignmentBeforeConntrackAudit(t *testing.T) {
 	events := make(chan string, 4)
 	c := New(engine.NewRegistry(), Config{

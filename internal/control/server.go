@@ -263,9 +263,14 @@ func lifecycleResult(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	code := http.StatusConflict
-	if errors.Is(err, engine.ErrInvalidStrategy) {
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, engine.ErrInvalidStrategy):
 		code = http.StatusBadRequest
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		code = http.StatusGatewayTimeout
+	case errors.Is(err, adapter.ErrLifecycleConflict):
+		code = http.StatusConflict
 	}
 	writeError(w, code, err.Error())
 }

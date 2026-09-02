@@ -89,7 +89,8 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
   bounded full conntrack snapshot and selects only an ID authoritatively proven
   to have zero flows. Snapshot failure rejects it without preparing or steering.
 
-Every handler combines request cancellation with a 30-second timeout. Every
+Lifecycle mutation, status, drain, and garbage-collection handlers combine
+request cancellation with a 30-second timeout. Every
 conntrack dump has a shorter controller-owned hard deadline as well, including
 startup reconstruction and internal callers.
 

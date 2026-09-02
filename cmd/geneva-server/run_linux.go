@@ -50,7 +50,7 @@ func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...))
 // calls do not return the same numbers.
 const censorReadInterval = 2 * time.Second
 
-func runServer(o *runCmd) error {
+func runServer(o *runCmd) (runResult error) {
 	ctx := context.Background()
 	started := time.Now()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -163,6 +163,9 @@ func runServer(o *runCmd) error {
 			if teardownErr == nil {
 				return errors.Join(startErr, rt.Close())
 			}
+			if attempt < 3 {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 		// Do not explicitly release the queues while kernel steering might remain.
 		// The command is terminating, so process teardown becomes the last-resort
@@ -185,10 +188,15 @@ func runServer(o *runCmd) error {
 				return
 			}
 			log.Error("steering teardown failed while queues remain bound", "attempt", attempt, "err", teardownErr)
+			if attempt < 3 {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 		// The process is already terminating. Leave the descriptors open until
 		// kernel process cleanup rather than releasing them ahead of live rules.
 		log.Error("unable to confirm steering removal; retaining NFQUEUE ownership until process exit", "err", teardownErr)
+		runResult = errors.Join(runResult,
+			fmt.Errorf("shutdown steering cleanup could not be confirmed: %w", teardownErr))
 	}()
 
 	// Profiling is opt-in and separate from the control surface: it is a
@@ -298,11 +306,11 @@ func runServer(o *runCmd) error {
 
 	log.Info("nfqueue runtime starting", "out_queue", o.OutQueue, "in_queue", o.InQueue)
 	err = rt.Run(ctx)
-	resultErr := runtimeExitError(err, fatalCause, serveErr)
-	if resultErr == nil {
+	runResult = runtimeExitError(err, fatalCause, serveErr)
+	if runResult == nil {
 		log.Info("shutting down")
 	}
-	return resultErr
+	return runResult
 }
 
 // runtimeExitError preserves the difference systemd needs: operator shutdown

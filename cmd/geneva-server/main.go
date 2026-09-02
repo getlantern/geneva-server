@@ -242,6 +242,15 @@ func (o *runCmd) validate() error {
 	if !o.LegacyStrategyAPI && (o.Strategy != "" || o.StrategyFile != "") {
 		return errors.New("--strategy/--strategy-file require --legacy-strategy-api and cannot be combined with authoritative v1 lifecycle mode")
 	}
+	if o.LegacyStrategyAPI && (o.Strategy != "" || o.StrategyFile != "") {
+		dna, err := o.resolveStrategy()
+		if err != nil {
+			return err
+		}
+		if dna == "" {
+			return errors.New("legacy --strategy/--strategy-file resolved to an empty strategy")
+		}
+	}
 	if o.Mode == "prod" && !o.LegacyStrategyAPI && strings.TrimSpace(o.AdapterStateFile) == "" {
 		return errors.New("authoritative prod mode requires --adapter-state-file for durable generation reconstruction and rollback continuity")
 	}

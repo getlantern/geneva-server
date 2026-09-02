@@ -78,6 +78,10 @@ func TestRegisterRequiresEngine(t *testing.T) {
 	if err := Register(Providers{Mode: "prod"}); err == nil {
 		t.Fatal("Register accepted a nil engine")
 	}
+	var typedNil *engine.Engine
+	if err := Register(Providers{Mode: "prod", Engine: typedNil}); err == nil {
+		t.Fatal("Register accepted a typed-nil engine")
+	}
 }
 
 func TestRegisterExportsEngineAndVerdicts(t *testing.T) {

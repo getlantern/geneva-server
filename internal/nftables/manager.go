@@ -272,10 +272,15 @@ func (m *Manager) Ruleset() string {
 		// verdict: the chain returns without one.
 		fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d jump %s\n", m.cfg.Port, censorChain)
 	}
-	if m.cfg.ActiveGeneration != 0 || m.cfg.NeutralizeNew {
+	activeGeneration := m.cfg.ActiveGeneration
+	if activeGeneration == 0 && !m.cfg.NeutralizeNew && len(m.cfg.Generations) == 0 &&
+		(!m.cfg.Outbound.Empty() || !m.cfg.Inbound.Empty()) {
+		activeGeneration = 1
+	}
+	if activeGeneration != 0 || m.cfg.NeutralizeNew {
 		mark := generation.Namespace
-		if m.cfg.ActiveGeneration != 0 {
-			mark, _ = generation.Mark(m.cfg.ActiveGeneration)
+		if activeGeneration != 0 {
+			mark, _ = generation.Mark(activeGeneration)
 		}
 		// Only an original inbound SYN creates the affinity. Retransmits retain
 		// their existing connmark, and the low 12 bits are left to other mark users.
@@ -311,6 +316,9 @@ func (m *Manager) revisionChain() string {
 // that exists for steering; they never keep one alive on their own, because a
 // box with no strategy is supposed to have nothing of ours in the kernel at all.
 func (m *Manager) Idle() bool {
+	if m.cfg.NeutralizeNew {
+		return false
+	}
 	for _, gen := range m.generations() {
 		if !gen.Outbound.Empty() || !gen.Inbound.Empty() {
 			return false

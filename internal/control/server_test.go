@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -440,6 +441,28 @@ func TestAdapterOperationUsesRequestCancellation(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if !errors.Is(a.saw, context.Canceled) {
 		t.Fatalf("adapter context error = %v", a.saw)
+	}
+}
+
+func TestLifecycleResultClassifiesClientAndServerFailures(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "invalid artifact", err: engine.ErrInvalidStrategy, want: http.StatusBadRequest},
+		{name: "state conflict", err: fmt.Errorf("%w: not prepared", adapter.ErrLifecycleConflict), want: http.StatusConflict},
+		{name: "deadline", err: context.DeadlineExceeded, want: http.StatusGatewayTimeout},
+		{name: "kernel failure", err: errors.New("nft transaction failed"), want: http.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			lifecycleResult(w, tt.err)
+			if w.Code != tt.want {
+				t.Fatalf("status = %d, want %d: %s", w.Code, tt.want, w.Body.String())
+			}
+		})
 	}
 }
 

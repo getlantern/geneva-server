@@ -126,10 +126,34 @@ func updateNeutral(ctx context.Context, port uint16) (int, error) {
 	}
 	select {
 	case dumpSlot <- struct{}{}:
-		defer func() { <-dumpSlot }()
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
+	type result struct {
+		updated int
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-dumpSlot }()
+		updated, err := neutralizeNetlink(port)
+		done <- result{updated: updated, err: err}
+	}()
+	select {
+	case r := <-done:
+		return r.updated, r.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// neutralizeNetlink is a test seam around the library's synchronous dump and
+// update transaction. The caller keeps dumpSlot owned until this returns even
+// when its context has already expired, so a wedged kernel cannot accumulate
+// goroutines or overlapping namespace mutations.
+var neutralizeNetlink = neutralizeNetlinkTransaction
+
+func neutralizeNetlinkTransaction(port uint16) (int, error) {
 	c, err := ct.Dial(nil)
 	if err != nil {
 		return 0, fmt.Errorf("dial conntrack netlink: %w", err)
@@ -141,9 +165,6 @@ func updateNeutral(ctx context.Context, port uint16) (int, error) {
 	}
 	updated := 0
 	for _, flow := range flows {
-		if err := ctx.Err(); err != nil {
-			return updated, err
-		}
 		if !adapterFlow(flow, port) || flow.Mark&generation.Mask != 0 {
 			continue
 		}
