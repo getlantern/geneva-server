@@ -184,8 +184,12 @@ and validates all artifacts against the installed descriptor before loading any
 assignment. Incompatible, metadata-less v1, or corrupt state is durably renamed
 to a quarantine file. The local lifecycle remains reachable for remediation but
 reports `unsafe`, `/healthz` returns unhealthy, no new generation is assigned,
-and unknown flows bypass userspace. Repair with a full known-good artifact
-rollback; do not edit or delete conntrack marks.
+and unknown flows bypass userspace. The overlay manager can repair with its
+normal newer-snapshot `Prepare` → `Verify` → `ActivateForNewConnections`
+sequence after Geneva freshly proves exact neutral kernel state and snapshots
+conntrack; rollback remains available for a full known-good fallback. This proof
+is process-local and repeated after every restart. Do not edit or delete
+conntrack marks.
 
 ### Conntrack mark reservation and drain
 
@@ -226,6 +230,8 @@ Lifecycle status reports authoritative connection counts and bare lowercase
 SHA-256 hex digests, never raw DNA. `/healthz` uses the cached lifecycle view and
 does not dump conntrack, keeping routine probes bounded; an integrity latch
 returns HTTP 503 while the local rollback endpoints remain available.
+Generic recovery Prepare/Verify endpoints also remain available, but health
+stays 503 until a safely staged activation succeeds.
 
 ## What gets steered
 

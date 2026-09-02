@@ -56,7 +56,10 @@ identity, is rejected.
 All mutations are `POST`; `descriptor` and `status` are `GET`.
 
 - `/v1/adapter/prepare` accepts an artifact, validates resource budgets, creates
-  its immutable engine, and durably allocates a private generation.
+  its immutable engine, and durably allocates a private generation. While state
+  is quarantined, a generic Prepare is accepted only after a process-local exact
+  neutral-rules readback and fresh bounded full conntrack snapshot; proof
+  failure changes no engine, nft, or durable state and is retryable.
 - `/v1/adapter/verify` accepts the same artifact and confirms its exact prepared
   identity, content, runtime, schema, and digest.
 - `/v1/adapter/activate-for-new-connections` accepts an artifact and assigns
@@ -105,9 +108,14 @@ adapter protocol, schema, and exact required runtime name/version. Restart
 reconstructs each artifact and validates it against the installed descriptor
 before loading any engine or assignment. Metadata-less v1, incompatible, or
 corrupt state is durably renamed to a quarantine file; the adapter remains
-reachable for full-artifact rollback remediation but inactive, unsafe, and
-unhealthy. Live orphan generation IDs found by the startup conntrack snapshot
-remain reserved and unruled until a later authoritative zero count.
+reachable but inactive, unsafe, and unhealthy. A newer desired artifact can
+remediate through the generic t8 sequence `Prepare` → `Verify` →
+`ActivateForNewConnections`; a previous-known-good fallback may still use
+`Rollback`. Prepare and Verify do not clear unsafe health. Only successful safe
+activation clears the latch. The verified-neutral permission is never persisted
+or trusted across restart: each process re-reads exact kernel state and takes a
+fresh bounded namespace snapshot. Live orphan generation IDs remain reserved
+and unruled until a later authoritative zero count.
 
 State replacement requires temporary-file sync, atomic rename, and containing-
 directory sync. A file or directory sync failure is integrity-fatal and cannot

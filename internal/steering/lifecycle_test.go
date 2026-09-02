@@ -30,12 +30,16 @@ const (
 )
 
 func lifecycleArtifact(t *testing.T, revision, dna string) adapter.Artifact {
+	return lifecycleArtifactForRuntime(t, revision, dna, "dev")
+}
+
+func lifecycleArtifactForRuntime(t *testing.T, revision, dna, runtimeVersion string) adapter.Artifact {
 	t.Helper()
 	payload := []byte(dna)
 	a, err := adapter.NewArtifact(adapter.ArtifactMetadata{
 		Technique: adapter.TechniqueGeneva, Revision: revision, Digest: adapter.Digest(payload), Size: len(payload),
 		AdapterProtocol: adapter.Version1, RequiredRuntimeName: adapter.RuntimeNameGeneva,
-		RequiredRuntimeVersion: "dev", SchemaVersion: adapter.SchemaVersionV1,
+		RequiredRuntimeVersion: runtimeVersion, SchemaVersion: adapter.SchemaVersionV1,
 	}, payload)
 	if err != nil {
 		t.Fatal(err)
@@ -1068,6 +1072,479 @@ func TestCorruptStateIsQuarantinedAndOrphanIDsRemainReserved(t *testing.T) {
 	}
 }
 
+func TestQuarantineRemediatesThroughGenericT8ChampionSequence(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(*testing.T) (string, *fakeConnections)
+		runtime string
+	}{
+		{
+			name: "corrupt state",
+			setup: func(t *testing.T) (string, *fakeConnections) {
+				state := filepath.Join(t.TempDir(), "adapter.json")
+				if err := os.WriteFile(state, []byte("{not-json\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return state, &fakeConnections{counts: map[uint32]int{1: 1}}
+			},
+			runtime: "dev",
+		},
+		{
+			name: "incompatible state",
+			setup: func(t *testing.T) (string, *fakeConnections) {
+				state, flows := writeActiveLifecycleState(t, "runtime-a")
+				flows.counts[1] = 1
+				return state, flows
+			},
+			runtime: "runtime-b",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			state, flows := tc.setup(t)
+			var calls []nftables.Config
+			var installed nftables.Config
+			newController := func() *Controller {
+				return New(engine.NewRegistry(), Config{
+					NoNFT: true, StateFile: state, RuntimeVersion: tc.runtime, Connections: flows,
+					Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+						calls = append(calls, cfg)
+						installed = cfg
+						return nil
+					},
+					VerifyProgram: func(_ context.Context, want nftables.Config) error {
+						if !sameProgram(installed, want) {
+							return errors.New("installed steering is not exactly neutral")
+						}
+						return nil
+					},
+				}, nil)
+			}
+			artifact := lifecycleArtifactForRuntime(t, "newer-champion", genOneDNA, tc.runtime)
+			c := newController()
+			if err := c.Start(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 {
+				t.Fatalf("quarantine state = %+v", st)
+			}
+			calls = nil
+			// This is the exact t8 deployLocked/activateTargetLocked sequence for a
+			// newer champion at lantern-cloud 5cf7ac68f.
+			if err := c.Prepare(ctx, artifact); err != nil {
+				t.Fatalf("prepare newer champion: %v", err)
+			}
+			if len(calls) != 0 {
+				t.Fatalf("prepare programmed steering while quarantined: %+v", calls)
+			}
+			if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 {
+				t.Fatalf("prepare cleared quarantine health: %+v", st)
+			}
+			persisted, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(persisted), "generic_remediation_allowed") {
+				t.Fatal("process-local verified-neutral proof leaked into durable state")
+			}
+			if err := c.Verify(ctx, artifact); err != nil {
+				t.Fatalf("verify newer champion: %v", err)
+			}
+			if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 {
+				t.Fatalf("verify cleared quarantine health: %+v", st)
+			}
+
+			// Crash after the fsynced recovery Prepare. The process-local proof is
+			// gone; Start and the replayed Prepare must re-read both kernel and
+			// conntrack state before activation is allowed.
+			calls = nil
+			preparedRestart := newController()
+			if err := preparedRestart.Start(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			if st := preparedRestart.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 1 || st.Generations[0].ID != 2 {
+				t.Fatalf("post-prepare restart state = %+v", st)
+			}
+			calls = nil
+			if err := preparedRestart.Prepare(ctx, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if err := preparedRestart.Verify(ctx, artifact); err != nil {
+				t.Fatal(err)
+			}
+			c = preparedRestart
+			if err := c.ActivateForNewConnections(ctx, artifact); err != nil {
+				t.Fatalf("activate newer champion: %v", err)
+			}
+			st := c.State()
+			if st.Unsafe || st.Remediation || st.ActiveNew != 2 {
+				t.Fatalf("remediated state = %+v", st)
+			}
+			if len(calls) != 2 || !calls[0].NeutralizeNew || calls[0].ActiveGeneration != 0 || calls[1].NeutralizeNew || calls[1].ActiveGeneration != 2 {
+				t.Fatalf("remediation transactions = %+v", calls)
+			}
+			for _, call := range calls {
+				for _, gen := range call.Generations {
+					if gen.ID == 1 {
+						t.Fatalf("orphan generation entered remediation union: %+v", call)
+					}
+				}
+			}
+
+			// A crash after durable preparation or activation preserves the
+			// remediable latch. t8 can replay the same generic sequence without a
+			// Geneva-specific Rollback call.
+			calls = nil
+			restarted := newController()
+			if err := restarted.Start(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			if st := restarted.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 {
+				t.Fatalf("restart remediation state = %+v", st)
+			}
+			calls = nil
+			if err := restarted.Prepare(ctx, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.Verify(ctx, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.ActivateForNewConnections(ctx, artifact); err != nil {
+				t.Fatal(err)
+			}
+			if st := restarted.State(); st.Unsafe || st.Remediation || st.ActiveNew != 2 {
+				t.Fatalf("replayed remediation state = %+v", st)
+			}
+		})
+	}
+}
+
+func TestRecoveryPrepareProofFailuresAreMutationFreeAndRetryable(t *testing.T) {
+	for _, proof := range []string{"nft readback", "conntrack snapshot"} {
+		t.Run(proof, func(t *testing.T) {
+			ctx := context.Background()
+			state := filepath.Join(t.TempDir(), "adapter.json")
+			if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+			var installed nftables.Config
+			programs := 0
+			readbackErr := error(nil)
+			c := New(engine.NewRegistry(), Config{
+				NoNFT: true, StateFile: state, Connections: flows,
+				Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+					programs++
+					installed = cfg
+					return nil
+				},
+				VerifyProgram: func(_ context.Context, want nftables.Config) error {
+					if readbackErr != nil {
+						return readbackErr
+					}
+					if !sameProgram(installed, want) {
+						return errors.New("unexpected installed steering")
+					}
+					return nil
+				},
+			}, nil)
+			if err := c.Start(ctx, ""); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			programs = 0
+			if proof == "nft readback" {
+				readbackErr = errors.New("injected exact-readback failure")
+			} else {
+				flows.countsErr = errors.New("injected conntrack snapshot failure")
+			}
+			artifact := lifecycleArtifact(t, "retryable-newer", genOneDNA)
+			if err := c.Prepare(ctx, artifact); err == nil {
+				t.Fatal("recovery Prepare succeeded without its proof")
+			}
+			after, err := os.ReadFile(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if programs != 0 || string(after) != string(before) || len(c.State().Generations) != 0 {
+				t.Fatalf("failed recovery proof mutated state: programs=%d state=%+v", programs, c.State())
+			}
+			readbackErr = nil
+			flows.countsErr = nil
+			if err := c.Prepare(ctx, artifact); err != nil {
+				t.Fatalf("recovery Prepare retry: %v", err)
+			}
+			if st := c.State(); !st.Unsafe || !st.Remediation || len(st.Generations) != 1 || st.Generations[0].ID != 2 {
+				t.Fatalf("recovery Prepare retry state = %+v", st)
+			}
+		})
+	}
+}
+
+func TestRecoveryActivateReprovesNeutralSteeringBeforeMutation(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	var installed nftables.Config
+	programs := 0
+	var readbackErr error
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			programs++
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if readbackErr != nil {
+				return readbackErr
+			}
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	artifact := lifecycleArtifact(t, "activate-reproof", genOneDNA)
+	if err := c.Prepare(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Verify(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	programs = 0
+	readbackErr = errors.New("injected pre-activation readback failure")
+	if err := c.ActivateForNewConnections(ctx, artifact); err == nil {
+		t.Fatal("recovery activation succeeded after its neutral proof was lost")
+	}
+	after, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if programs != 0 || string(after) != string(before) {
+		t.Fatalf("failed recovery activation mutated state: programs=%d", programs)
+	}
+	if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 {
+		t.Fatalf("failed recovery activation state = %+v", st)
+	}
+
+	readbackErr = nil
+	if err := c.ActivateForNewConnections(ctx, artifact); err != nil {
+		t.Fatalf("recovery activation retry: %v", err)
+	}
+	if st := c.State(); st.Unsafe || st.Remediation || st.ActiveNew != 2 {
+		t.Fatalf("recovery activation retry state = %+v", st)
+	}
+	if programs != 2 {
+		t.Fatalf("recovery activation programmed %d transactions, want neutral stage and direct flip", programs)
+	}
+}
+
+func TestIntegritySignalInterruptsGenericRecoveryActivation(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	var installed nftables.Config
+	var c *Controller
+	interrupt := false
+	c = New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			if interrupt {
+				interrupt = false
+				c.IntegrityFailure(errors.New("integrity fault during generic recovery activation"))
+			}
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	artifact := lifecycleArtifact(t, "interrupted-recovery", genOneDNA)
+	if err := c.Prepare(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Verify(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	interrupt = true
+	if err := c.ActivateForNewConnections(ctx, artifact); err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("interrupted recovery activation error = %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		st := c.State()
+		if st.Unsafe && !st.Remediation && st.ActiveNew == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("integrity reconciliation did not restore inactive quarantine: %+v", st)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestRecoveryPrepareDirectorySyncAmbiguityIsFatalWithoutSteering(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	var installed nftables.Config
+	programs := 0
+	failSync := false
+	fatal := make(chan error, 1)
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			programs++
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+		SyncDirectory: func(string) error {
+			if failSync {
+				return errors.New("injected directory sync ambiguity")
+			}
+			return nil
+		},
+		Fatal: func(err error) { fatal <- err },
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	programs = 0
+	failSync = true
+	artifact := lifecycleArtifact(t, "fatal-newer", genOneDNA)
+	if err := c.Prepare(ctx, artifact); err == nil || !strings.Contains(err.Error(), "durability") {
+		t.Fatalf("directory-sync recovery Prepare error = %v", err)
+	}
+	if programs != 0 {
+		t.Fatalf("ambiguous recovery Prepare programmed steering %d times", programs)
+	}
+	if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 0 {
+		t.Fatalf("ambiguous recovery Prepare state = %+v", st)
+	}
+	select {
+	case <-fatal:
+	case <-time.After(time.Second):
+		t.Fatal("directory sync ambiguity did not request fatal restart")
+	}
+	if err := c.Prepare(ctx, artifact); err == nil {
+		t.Fatal("durability-fatal controller accepted recovery retry")
+	}
+}
+
+func TestGenericRecoveryPreservesPreviousKnownGoodGenerations(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	var installed nftables.Config
+	var calls []nftables.Config
+	config := func() Config {
+		return Config{
+			NoNFT: true, StateFile: state, Connections: flows, MaxScopedGenerations: 3,
+			Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+				installed = cfg
+				calls = append(calls, cfg)
+				return nil
+			},
+			VerifyProgram: func(_ context.Context, want nftables.Config) error {
+				if !sameProgram(installed, want) {
+					return errors.New("unexpected installed steering")
+				}
+				return nil
+			},
+		}
+	}
+	one := lifecycleArtifact(t, "champion-one", genOneDNA)
+	two := lifecycleArtifact(t, "challenger-two", genTwoDNA)
+	three := lifecycleArtifact(t, "newer-champion-three", genOneDNA)
+	c1 := New(engine.NewRegistry(), config(), nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, artifact := range []adapter.Artifact{one, two} {
+		if err := c1.Prepare(ctx, artifact); err != nil {
+			t.Fatal(err)
+		}
+		if err := c1.ActivateForNewConnections(ctx, artifact); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flows.counts = map[uint32]int{1: 1, 2: 1}
+	c1.mu.Lock()
+	c1.integrityFailureLocked(ctx, errors.New("injected integrity latch"))
+	c1.mu.Unlock()
+
+	calls = nil
+	c2 := New(engine.NewRegistry(), config(), nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := c2.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 2 {
+		t.Fatalf("recovery start did not retain PBG generations: %+v", st)
+	}
+	calls = nil
+	if err := c2.Prepare(ctx, three); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Verify(ctx, three); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.ActivateForNewConnections(ctx, three); err != nil {
+		t.Fatal(err)
+	}
+	st := c2.State()
+	if st.Unsafe || st.Remediation || st.ActiveNew != 3 || len(st.Generations) != 3 {
+		t.Fatalf("PBG recovery result = %+v", st)
+	}
+	want := map[adapter.ArtifactIdentity]bool{one.Identity(): true, two.Identity(): true, three.Identity(): true}
+	for _, gen := range st.Generations {
+		delete(want, gen.Identity)
+	}
+	if len(want) != 0 {
+		t.Fatalf("recovery discarded retained identities: %v", want)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("recovery activation calls = %+v", calls)
+	}
+	for _, call := range calls {
+		if len(call.Generations) != 3 {
+			t.Fatalf("recovery union omitted retained generation: %+v", call)
+		}
+	}
+}
+
 func TestRestartReenumeratesOrphanReservations(t *testing.T) {
 	ctx := context.Background()
 	state := filepath.Join(t.TempDir(), "adapter.json")
@@ -1231,7 +1708,7 @@ func TestStartConntrackAuditHasControllerDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
 		t.Fatalf("Start blocked for %s", elapsed)
 	}
-	if st := c.State(); !st.Unsafe || st.ActiveNew != 0 {
+	if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 {
 		t.Fatalf("bounded startup state = %+v", st)
 	}
 }
@@ -1283,6 +1760,9 @@ func TestIntegritySignalDoesNotWaitForStatusConntrackDump(t *testing.T) {
 	}
 	if err := c.ActivateNew(context.Background(), 1); err == nil {
 		t.Fatal("mutator did not observe atomic fault latch")
+	}
+	if err := c.Prepare(context.Background(), lifecycleArtifact(t, "ordinary-integrity-newer", genTwoDNA)); err == nil {
+		t.Fatal("ordinary in-process integrity latch bypassed verified-neutral recovery gate")
 	}
 	select {
 	case active := <-programmed:
