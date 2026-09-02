@@ -503,7 +503,9 @@ func TestStatusReportsAuthoritativeCountsAndHonorsContext(t *testing.T) {
 
 func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
 	ctx := context.Background()
-	state := filepath.Join(t.TempDir(), "adapter.json")
+	stateDir := t.TempDir()
+	const stateName = "adapter.json"
+	state := filepath.Join(stateDir, stateName)
 	syncs := 0
 	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}}, SyncDirectory: func(path string) error {
 		syncs++
@@ -525,7 +527,16 @@ func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(state, append(b, []byte(`{"extra":true}`)...), 0o600); err != nil {
+	stateRoot, err := os.OpenRoot(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := stateRoot.Close(); err != nil {
+			t.Errorf("close temporary state root: %v", err)
+		}
+	})
+	if err := stateRoot.WriteFile(stateName, append(b, []byte(`{"extra":true}`)...), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}}}, nil)
@@ -1574,8 +1585,7 @@ func TestIntegritySignalInterruptsRecoveryPrepareRearm(t *testing.T) {
 	}
 	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
 	var installed nftables.Config
-	var c *Controller
-	c = New(engine.NewRegistry(), Config{
+	c := New(engine.NewRegistry(), Config{
 		NoNFT: true, StateFile: state, Connections: flows,
 		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
 			installed = cfg

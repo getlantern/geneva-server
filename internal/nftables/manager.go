@@ -329,25 +329,6 @@ func (m *Manager) generations() []Generation {
 	return []Generation{{ID: 1, Outbound: m.cfg.Outbound, Inbound: m.cfg.Inbound}}
 }
 
-// queueRules renders the queue rules for one direction: one per flag match, or
-// a single unconditional rule when the selector is Any.
-func queueRules(sel Selector, portKeyword string, port, queue uint16) []string {
-	base := fmt.Sprintf("meta nfproto ipv4 meta l4proto tcp tcp %s %d", portKeyword, port)
-	verdict := fmt.Sprintf("queue num %d bypass", queue)
-	switch {
-	case sel.Empty():
-		return nil
-	case sel.Any:
-		return []string{fmt.Sprintf("%s %s", base, verdict)}
-	default:
-		rules := make([]string, 0, len(sel.Flags))
-		for _, f := range sel.Flags {
-			rules = append(rules, fmt.Sprintf("%s %s %s", base, flagExpr(f), verdict))
-		}
-		return rules
-	}
-}
-
 func generationQueueRules(gen Generation, sel Selector, portKeyword string, port, queue uint16) []string {
 	mark, err := generation.Mark(gen.ID)
 	if err != nil || sel.Empty() {

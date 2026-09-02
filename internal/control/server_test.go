@@ -40,6 +40,13 @@ func testArtifact(t *testing.T, revision string, payload []byte) adapter.Artifac
 	return artifact
 }
 
+func closeResponseBody(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close response body: %v", err)
+	}
+}
+
 func (a *canceledAdapter) Prepare(ctx context.Context, _ adapter.Artifact) error {
 	<-ctx.Done()
 	a.saw = ctx.Err()
@@ -103,7 +110,7 @@ func TestHealthz(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != 200 {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -130,7 +137,7 @@ func TestHealthzReportsLifecycleIntegrityFailureWhileControlRemainsReachable(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
 	}
@@ -151,7 +158,7 @@ func TestStrategyReloadEval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != 200 {
 		t.Fatalf("reload status = %d", resp.StatusCode)
 	}
@@ -160,7 +167,7 @@ func TestStrategyReloadEval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = gr.Body.Close() }()
+	defer closeResponseBody(t, gr)
 	var got map[string]string
 	_ = json.NewDecoder(gr.Body).Decode(&got)
 	if got["strategy"] != newDNA {
@@ -175,7 +182,7 @@ func TestStrategyReloadRejectsInvalid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("invalid strategy status = %d, want 400", resp.StatusCode)
 	}
@@ -192,7 +199,7 @@ func TestStrategyReloadRejectsOversizedBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized body status = %d, want 413", resp.StatusCode)
 	}
@@ -207,7 +214,7 @@ func TestStrategyReloadWorksInProd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("prod reload status = %d, want 200", resp.StatusCode)
 	}
@@ -215,7 +222,7 @@ func TestStrategyReloadWorksInProd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = gr.Body.Close() }()
+	defer closeResponseBody(t, gr)
 	var got map[string]string
 	_ = json.NewDecoder(gr.Body).Decode(&got)
 	if got["strategy"] != newDNA {
@@ -229,7 +236,7 @@ func TestCanaryOnlyInEval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("prod canary status = %d, want 404", resp.StatusCode)
 	}
@@ -239,7 +246,7 @@ func TestCanaryOnlyInEval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp2.Body.Close() }()
+	defer closeResponseBody(t, resp2)
 	if resp2.StatusCode != 200 {
 		t.Fatalf("eval canary status = %d, want 200", resp2.StatusCode)
 	}
@@ -262,7 +269,7 @@ func TestMetricsEndpointGone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("GET /metrics status = %d, want 404", resp.StatusCode)
 	}
@@ -288,7 +295,7 @@ func TestHealthzReportsInboundTCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer closeResponseBody(t, resp)
 
 	var body struct {
 		InboundTCP censor.Snapshot `json:"inbound_tcp"`
@@ -324,7 +331,7 @@ func TestVersionedAdapterPrepareAndActivate(t *testing.T) {
 		return resp
 	}
 	resp := post("/v1/adapter/prepare", body)
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("prepare status = %d", resp.StatusCode)
 	}
@@ -332,7 +339,7 @@ func TestVersionedAdapterPrepareAndActivate(t *testing.T) {
 		t.Fatalf("prepared = %+v", a.prepared)
 	}
 	resp2 := post("/v1/adapter/activate-for-new-connections", body)
-	defer resp2.Body.Close()
+	defer closeResponseBody(t, resp2)
 	if resp2.StatusCode != http.StatusOK || a.active == nil || *a.active != artifact.Identity() {
 		t.Fatalf("activate status=%d active=%+v", resp2.StatusCode, a.active)
 	}
@@ -389,7 +396,7 @@ func TestVersionedAdapterRejectsSerializedRequestOver256KiB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", resp.StatusCode)
 	}
@@ -409,7 +416,7 @@ func TestVersionedAdapterAcceptsFull256KiBArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -442,7 +449,7 @@ func TestLegacyStrategyAndAuthoritativeV1AreMutuallyExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("legacy server exposed v1 adapter: %d", resp.StatusCode)
 	}
@@ -454,7 +461,7 @@ func TestLegacyStrategyAndAuthoritativeV1AreMutuallyExclusive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp2.Body.Close()
+	defer closeResponseBody(t, resp2)
 	if resp2.StatusCode != http.StatusNotFound {
 		t.Fatalf("authoritative v1 server exposed raw-DNA strategy API: %d", resp2.StatusCode)
 	}
