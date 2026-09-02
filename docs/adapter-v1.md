@@ -82,10 +82,12 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
   mapping and permits its private generation ID to be reused.
 - `/v1/adapter/rollback` accepts the complete previous-known-good artifact. It
   can restage a retained drained artifact or recreate a GC'd artifact, is stable
-  on retry, and is the only activation allowed after an integrity latch. Before
-  allocating a private ID for an absent artifact it takes one bounded full
-  conntrack snapshot and selects only an ID authoritatively proven to have zero
-  flows. Snapshot failure rejects the rollback without preparing or steering.
+  on retry, and remains an identity-fenced fallback after an integrity latch. A
+  newer desired artifact may instead recover through the verified-neutral
+  `Prepare` → `Verify` → `ActivateForNewConnections` path described below.
+  Before allocating a private ID for an absent artifact, rollback takes one
+  bounded full conntrack snapshot and selects only an ID authoritatively proven
+  to have zero flows. Snapshot failure rejects it without preparing or steering.
 
 Every handler combines request cancellation with a 30-second timeout. Every
 conntrack dump has a shorter controller-owned hard deadline as well, including
