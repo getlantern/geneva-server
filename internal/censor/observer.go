@@ -58,6 +58,14 @@ const (
 	eventCount
 )
 
+// KernelEvents are the events the nftables classification chain can sort
+// packets into, in classification precedence order. It is the single list the
+// kernel-side counter names and rules derive from (see internal/nftables), so
+// adding or renaming an event cannot leave the two sides silently disagreeing.
+// EventFragment and EventUndecodable have no kernel equivalent: a fragment
+// carries no TCP header to match, and nothing the kernel counts is decoded.
+var KernelEvents = []Event{EventRST, EventSYN, EventFIN, EventData, EventACKOnly}
+
 func (e Event) String() string {
 	switch e {
 	case EventRST:

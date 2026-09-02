@@ -17,6 +17,7 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -42,6 +43,16 @@ type Providers struct {
 	// InboundTCP returns the inbound TCP event counts (JSON-marshalable), the
 	// box-side censor-reachability signal. It may be nil.
 	InboundTCP func() any
+	// Apply installs a strategy end to end: it reprograms the kernel's steering
+	// for what the new strategy can match and then swaps the engine. PUT goes
+	// through it rather than straight to the engine, because a strategy change
+	// can put the box on or take it off the data path. It is required for PUT:
+	// a caller that forgets to wire it gets a loud 503, never a silent
+	// engine-only swap that leaves the kernel steering for the old strategy.
+	Apply func(ctx context.Context, dna string) error
+	// Steering returns what the box is currently steering (JSON-marshalable).
+	// It may be nil.
+	Steering func() any
 }
 
 // Server is the HTTP control surface.
@@ -79,6 +90,10 @@ type healthResp struct {
 	// read on a box with no collector configured — during an e2e run, or when
 	// an operator is on the box asking whether its IP has been burned.
 	InboundTCP any `json:"inbound_tcp,omitempty"`
+	// Steering says whether the box is on the data path at all, and for which
+	// packets. A sidecar with no strategy steers nothing, and an operator
+	// looking at a slow box needs to be able to tell that from here.
+	Steering any `json:"steering,omitempty"`
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -97,20 +112,30 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.p.InboundTCP != nil {
 		resp.InboundTCP = s.p.InboundTCP()
 	}
+	if s.p.Steering != nil {
+		resp.Steering = s.p.Steering()
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).
 // PUT validates the DNA before installing it, and the swap is atomic, so the new
-// strategy applies to the next packet with no restart. This works in both modes:
-// the swap is strategy-content-only (the queues, nftables rules, reinjector, and
-// offload setup are untouched). The write endpoint is unauthenticated, so the
-// control address must stay on a private interface (see deploy/README.md).
+// strategy applies to the next packet with no restart. This works in both modes.
+//
+// The swap is not strategy-content-only: steering is scoped to what the strategy
+// can match, so installing one can widen, narrow, or remove the kernel's rules
+// (see internal/steering). PUT of an empty strategy takes the box off the data
+// path completely. The write endpoint is unauthenticated, so the control address
+// must stay on a private interface (see deploy/README.md).
 func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
 	case http.MethodPut:
+		if s.p.Apply == nil {
+			writeError(w, http.StatusServiceUnavailable, "strategy updates are not wired up")
+			return
+		}
 		// MaxBytesReader returns an error once the limit is exceeded, so an oversized
 		// body is rejected rather than silently truncated (as io.LimitReader would).
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -127,8 +152,15 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 		// Tolerate a trailing newline or surrounding whitespace (common when the
 		// body is piped from a file), which would otherwise fail validation.
 		dna := strings.TrimSpace(string(body))
-		if err := s.p.Engine.SetStrategy(dna); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid strategy: "+err.Error())
+		if err := s.p.Apply(r.Context(), dna); err != nil {
+			// Only a strategy the client got wrong is the client's fault. A
+			// failure to program the kernel for a valid one is ours, and a 400
+			// there would send the caller off fixing a DNA that is fine.
+			if errors.Is(err, engine.ErrInvalidStrategy) {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, "apply strategy: "+err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})

@@ -61,8 +61,11 @@ type runCmd struct {
 	CanaryCapacity int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
 	NFTPath        string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
 	NoNFT          bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
+	CensorCounters bool     `arg:"--censor-counters" default:"true" help:"classify inbound packets with nftables counters, so the censor-reachability signal does not depend on steering inbound through userspace"`
+	ObserveInbound bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
 	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
 	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
+	PprofAddr      string   `arg:"--pprof-addr" help:"debug only: serve net/http/pprof on this address; never enable on a box carrying client traffic"`
 }
 
 // validateCmd holds the flags for the validate subcommand.
@@ -144,23 +147,50 @@ func (o *runCmd) resolveStrategy() (string, error) {
 	if o.Strategy != "" && o.StrategyFile != "" {
 		return "", fmt.Errorf("--strategy and --strategy-file are mutually exclusive")
 	}
+	dna := strings.TrimSpace(o.Strategy)
 	if o.StrategyFile != "" {
 		b, err := os.ReadFile(o.StrategyFile)
 		if err != nil {
 			return "", fmt.Errorf("read strategy file: %w", err)
 		}
 		// Tolerate a trailing newline in an operator-managed file.
-		return strings.TrimSpace(string(b)), nil
+		dna = strings.TrimSpace(string(b))
 	}
-	if o.Strategy == "" && o.Mode == "prod" {
-		return "", fmt.Errorf("prod mode requires --strategy or --strategy-file")
+	// Checked against the resolved DNA, not against the flags: an empty
+	// strategy file passed --strategy-file used to satisfy the flag check and
+	// boot prod in pass-through. That now also means no steering at all, so a
+	// truncated file would take a prod box off the data path silently.
+	if dna == "" && o.Mode == "prod" {
+		return "", fmt.Errorf("prod mode requires a non-empty strategy (--strategy or --strategy-file)")
 	}
-	return strings.TrimSpace(o.Strategy), nil
+	return dna, nil
 }
 
 func (o *runCmd) validate() error {
 	if o.Mode != "prod" && o.Mode != "eval" {
 		return fmt.Errorf("invalid --mode %q (want prod or eval)", o.Mode)
+	}
+	if o.ObserveInbound && o.Mode == "prod" {
+		// Refused rather than warned about, because the cost lands on real
+		// users and the benefit does not need their traffic.
+		//
+		// Observing inbound means a userspace round trip for every inbound
+		// packet, whether or not the strategy can act on one. Measured on a
+		// 1-vCPU box: free where clients download (the inbound direction is
+		// only stretch-ACKs) but -40% where they upload, and a prod box does
+		// not get to choose which its users do. What it buys is the
+		// censor-reachability signal, which is an inference from a
+		// SYN-to-data ratio — and an eval box, which carries no client
+		// traffic, produces that same signal for nothing.
+		//
+		// A prod box that genuinely needs inbound packets in userspace has a
+		// precise way to ask: give its strategy an inbound tree. Steering then
+		// follows the strategy, and the packets are queued because something
+		// actually acts on them rather than because a flag was set. An inbound
+		// pass-through tree is spelled `\/ [TCP:flags:A*]-send-|`.
+		return fmt.Errorf("--observe-inbound is not available in prod mode: it costs a userspace round trip " +
+			"per inbound packet (measured up to -40%% on upload-heavy traffic) for a signal an eval box " +
+			"provides for free; to steer inbound on a prod box, give the strategy an inbound tree")
 	}
 	if o.OutQueue == o.InQueue {
 		return fmt.Errorf("--out-queue and --in-queue must differ")

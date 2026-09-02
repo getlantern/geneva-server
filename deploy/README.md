@@ -36,6 +36,9 @@ sidecar run `ethtool -K` to turn the offloads off, so NFQUEUE yields real,
 MTU-sized, fully-checksummed packets. Always set it to the interface carrying the
 proxy's traffic.
 
+The offloads come down only while something is actually being steered, and go
+back up when it stops — a sidecar with no strategy leaves the NIC alone.
+
 ## Modes
 
 - **prod** — the assigned strategy on a fleet box:
@@ -154,8 +157,123 @@ Mirror the `lantern-box` provisioning flow:
 3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
    the sidecar stopped until the next boot.
 
-In eval mode the strategy file is optional: the sidecar starts in pass-through
-until the GA brain assigns a candidate over `PUT /strategy`.
+In eval mode the strategy file is optional: the sidecar starts with no strategy,
+steering nothing at all, until the GA brain assigns a candidate over
+`PUT /strategy`.
 
-The nftables rules are runtime-owned: the sidecar creates its table on start and
-deletes it on stop, so provisioning must **not** install steering rules itself.
+The nftables rules are runtime-owned: the sidecar programs its table from the
+loaded strategy and deletes it on stop, so provisioning must **not** install
+steering rules itself.
+
+## What gets steered
+
+Steering follows the strategy, because the NFQUEUE round trip — not the
+manipulation — is what the sidecar costs. Measured on a 1-vCPU box running
+vless+REALITY, queueing every packet on the proxy's port cost 76% of a bulk
+transfer's throughput *with no strategy loaded*, while a strategy that duplicated
+every data packet cost only ~4% more than that.
+
+A Geneva strategy hands back any packet its triggers do not match, byte for byte.
+So the rules are narrowed to what can match:
+
+| Strategy | Steered |
+| --- | --- |
+| no strategy (eval boot, or `PUT ""`) | nothing: no table, no rules, offloads untouched |
+| triggers on TCP flags, e.g. `[TCP:flags:S]` | only those flag combinations, per direction |
+| an outbound-only forest | outbound only; inbound stays in the kernel |
+| a trigger nftables cannot express (`TCP:load`, `IP:ttl`, options) | everything on the port, in that direction |
+
+`GET /healthz` reports this under `steering`, which is where to look first when a
+box is unexpectedly fast or slow:
+
+```json
+"steering": {"steering": true, "outbound": "flags&0xff==0x02", "inbound": "none", "offloads_disabled": true}
+```
+
+### Cost of a strategy that touches every packet
+
+A strategy whose triggers match bulk data cannot be scoped away — those packets
+genuinely have to reach userspace. What the sidecar does about it is spend as
+little as possible per packet: one `recvmsg` per batch of packets rather than
+per packet, accept verdicts batched into one message per batch, rewritten
+packets replaced in the queue rather than dropped and reinjected through a raw
+socket (which also skips a second trip through netfilter), and no allocation per
+packet on the hot path.
+
+Two counters on `/healthz` say when the box is losing packets rather than
+manipulating them:
+
+| Counter | Meaning |
+| --- | --- |
+| `verdicts.overruns` | the netlink socket buffer overflowed; those packets bypassed the strategy (the rules' `bypass` flag accepted them, so the proxy kept serving) |
+| `verdicts.truncated` | the kernel copied only part of a packet, so it was accepted unmodified rather than manipulated as a fragment |
+
+Both should be zero. A nonzero `overruns` means the strategy cannot keep up with
+the packet rate on this box; a nonzero `truncated` means the copy length is too
+small for its traffic.
+
+### The censor signal comes from nftables counters
+
+Steering follows the strategy, so an outbound-only strategy delivers no inbound
+packet to userspace — and the censor-reachability signal, the inbound
+SYN-to-data ratio that estimates whether a box's IP has been burned, is about
+inbound packets. Left there, scoping would have bought throughput by going
+blind.
+
+So the classification happens in the kernel instead. Whenever the sidecar has a
+table, it also installs named counters and a chain that sorts arriving packets
+into them — RST, SYN, FIN, data, ack_only, in that precedence, each rule
+returning so every packet lands in exactly one — and reads the counters once per
+export interval. **No packet is queued for the signal**, and it works the same in
+prod and eval, with or without an inbound tree in the strategy. On by default;
+`--censor-counters=false` falls back to the userspace classifier, which only sees
+what the strategy already steers.
+
+Two things the kernel path cannot count, and reports as zero:
+
+- `undecodable` — a decode failure cannot happen to a packet nobody decodes.
+- `fragment` — a non-initial fragment carries no TCP header to match a port
+  against, so counting them would mean counting every fragment on the box for
+  every port.
+
+And one approximation: nftables cannot subtract one header field from another, so
+"carries a payload" is `meta length > 80` rather than
+`ip length - ihl*4 - dataoffset*4 > 0`. A pure ACK with 32 bytes of options is 72
+bytes, so the threshold is safe; the failure mode is a data segment with fewer
+than ~28 payload bytes counting as `ack_only`, which proxy traffic does not
+produce.
+
+The counters ride along with a table that exists for steering. They never keep
+one alive on their own, so **a box with no strategy reports no censor signal** —
+it also has nothing of ours in the kernel, which is the trade that makes an
+unconfigured sidecar free. A box that should be reporting a burn rate is a box
+that should have a strategy.
+
+### `--observe-inbound` (eval mode only)
+
+With the counters above providing the censor signal, this flag no longer has
+anything to do with it. What it still buys is *packets* in userspace rather than
+counts — which only the eval-mode canary pool wants, since that captures real
+header field values for the GA brain to mutate against. Prod has no canary pool
+at all, so in prod the flag would pay for something nothing reads: it is refused
+outright at startup rather than warned about.
+
+**What it costs, if you are wondering why prod may not have it.** One round trip
+per *inbound* packet, so it tracks the inbound packet rate, not the byte rate —
+which makes it almost free or ruinous depending on which way the box's bulk
+traffic runs, and a prod box does not get to choose which its users generate:
+
+| Workload | without | with | |
+| --- | --- | --- | --- |
+| download-heavy, handshake-only strategy | 105.1 MB/s | 105.0 MB/s | free |
+| download-heavy, strategy tampering every data packet | 36.6 MB/s | 33.3 MB/s | −9% |
+| **upload-heavy, handshake-only strategy** | **79.3 MB/s** | **47.4 MB/s** | **−40%** |
+
+Measured on a 1-vCPU box (route `d711a4df`, vless+REALITY). A download's inbound
+direction is nothing but stretch-ACKs — 18.9k inbound packets across 900 MB, one
+per ~33 outbound data packets — so observing it is free. An upload's inbound
+direction is the bulk stream, and then every packet pays.
+
+An eval box carries no client traffic at all, so turning it on there costs
+nothing worth counting — which is the other half of the argument for the mode
+gate: the box that can afford the signal is the box that produces it for free.

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,13 +18,14 @@ import (
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/control"
 	"github.com/getlantern/geneva-server/internal/engine"
-	"github.com/getlantern/geneva-server/internal/netdev"
 	"github.com/getlantern/geneva-server/internal/nfqueue"
 	"github.com/getlantern/geneva-server/internal/nftables"
+	"github.com/getlantern/geneva-server/internal/steering"
 	"github.com/getlantern/geneva-server/internal/telemetry"
 )
 
-// slogLogger adapts slog to the runtime's Debugf/Errorf logger.
+// slogLogger adapts slog to the printf-style loggers the runtime and the
+// steering controller want; one adapter satisfies both interfaces.
 type slogLogger struct{ l *slog.Logger }
 
 // Debugf checks the level before formatting. The runtime's debug path is the
@@ -36,7 +38,16 @@ func (s slogLogger) Debugf(f string, a ...any) {
 	s.l.Debug(fmt.Sprintf(f, a...))
 }
 
+// Infof formats unconditionally: its callers log lifecycle events, not
+// per-packet ones.
+func (s slogLogger) Infof(f string, a ...any)  { s.l.Info(fmt.Sprintf(f, a...)) }
 func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...)) }
+
+// censorReadInterval is how often the kernel classification counters are read.
+// One nft invocation per read, feeding a metric exported on a much slower
+// cadence, so this only has to be quick enough that two consecutive /healthz
+// calls do not return the same numbers.
+const censorReadInterval = 2 * time.Second
 
 func runServer(o *runCmd) error {
 	ctx := context.Background()
@@ -61,53 +72,64 @@ func runServer(o *runCmd) error {
 		observers = append(observers, pool)
 	}
 
-	// The inbound censor classifier runs in both modes: a prod box's IP gets
-	// burned the same way a test box's does, and the fleet-wide burn rate is
-	// what sizes the clean-IP budget for exploration.
-	censorObs := censor.New()
-	observers = append(observers, censorObs)
-	observer := nfqueue.Observers(observers...)
-
 	// Signals cancel the root context so cleanup (nft teardown) always runs.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Disable NIC offloads on the steered interface so NFQUEUE yields real,
-	// MTU-sized, fully-checksummed packets that reinjection can put back on the
-	// wire intact.
-	if o.Iface != "" {
-		summary, err := netdev.DisableOffload(ctx, o.EthtoolPath, o.Iface)
-		if err != nil {
-			return err
-		}
-		log.Info("NIC offloads adjusted", "iface", o.Iface, "result", summary)
-	}
+	// The controller owns both halves of "what reaches userspace": the NIC's
+	// offload state and the steering rules. It installs rules only for the
+	// packets the strategy's triggers can match, and nothing at all when the
+	// strategy can match nothing — which is what keeps an unassigned eval box
+	// and a rolled-back prod box off the data path entirely.
+	ctrl := steering.New(eng, steering.Config{
+		Mode: o.Mode,
+		NFT: nftables.Config{
+			Table:    o.Table,
+			Port:     o.Port,
+			OutQueue: o.OutQueue,
+			InQueue:  o.InQueue,
+			Mark:     uint32(o.Mark),
+			NFTPath:  o.NFTPath,
+			Censor:   o.CensorCounters,
+		},
+		EthtoolPath: o.EthtoolPath,
+		Iface:       o.Iface,
+		NoNFT:       o.NoNFT,
 
-	// Program the steering rules. They are torn down on any exit path.
-	nft := nftables.New(nftables.Config{
-		Table:    o.Table,
-		Port:     o.Port,
-		OutQueue: o.OutQueue,
-		InQueue:  o.InQueue,
-		Mark:     uint32(o.Mark),
-		NFTPath:  o.NFTPath,
-	})
-	if !o.NoNFT {
-		if err := nft.Install(ctx); err != nil {
-			return err
-		}
-		log.Info("nftables steering installed", "table", o.Table, "port", o.Port)
-		defer func() {
-			// Use a fresh context: the root one is already cancelled at shutdown.
-			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if err := nft.Remove(rmCtx); err != nil {
-				log.Error("nftables teardown failed", "err", err)
-			} else {
-				log.Info("nftables steering removed")
-			}
-		}()
+		ObserveInbound: o.ObserveInbound,
+	}, slogLogger{l: log})
+	if err := ctrl.Start(ctx); err != nil {
+		return err
 	}
+	defer func() {
+		// Use a fresh context: the root one is already cancelled at shutdown.
+		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ctrl.Close(rmCtx); err != nil {
+			log.Error("steering teardown failed", "err", err)
+		}
+	}()
+
+	// The inbound censor classifier runs in both modes: a prod box's IP gets
+	// burned the same way a test box's does, and the fleet-wide burn rate is
+	// what sizes the clean-IP budget for exploration.
+	//
+	// Where those counts come from is the interesting part. Steering is scoped
+	// to what the strategy can act on, so an outbound-only strategy delivers no
+	// inbound packet to userspace, and a classifier fed by NFQUEUE would see
+	// nothing at all. The kernel counters classify what arrives without queueing
+	// any of it, which is both the complete answer and the free one. The
+	// userspace classifier stays as the fallback for a box that turns them off,
+	// where it sees whatever the strategy happened to steer.
+	var censorSrc censor.Source
+	if o.CensorCounters {
+		censorSrc = censor.NewKernelSource(ctrl.CensorCounts, censorReadInterval)
+	} else {
+		obs := censor.New()
+		observers = append(observers, obs)
+		censorSrc = obs
+	}
+	observer := nfqueue.Observers(observers...)
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
@@ -119,6 +141,32 @@ func runServer(o *runCmd) error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Profiling is opt-in and separate from the control surface: it is a
+	// benchmarking tool, and the control surface is unauthenticated on a box
+	// that carries traffic. The handlers are registered on a mux of our own
+	// rather than through the package's blank-import side effect, so nothing is
+	// reachable unless this flag is set.
+	if o.PprofAddr != "" {
+		pprofMux := http.NewServeMux()
+		pprofMux.HandleFunc("/debug/pprof/", pprof.Index)
+		pprofMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		pprofMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		pprofMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		pprofMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		pprofSrv := &http.Server{Addr: o.PprofAddr, Handler: pprofMux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			log.Warn("pprof enabled", "addr", o.PprofAddr)
+			if err := pprofSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error("pprof listener failed", "err", err)
+			}
+		}()
+		defer func() {
+			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = pprofSrv.Shutdown(shCtx)
+		}()
 	}
 
 	// Metric export is opt-in: with no OTLP endpoint configured there is no
@@ -133,7 +181,7 @@ func runServer(o *runCmd) error {
 			Mode:    o.Mode,
 			Market:  o.Market,
 			Engine:  eng,
-			Censor:  censorObs,
+			Censor:  censorSrc,
 			Started: started,
 			Verdicts: func() telemetry.Verdicts {
 				s := rt.Snapshot()
@@ -154,18 +202,22 @@ func runServer(o *runCmd) error {
 	}
 
 	// Control/health surface.
-	ctrl := control.New(control.Providers{
+	api := control.New(control.Providers{
 		Mode:       o.Mode,
 		Version:    version,
 		Commit:     commit,
 		Engine:     eng,
 		Canary:     pool,
 		Verdicts:   func() any { return rt.Snapshot() },
-		InboundTCP: func() any { return censorObs.Snapshot() },
+		InboundTCP: func() any { return censorSrc.Snapshot() },
+		// A strategy change is not just an engine swap: it can put the box on
+		// or take it off the data path, so it has to go through the controller.
+		Apply:    ctrl.Apply,
+		Steering: func() any { return ctrl.State() },
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,
-		Handler:           ctrl.Handler(),
+		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		// Bound the whole request read: strategy uploads call io.ReadAll, so a
 		// slow client must not be able to hold a handler open indefinitely.

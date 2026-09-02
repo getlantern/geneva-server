@@ -1,0 +1,16 @@
+# Benchmark-only image: the bulk load generator plus the tooling the runner uses
+# to drive the control API and read the sidecar's counters.
+FROM golang:1.25-bookworm AS builder
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/bulk ./bench/bulk
+
+FROM debian:bookworm-slim
+RUN set -ex \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends curl jq ethtool ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/bulk /usr/local/bin/bulk
+ENTRYPOINT ["/usr/local/bin/bulk"]

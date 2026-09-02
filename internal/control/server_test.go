@@ -1,6 +1,7 @@
 package control
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,9 @@ func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Se
 		Version:  "test",
 		Engine:   eng,
 		Verdicts: func() any { return map[string]int{"accepted": 0} },
+		// Engine-only apply: these tests exercise the HTTP surface, not the
+		// kernel-reprogramming half a real box wires in.
+		Apply: func(_ context.Context, dna string) error { return eng.SetStrategy(dna) },
 	}
 	if withCanary {
 		p.Canary = canary.NewPool("RU", 16)

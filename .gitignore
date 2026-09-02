@@ -5,3 +5,6 @@ profile.cov
 
 # goreleaser output
 dist/
+
+# Written by bench/run.sh before each condition; the mount target, not source.
+bench/strategy.dna

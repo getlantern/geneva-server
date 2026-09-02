@@ -58,3 +58,27 @@ func TestValidateRequiresNonZeroMark(t *testing.T) {
 		}
 	}
 }
+
+// TestObserveInboundRefusedInProd pins the mode gate. Observing inbound costs a
+// userspace round trip per inbound packet — measured free on download-heavy
+// traffic but -40% on upload-heavy, and a prod box does not get to choose which
+// its users generate — in exchange for a signal an eval box produces for free.
+// A prod box that needs inbound packets in userspace asks for them precisely, by
+// giving its strategy an inbound tree.
+func TestObserveInboundRefusedInProd(t *testing.T) {
+	base := func(mode string, observe bool) *runCmd {
+		return &runCmd{
+			Mode: mode, Port: 443, OutQueue: 100, InQueue: 101,
+			Mark: 0x67656e, ObserveInbound: observe,
+		}
+	}
+	if err := base("prod", true).validate(); err == nil {
+		t.Error("validate accepted --observe-inbound in prod mode")
+	}
+	if err := base("eval", true).validate(); err != nil {
+		t.Errorf("validate rejected --observe-inbound in eval mode: %v", err)
+	}
+	if err := base("prod", false).validate(); err != nil {
+		t.Errorf("validate rejected prod without the flag: %v", err)
+	}
+}
