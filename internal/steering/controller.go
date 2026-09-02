@@ -76,7 +76,16 @@ const (
 	defaultMaxScopedGenerations      = 3
 	defaultMaxEveryPacketGenerations = 2
 	maxGenerationArtifact            = 256 << 10
+	persistedStateVersion            = 2
 )
+
+type stateCompatibilityError struct{ cause error }
+
+func (e *stateCompatibilityError) Error() string {
+	return fmt.Sprintf("persisted artifact compatibility check failed: %v", e.cause)
+}
+
+func (e *stateCompatibilityError) Unwrap() error { return e.cause }
 
 type Phase string
 
@@ -88,12 +97,13 @@ const (
 )
 
 type generationState struct {
-	ID       uint32           `json:"id"`
-	DNA      string           `json:"dna"`
-	Digest   string           `json:"digest"`
-	Phase    Phase            `json:"phase"`
-	Scope    Scope            `json:"-"`
-	Identity adapter.Identity `json:"identity"`
+	ID       uint32                   `json:"id"`
+	DNA      string                   `json:"dna"`
+	Digest   string                   `json:"digest"`
+	Phase    Phase                    `json:"phase"`
+	Scope    Scope                    `json:"-"`
+	Identity adapter.Identity         `json:"identity"`
+	Metadata adapter.ArtifactMetadata `json:"artifact_metadata"`
 }
 
 type GenerationStatus struct {
@@ -143,6 +153,10 @@ type Controller struct {
 	offloads     *netdev.Original
 	faultLatched atomic.Bool
 	persistFatal atomic.Bool
+	// reservedGenerations contains namespace IDs observed on orphaned live
+	// conntracks. They cannot be reused until a later authoritative full dump
+	// proves the ID has no flows.
+	reservedGenerations map[uint32]struct{}
 }
 
 var _ adapter.Adapter = (*Controller)(nil)
@@ -182,7 +196,10 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 			return original.Restore(ctx, path)
 		}
 	}
-	return &Controller{cfg: cfg, eng: eng, log: log, generations: make(map[uint32]*generationState)}
+	return &Controller{
+		cfg: cfg, eng: eng, log: log,
+		generations: make(map[uint32]*generationState), reservedGenerations: make(map[uint32]struct{}),
+	}
 }
 
 // Start reconstructs durable engines before enabling any steering.
@@ -205,11 +222,23 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		}
 	}
 	loaded, err := c.loadLocked()
+	compatibilityUnsafe := false
 	if err != nil {
-		return err
+		quarantined, quarantineErr := c.quarantineStateLocked()
+		if quarantineErr != nil {
+			return errors.Join(fmt.Errorf("load adapter state: %w", err), fmt.Errorf("quarantine adapter state: %w", quarantineErr))
+		}
+		// No engine or assignment from corrupt/incompatible durable intent is
+		// loaded. The original bytes remain in a durably renamed quarantine file,
+		// and the new state records the unsafe remediation requirement.
+		compatibilityUnsafe = true
+		loaded = false
+		c.unsafe, c.activeNew = true, 0
+		c.faultLatched.Store(true)
+		c.failure = fmt.Sprintf("adapter state quarantined at %s: %v", quarantined, err)
 	}
 	legacyInitial := uint32(0)
-	if !loaded && initialDNA != "" {
+	if !loaded && !compatibilityUnsafe && initialDNA != "" {
 		if err := c.prepareLocked(1, legacyIdentity(1, initialDNA), initialDNA); err != nil {
 			return err
 		}
@@ -220,7 +249,7 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		if countErr != nil {
 			c.unsafe, c.activeNew = true, 0
 			c.faultLatched.Store(true)
-			c.failure = fmt.Sprintf("bounded startup conntrack audit failed: %v", countErr)
+			c.appendFailureLocked(fmt.Sprintf("bounded startup conntrack audit failed: %v", countErr))
 			for _, gen := range c.generations {
 				if gen.Phase == PhaseActive {
 					gen.Phase = PhaseDraining
@@ -228,6 +257,7 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 			}
 			counts = nil
 		}
+		c.reconcileReservedGenerationsLocked(counts)
 		if !loaded {
 			n := 0
 			for _, count := range counts {
@@ -235,7 +265,7 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 			}
 			if n != 0 {
 				c.unsafe, c.activeNew = true, 0
-				c.failure = fmt.Sprintf("%d orphaned Geneva-marked flows without durable engine state", n)
+				c.appendFailureLocked(fmt.Sprintf("%d orphaned Geneva-marked flows without durable engine state", n))
 				for _, gen := range c.generations {
 					gen.Phase = PhasePrepared
 				}
@@ -249,7 +279,7 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 			}
 			if orphaned != 0 {
 				c.unsafe, c.activeNew = true, 0
-				c.failure = fmt.Sprintf("%d orphaned Geneva-marked flows have no reconstructed engine", orphaned)
+				c.appendFailureLocked(fmt.Sprintf("%d orphaned Geneva-marked flows have no reconstructed engine", orphaned))
 			}
 		}
 	}
@@ -329,9 +359,6 @@ func (c *Controller) restoreActiveAfterRestartLocked(ctx context.Context) error 
 	}
 	if _, err := c.neutralizeConnections(ctx); err != nil {
 		return fmt.Errorf("neutralize conntracks during active restart: %w", err)
-	}
-	if err := c.programLocked(ctx, live, 0, false); err != nil {
-		return fmt.Errorf("stage restart generation union: %w", err)
 	}
 	if err := c.programLocked(ctx, live, active, false); err != nil {
 		return fmt.Errorf("restore restart active assignment: %w", err)
@@ -418,8 +445,24 @@ func (c *Controller) Apply(ctx context.Context, dna string) error {
 }
 
 func (c *Controller) prepareLocked(id uint32, identity adapter.Identity, dna string) error {
+	descriptor := c.Descriptor()
+	return c.prepareArtifactLocked(id, adapter.ArtifactMetadata{
+		Technique: identity.Technique, Revision: identity.Revision, Digest: identity.Digest, Size: len([]byte(dna)),
+		AdapterProtocol: descriptor.AdapterProtocol, RequiredRuntimeName: descriptor.RuntimeName,
+		RequiredRuntimeVersion: descriptor.RuntimeVersion, SchemaVersion: adapter.SchemaVersionV1,
+	}, dna)
+}
+
+func (c *Controller) prepareArtifactLocked(id uint32, metadata adapter.ArtifactMetadata, dna string) error {
 	if len([]byte(dna)) > maxGenerationArtifact {
 		return fmt.Errorf("%w: artifact exceeds 256 KiB", engine.ErrInvalidStrategy)
+	}
+	artifact, err := adapter.NewArtifact(metadata, []byte(dna))
+	if err != nil {
+		return fmt.Errorf("%w: artifact metadata: %v", engine.ErrInvalidStrategy, err)
+	}
+	if err := artifact.ValidateFor(c.Descriptor()); err != nil {
+		return fmt.Errorf("%w: artifact compatibility: %v", engine.ErrInvalidStrategy, err)
 	}
 	parsed, err := geneva.NewStrategy(dna)
 	if err != nil {
@@ -433,11 +476,15 @@ func (c *Controller) prepareLocked(id uint32, identity adapter.Identity, dna str
 	}
 	sum := sha256.Sum256([]byte(dna))
 	digest := hex.EncodeToString(sum[:])
+	identity := artifact.Identity()
 	if err := validateIdentity(identity, digest); err != nil {
 		_ = c.eng.Remove(id)
 		return err
 	}
-	c.generations[id] = &generationState{ID: id, DNA: dna, Digest: digest, Identity: identity, Phase: PhasePrepared, Scope: c.widen(Of(parsed))}
+	c.generations[id] = &generationState{
+		ID: id, DNA: dna, Digest: digest, Identity: identity, Metadata: metadata,
+		Phase: PhasePrepared, Scope: c.widen(Of(parsed)),
+	}
 	return nil
 }
 
@@ -529,7 +576,7 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	if id == 0 {
 		return errors.New("no private generation ID is available")
 	}
-	if err := c.prepareLocked(id, artifact.Identity(), dna); err != nil {
+	if err := c.prepareArtifactLocked(id, artifact.Metadata(), dna); err != nil {
 		return err
 	}
 	if err := c.validateResourceBudgetsLocked(); err != nil {
@@ -610,37 +657,79 @@ func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) er
 		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	id, gen, err := c.generationForIdentityLocked(artifact.Identity())
 	if err != nil {
+		c.mu.Unlock()
 		return err
 	}
 	dna := string(artifact.Payload())
-	if gen == nil {
-		if len(c.generations) >= c.cfg.MaxGenerations {
-			return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+	if gen != nil {
+		defer c.mu.Unlock()
+		if gen.DNA != dna {
+			return errors.New("rollback artifact identity is retained with different content")
 		}
-		id = c.nextGenerationLocked()
-		if id == 0 {
-			return errors.New("no private generation ID is available for rollback")
-		}
-		if err := c.prepareLocked(id, artifact.Identity(), dna); err != nil {
-			return err
-		}
-		if err := c.validateResourceBudgetsLocked(); err != nil {
-			delete(c.generations, id)
-			_ = c.eng.Remove(id)
-			return err
-		}
-		if err := c.persistLocked(); err != nil {
-			delete(c.generations, id)
-			_ = c.eng.Remove(id)
-			return err
-		}
-		gen = c.generations[id]
+		return c.activateLocked(ctx, id, true)
 	}
-	if gen.DNA != dna {
-		return errors.New("rollback artifact identity is retained with different content")
+	if len(c.generations) >= c.cfg.MaxGenerations {
+		c.mu.Unlock()
+		return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+	}
+	c.mu.Unlock()
+
+	// An absent rollback artifact needs a new private numeric mapping. A full,
+	// bounded namespace snapshot is the authority that the chosen ID has zero
+	// flows; in-memory state alone cannot see orphan marks left by lost state.
+	counts, err := c.connectionCounts(ctx)
+	if err != nil {
+		cause := fmt.Errorf("cannot prove a zero-flow generation for rollback: %w", err)
+		c.mu.Lock()
+		c.faultLatched.Store(true)
+		c.unsafe = true
+		c.appendFailureLocked(cause.Error())
+		active := c.activeNew
+		if active != 0 {
+			failureCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			c.integrityFailureLocked(failureCtx, cause)
+			cancel()
+		}
+		c.mu.Unlock()
+		return cause
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Another idempotent caller may have completed the preparation while the
+	// conntrack dump was in flight.
+	id, gen, err = c.generationForIdentityLocked(artifact.Identity())
+	if err != nil {
+		return err
+	}
+	if gen != nil {
+		if gen.DNA != dna {
+			return errors.New("rollback artifact identity is retained with different content")
+		}
+		return c.activateLocked(ctx, id, true)
+	}
+	if len(c.generations) >= c.cfg.MaxGenerations {
+		return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+	}
+	c.reconcileReservedGenerationsLocked(counts)
+	id = c.nextGenerationLocked()
+	if id == 0 {
+		return errors.New("no proven-zero private generation ID is available for rollback")
+	}
+	if err := c.prepareArtifactLocked(id, artifact.Metadata(), dna); err != nil {
+		return err
+	}
+	if err := c.validateResourceBudgetsLocked(); err != nil {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return err
+	}
+	if err := c.persistLocked(); err != nil {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return err
 	}
 	return c.activateLocked(ctx, id, true)
 }
@@ -1125,7 +1214,7 @@ func (c *Controller) State() State {
 }
 
 func (c *Controller) stateLocked() State {
-	out := State{Version: 1, ActiveNew: c.activeNew, Previous: c.previous, OffloadsDisabled: c.offloads != nil, Unsafe: c.unsafe || c.faultLatched.Load(), IntegrityFailure: c.failure, Generations: make([]GenerationStatus, 0, len(c.generations))}
+	out := State{Version: persistedStateVersion, ActiveNew: c.activeNew, Previous: c.previous, OffloadsDisabled: c.offloads != nil, Unsafe: c.unsafe || c.faultLatched.Load(), IntegrityFailure: c.failure, Generations: make([]GenerationStatus, 0, len(c.generations))}
 	for _, g := range c.generations {
 		out.Generations = append(out.Generations, GenerationStatus{ID: g.ID, Digest: g.Digest, Identity: g.Identity, Phase: g.Phase, Outbound: describe(g.Scope.Outbound), Inbound: describe(g.Scope.Inbound), ResourceClass: resourceClass(g.Scope)})
 		if (g.Phase == PhaseActive || g.Phase == PhaseDraining) && !g.Scope.Idle() {
@@ -1411,7 +1500,7 @@ func (c *Controller) persistLocked() (retErr error) {
 			retErr = c.persistenceFailureLocked(retErr)
 		}
 	}()
-	s := persistedState{Version: 1, ActiveNew: c.activeNew, Previous: c.previous, Unsafe: c.unsafe, Failure: c.failure, Offloads: c.offloads, Generations: make([]generationState, 0, len(c.generations))}
+	s := persistedState{Version: persistedStateVersion, ActiveNew: c.activeNew, Previous: c.previous, Unsafe: c.unsafe, Failure: c.failure, Offloads: c.offloads, Generations: make([]generationState, 0, len(c.generations))}
 	for _, g := range c.generations {
 		x := *g
 		x.Scope = Scope{}
@@ -1520,46 +1609,86 @@ func (c *Controller) loadLocked() (bool, error) {
 		}
 		return false, fmt.Errorf("decode adapter state: %w", err)
 	}
-	if s.Version != 1 {
+	if s.Offloads != nil && s.Offloads.Interface != c.cfg.Iface {
+		return false, fmt.Errorf("persisted offload owner names %q, configured interface is %q", s.Offloads.Interface, c.cfg.Iface)
+	}
+	// Even when artifact compatibility later fails, retain valid controller-
+	// owned offload restoration metadata. Startup remains inactive and restores
+	// these features before persisting that ownership as complete.
+	c.offloads = s.Offloads
+	if s.Version == 1 {
+		return false, &stateCompatibilityError{cause: errors.New("state version 1 has no durable artifact protocol/schema/runtime metadata")}
+	}
+	if s.Version != persistedStateVersion {
 		return false, fmt.Errorf("unsupported adapter state version %d", s.Version)
 	}
 	if len(s.Generations) > c.cfg.MaxGenerations {
 		return false, fmt.Errorf("adapter state has %d generations, exceeding configured maximum %d", len(s.Generations), c.cfg.MaxGenerations)
 	}
+	// Validate the complete immutable artifact contract before reconstructing a
+	// single engine. A changed binary must never partially load old intent and
+	// then discover an incompatible active generation.
+	savedByID := make(map[uint32]generationState, len(s.Generations))
+	savedIdentity := make(map[adapter.Identity]uint32, len(s.Generations))
 	for _, saved := range s.Generations {
 		if _, err := generation.Mark(saved.ID); err != nil {
 			return false, err
 		}
-		if c.generations[saved.ID] != nil {
+		if _, exists := savedByID[saved.ID]; exists {
 			return false, fmt.Errorf("adapter state contains duplicate generation %d", saved.ID)
 		}
-		if existingID, existing, err := c.generationForIdentityLocked(saved.Identity); err != nil {
-			return false, err
-		} else if existing != nil {
+		if existingID, exists := savedIdentity[saved.Identity]; exists {
 			return false, fmt.Errorf("adapter state maps artifact identity to both generations %d and %d", existingID, saved.ID)
 		}
 		if saved.Phase != PhasePrepared && saved.Phase != PhaseActive && saved.Phase != PhaseDraining && saved.Phase != PhaseDrained {
 			return false, fmt.Errorf("generation %d has invalid phase %q", saved.ID, saved.Phase)
 		}
-		if err := c.prepareLocked(saved.ID, saved.Identity, saved.DNA); err != nil {
+		artifact, artifactErr := adapter.NewArtifact(saved.Metadata, []byte(saved.DNA))
+		if artifactErr != nil {
+			return false, &stateCompatibilityError{cause: fmt.Errorf("generation %d metadata: %w", saved.ID, artifactErr)}
+		}
+		if artifact.Identity() != saved.Identity {
+			return false, &stateCompatibilityError{cause: fmt.Errorf("generation %d metadata identity does not match retained identity", saved.ID)}
+		}
+		if artifactErr := artifact.ValidateFor(c.Descriptor()); artifactErr != nil {
+			return false, &stateCompatibilityError{cause: fmt.Errorf("generation %d: %w", saved.ID, artifactErr)}
+		}
+		if saved.Digest != saved.Metadata.Digest {
+			return false, fmt.Errorf("generation %d digest does not match persisted artifact metadata", saved.ID)
+		}
+		if artifactErr := c.verifyArtifact(context.Background(), saved.Identity, saved.DNA); artifactErr != nil {
+			return false, fmt.Errorf("validate persisted generation %d: %w", saved.ID, artifactErr)
+		}
+		savedByID[saved.ID] = saved
+		savedIdentity[saved.Identity] = saved.ID
+	}
+	if s.ActiveNew != 0 {
+		active, exists := savedByID[s.ActiveNew]
+		if !exists {
+			return false, fmt.Errorf("active generation %d absent from adapter state", s.ActiveNew)
+		}
+		if active.Phase != PhaseActive {
+			return false, fmt.Errorf("active generation %d has phase %q", s.ActiveNew, active.Phase)
+		}
+	}
+	prepared := make([]uint32, 0, len(s.Generations))
+	cleanupPrepared := func() {
+		for _, id := range prepared {
+			delete(c.generations, id)
+			_ = c.eng.Remove(id)
+		}
+	}
+	for _, saved := range s.Generations {
+		if err := c.prepareArtifactLocked(saved.ID, saved.Metadata, saved.DNA); err != nil {
+			cleanupPrepared()
 			return false, fmt.Errorf("reconstruct generation %d: %w", saved.ID, err)
 		}
-		if saved.Digest != c.generations[saved.ID].Digest {
-			return false, fmt.Errorf("generation %d digest does not match persisted artifact", saved.ID)
-		}
+		prepared = append(prepared, saved.ID)
 		c.generations[saved.ID].Phase = saved.Phase
 	}
 	if err := c.validateResourceBudgetsLocked(); err != nil {
+		cleanupPrepared()
 		return false, fmt.Errorf("adapter state resource budget: %w", err)
-	}
-	if s.ActiveNew != 0 && c.generations[s.ActiveNew] == nil {
-		return false, fmt.Errorf("active generation %d absent from adapter state", s.ActiveNew)
-	}
-	if s.ActiveNew != 0 && c.generations[s.ActiveNew].Phase != PhaseActive {
-		return false, fmt.Errorf("active generation %d has phase %q", s.ActiveNew, c.generations[s.ActiveNew].Phase)
-	}
-	if s.Offloads != nil && s.Offloads.Interface != c.cfg.Iface {
-		return false, fmt.Errorf("persisted offload owner names %q, configured interface is %q", s.Offloads.Interface, c.cfg.Iface)
 	}
 	c.activeNew, c.previous, c.unsafe, c.failure, c.offloads = s.ActiveNew, s.Previous, s.Unsafe, s.Failure, s.Offloads
 	return true, nil
@@ -1608,21 +1737,49 @@ func (c *Controller) validateResourceBudgetsLocked() error {
 }
 
 func (c *Controller) nextGenerationLocked() uint32 {
-	ids := make([]uint32, 0, len(c.generations))
+	ids := make([]uint32, 0, len(c.generations)+len(c.reservedGenerations))
 	for id := range c.generations {
 		ids = append(ids, id)
+	}
+	for id := range c.reservedGenerations {
+		if c.generations[id] == nil {
+			ids = append(ids, id)
+		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	candidate := uint32(1)
 	for _, id := range ids {
 		if id == candidate {
 			candidate++
+		} else if id > candidate {
+			break
 		}
 	}
 	if candidate == 0 || candidate > generation.MaxID {
 		return 0
 	}
 	return candidate
+}
+
+func (c *Controller) reconcileReservedGenerationsLocked(counts map[uint32]int) {
+	for id := range c.reservedGenerations {
+		if counts[id] == 0 {
+			delete(c.reservedGenerations, id)
+		}
+	}
+	for id, count := range counts {
+		if count > 0 && c.generations[id] == nil {
+			c.reservedGenerations[id] = struct{}{}
+		}
+	}
+}
+
+func (c *Controller) appendFailureLocked(failure string) {
+	if c.failure == "" {
+		c.failure = failure
+		return
+	}
+	c.failure += "; " + failure
 }
 
 func fsyncDirectory(path string) error {
@@ -1632,6 +1789,37 @@ func fsyncDirectory(path string) error {
 	}
 	defer func() { _ = dir.Close() }()
 	return dir.Sync()
+}
+
+func (c *Controller) quarantineStateLocked() (string, error) {
+	if c.cfg.StateFile == "" {
+		return "", errors.New("adapter state path is empty")
+	}
+	dir := filepath.Dir(c.cfg.StateFile)
+	var quarantine string
+	for attempt := 0; attempt < 100; attempt++ {
+		quarantine = fmt.Sprintf("%s.quarantine-%d-%d", c.cfg.StateFile, time.Now().UnixNano(), attempt)
+		if _, err := os.Lstat(quarantine); errors.Is(err, os.ErrNotExist) {
+			break
+		} else if err != nil {
+			return "", err
+		}
+		quarantine = ""
+	}
+	if quarantine == "" {
+		return "", errors.New("could not allocate a unique quarantine path")
+	}
+	if err := os.Rename(c.cfg.StateFile, quarantine); err != nil {
+		return "", err
+	}
+	syncDirectory := c.cfg.SyncDirectory
+	if syncDirectory == nil {
+		syncDirectory = fsyncDirectory
+	}
+	if err := syncDirectory(dir); err != nil {
+		return "", fmt.Errorf("sync quarantine rename: %w", err)
+	}
+	return quarantine, nil
 }
 func (c *Controller) phasesLocked() map[uint32]Phase {
 	m := make(map[uint32]Phase, len(c.generations))

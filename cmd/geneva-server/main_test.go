@@ -48,7 +48,7 @@ func TestMarkFlagUnmarshalText(t *testing.T) {
 // no longer participates in steering. Reinjection uses the packet's exact
 // routing mark and the dedicated adapter socket UID.
 func TestValidateAllowsDeprecatedMarkZero(t *testing.T) {
-	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, ReinjectBypassUID: -1}
+	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, ReinjectBypassUID: -1, AdapterStateFile: "/tmp/adapter-state.json"}
 	if err := o.validate(); err != nil {
 		t.Errorf("deprecated --mark affected managed-nft validation: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestValidateAllowsDeprecatedMarkZero(t *testing.T) {
 
 func TestNoNFTRejectedForVersionedLifecycle(t *testing.T) {
 	for _, uid := range []int64{-1, 4242} {
-		o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, NoNFT: true, ReinjectBypassUID: uid}
+		o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, NoNFT: true, ReinjectBypassUID: uid, AdapterStateFile: "/tmp/adapter-state.json"}
 		if err := o.validate(); err == nil || !strings.Contains(err.Error(), "transactional versioned lifecycle") {
 			t.Fatalf("no-nft with UID %d error = %v", uid, err)
 		}
@@ -73,7 +73,7 @@ func TestObserveInboundRefusedInProd(t *testing.T) {
 	base := func(mode string, observe bool) *runCmd {
 		return &runCmd{
 			Mode: mode, Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101,
-			Mark: 0x67656e, ObserveInbound: observe,
+			Mark: 0x67656e, ObserveInbound: observe, AdapterStateFile: "/tmp/adapter-state.json",
 		}
 	}
 	if err := base("prod", true).validate(); err == nil {
@@ -109,9 +109,16 @@ func TestValidateGenerationBudget(t *testing.T) {
 }
 
 func TestProductionRequiresInterfaceForOffloadOwnership(t *testing.T) {
-	o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1}
+	o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1, AdapterStateFile: "/tmp/adapter-state.json"}
 	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "requires --iface") {
 		t.Fatalf("missing interface error = %v", err)
+	}
+}
+
+func TestAuthoritativeProductionRequiresDurableAdapterState(t *testing.T) {
+	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1, AdapterStateFile: "   "}
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "requires --adapter-state-file") {
+		t.Fatalf("empty adapter state path error = %v", err)
 	}
 }
 

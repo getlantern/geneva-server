@@ -146,12 +146,23 @@ no packet can be assigned before its immutable engine and rules are live. The
 state needed to reconstruct every live engine is atomically persisted and
 file/directory-synced at `--adapter-state-file` before either transaction. Every
 restart which sees active intent first reinstalls the neutral boundary and
-sweeps unowned conntracks before restoring assignment. Unknown orphaned
+sweeps unowned conntracks before restoring assignment, then flips directly from
+neutral+full-union to active+full-union without an unassigned gap. Unknown orphaned
 namespace marks disable new assignment and fail open rather than being applied
 to the wrong DNA. First activation temporarily neutral-marks both existing
 relevant conntracks and SYNs arriving during the sweep before flipping
 assignment, so a pre-activation half-open SYN retransmission cannot cross the
 boundary.
+
+State v2 retains the artifact's exact protocol, schema, and required runtime
+metadata and revalidates it against the installed descriptor before restart
+activation. Corrupt, incompatible, or metadata-less v1 state is durably
+quarantined; the sidecar stays inactive/unsafe and reports unhealthy while the
+loopback rollback endpoint remains available. Orphan generation IDs discovered
+by a bounded full conntrack dump remain reserved and never enter union rules.
+An absent-artifact rollback allocates only an ID proven zero-flow by a fresh
+authoritative snapshot. Production authoritative mode requires a nonempty
+`--adapter-state-file`.
 
 The lifecycle status exposes only the canonical artifact digest: bare lowercase
 64-character SHA-256 hex. Raw DNA remains confined to the legacy,

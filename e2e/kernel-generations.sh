@@ -77,6 +77,12 @@ wait_count() {
   return 1
 }
 
+mark_observer_packets() {
+  local mark=$1
+  "${COMPOSE[@]}" exec -T probe nft list chain inet geneva_mark_probe observe | \
+    awk -v mark="$mark" '$0 ~ "meta mark " mark { for (i = 1; i <= NF; i++) if ($i == "packets") { print $(i + 1); exit } }'
+}
+
 echo 'kernel-gate: clean prior state, build, and start inactive'
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 "${COMPOSE[@]}" up -d --build server sidecar
@@ -101,7 +107,9 @@ tester_ip=$("${COMPOSE[@]}" exec -T probe getent ahostsv4 tester | awk 'NR==1 {p
 "${COMPOSE[@]}" exec -d tester sh -c \
   'echo $$ >/tmp/halfopen.pid; exec curl --local-port 39001 -fsS --no-buffer "http://server:8080/hold?duration=50s" >/tmp/halfopen.out'
 sleep 1
-"${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | grep -q 'sport=39001'
+halfopen_before=$("${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | grep 'sport=39001')
+printf '%s\n' "$halfopen_before" | grep -q 'SYN_SENT'
+printf '%s\n' "$halfopen_before" | grep -q '\[UNREPLIED\]'
 
 # Generation 1 has an unexpressible payload scope, so it queues every inbound
 # packet, plus an unchanged outbound ACK path. That widens across the pre-existing
@@ -135,6 +143,11 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 [[ "$(status | jq --argjson want "$identity_one" '.active == $want')" == true ]]
+halfopen_after_flip=$("${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | grep 'sport=39001')
+printf '%s\n' "$halfopen_after_flip" | grep -q 'SYN_SENT'
+printf '%s\n' "$halfopen_after_flip" | grep -q '\[UNREPLIED\]'
+printf '%s\n' "$halfopen_after_flip" | grep -Eq 'mark=(1728053248|0x67000000)'
+"${COMPOSE[@]}" exec -T tester sh -c 'kill -0 "$(cat /tmp/halfopen.pid)"'
 "${COMPOSE[@]}" exec -T probe nft delete table inet geneva_halfopen
 for _ in $(seq 1 50); do
   if "${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | \
@@ -191,14 +204,18 @@ activate "$two"
 [[ "$(wait_count 1 positive)" -gt 0 ]]
 [[ "$(wait_count 2 positive)" -gt 0 ]]
 
-before=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.packets_in')
+health_before=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+before=$(printf '%s' "$health_before" | jq '.engine.packets_in')
+reinjected_before=$(printf '%s' "$health_before" | jq '.verdicts.reinjected')
+mark_440_before=$(mark_observer_packets '0x00000440')
 "${COMPOSE[@]}" exec -T tester curl -fsS 'http://server:8080/?mark=0x440' >/dev/null
 health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
 after=$(printf '%s' "$health" | jq '.engine.packets_in')
-[[ "$(printf '%s' "$health" | jq '.verdicts.reinjected')" -gt 0 ]]
+reinjected_after=$(printf '%s' "$health" | jq '.verdicts.reinjected')
+mark_440_after=$(mark_observer_packets '0x00000440')
+[[ "$reinjected_after" -gt "$reinjected_before" ]]
 [[ "$((after - before))" -lt 10000 ]]
-"${COMPOSE[@]}" exec -T probe nft list chain inet geneva_mark_probe observe | \
-  grep 'meta mark 0x00000440' | grep -Eq 'packets [1-9]'
+[[ "$mark_440_after" -gt "$mark_440_before" ]]
 
 echo 'kernel-gate: rollback keeps both flows, then bounded drain and keep-set GC'
 api /v1/adapter/rollback "$one" >/dev/null
@@ -217,6 +234,7 @@ api /v1/adapter/garbage-collect "$(jq -cn --argjson one "$identity_one" '{keep:[
 [[ "$(wait_count 1 positive)" -gt 0 ]]
 
 echo 'kernel-gate: a verified second process cannot acquire live queues'
+collision_packets_before=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.packets_in')
 collision_log=$(mktemp)
 if "${COMPOSE[@]}" exec -T sidecar /usr/local/bin/geneva-server run \
     --mode=prod --port=8080 --iface=eth0 --control-addr=127.0.0.1:8093 \
@@ -228,6 +246,12 @@ fi
 grep -q 'engine registry ready' "$collision_log"
 grep -Eq 'open (out|in)-queue (100|101): .*bind queue' "$collision_log"
 "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8080/healthz >/dev/null
+for _ in $(seq 1 30); do
+  collision_packets_after=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.packets_in')
+  [[ "$collision_packets_after" -gt "$collision_packets_before" ]] && break
+  sleep 0.2
+done
+[[ "$collision_packets_after" -gt "$collision_packets_before" ]]
 
 echo 'kernel-gate: bound queue overload is fail-open at max length 1'
 "${COMPOSE[@]}" pause sidecar >/dev/null

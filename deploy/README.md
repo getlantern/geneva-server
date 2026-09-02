@@ -177,12 +177,15 @@ loaded strategy and deletes it on stop, so provisioning must **not** install
 steering rules itself.
 
 The systemd unit creates `/var/lib/geneva-server` for the default
-`--adapter-state-file`. This 0600 file contains the DNA and phase of every live
-generation. It is required for restart reconstruction: conntrack marks survive
-a process restart, so discarding the corresponding immutable engines would be
-unsafe. If state is missing or corrupt while namespace-marked flows exist, the
-adapter reports `unsafe`, assigns no new generation, and unknown flows bypass
-userspace. Repair with an explicit rollback after restoring a known generation.
+`--adapter-state-file`; authoritative production rejects an empty path. This
+0600 v2 file contains the DNA, phase, identity, and exact adapter protocol,
+schema, and required runtime metadata of every live generation. Restart rebuilds
+and validates all artifacts against the installed descriptor before loading any
+assignment. Incompatible, metadata-less v1, or corrupt state is durably renamed
+to a quarantine file. The local lifecycle remains reachable for remediation but
+reports `unsafe`, `/healthz` returns unhealthy, no new generation is assigned,
+and unknown flows bypass userspace. Repair with a full known-good artifact
+rollback; do not edit or delete conntrack marks.
 
 ### Conntrack mark reservation and drain
 
@@ -209,7 +212,10 @@ Drain/status read conntrack over netlink, filter by the full Geneva generation
 mask, then by original IPv4/TCP destination port. GC refuses an active
 generation or any nonzero result. IDs are bounded to 1..4095 and cannot be
 changed in place; an ID becomes reusable only after zero-flow GC, so wraparound
-cannot bind an old conntrack entry to new DNA.
+cannot bind an old conntrack entry to new DNA. Startup also reserves every live
+orphan ID found in the namespace. Restaging an absent rollback artifact takes a
+fresh bounded full dump and allocates only an ID proven to have zero flows;
+unknown orphan IDs never enter the union rules or engine registry.
 
 At most three generations are retained by default; change this deliberately
 with `--max-generations` (1..32). The handshake-scoped and every-packet subsets
@@ -218,7 +224,8 @@ also have separate `--max-scoped-generations` (default three) and
 applicable budget is full, and status exposes the generation resource class.
 Lifecycle status reports authoritative connection counts and bare lowercase
 SHA-256 hex digests, never raw DNA. `/healthz` uses the cached lifecycle view and
-does not dump conntrack, keeping routine probes bounded.
+does not dump conntrack, keeping routine probes bounded; an integrity latch
+returns HTTP 503 while the local rollback endpoints remain available.
 
 ## What gets steered
 

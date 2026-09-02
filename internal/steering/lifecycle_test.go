@@ -4,6 +4,7 @@ package steering
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -44,6 +45,8 @@ func lifecycleArtifact(t *testing.T, revision, dna string) adapter.Artifact {
 
 type fakeConnections struct {
 	counts      map[uint32]int
+	countsErr   error
+	countCalls  int
 	namespace   int
 	gotID       uint32
 	gotPort     uint16
@@ -55,6 +58,10 @@ func (f *fakeConnections) Count(_ context.Context, id uint32, port uint16) (int,
 	return f.counts[id], nil
 }
 func (f *fakeConnections) Counts(context.Context, uint16) (map[uint32]int, error) {
+	f.countCalls++
+	if f.countsErr != nil {
+		return nil, f.countsErr
+	}
 	counts := make(map[uint32]int, len(f.counts)+1)
 	for id, count := range f.counts {
 		counts[id] = count
@@ -493,8 +500,11 @@ func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
 		t.Fatal(err)
 	}
 	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}}}, nil)
-	if err := c2.Start(ctx, ""); err == nil || !strings.Contains(err.Error(), "trailing") {
-		t.Fatalf("trailing state error = %v", err)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := c2.State(); !st.Unsafe || st.ActiveNew != 0 || !strings.Contains(st.IntegrityFailure, "trailing") {
+		t.Fatalf("trailing state was not quarantined unsafe: %+v", st)
 	}
 }
 
@@ -757,8 +767,8 @@ func TestRestartRestagesDurableActiveThroughNeutralBoundary(t *testing.T) {
 	if err := c2.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 4 {
-		t.Fatalf("restart program calls = %d, want stale removal + neutral + stage + flip: %+v", len(calls), calls)
+	if len(calls) != 3 {
+		t.Fatalf("restart program calls = %d, want stale removal + neutral union + active flip: %+v", len(calls), calls)
 	}
 	if calls[0].ActiveGeneration != 0 || len(calls[0].Generations) != 0 {
 		t.Fatalf("restart did not first remove stale assignment: %+v", calls[0])
@@ -766,17 +776,326 @@ func TestRestartRestagesDurableActiveThroughNeutralBoundary(t *testing.T) {
 	if !calls[1].NeutralizeNew || calls[1].ActiveGeneration != 0 || len(calls[1].Generations) != 1 {
 		t.Fatalf("restart neutral boundary = %+v", calls[1])
 	}
-	if calls[2].NeutralizeNew || calls[2].ActiveGeneration != 0 || len(calls[2].Generations) != 1 {
-		t.Fatalf("restart staged union = %+v", calls[2])
-	}
-	if calls[3].NeutralizeNew || calls[3].ActiveGeneration != 1 {
-		t.Fatalf("restart assignment flip = %+v", calls[3])
+	if calls[2].NeutralizeNew || calls[2].ActiveGeneration != 1 || len(calls[2].Generations) != 1 {
+		t.Fatalf("restart assignment flip = %+v", calls[2])
 	}
 	if flows2.neutralized != 1 {
 		t.Fatalf("pre-existing/half-open conntrack neutralization calls = %d", flows2.neutralized)
 	}
 	if got := c2.State().ActiveNew; got != 1 {
 		t.Fatalf("restored active generation = %d", got)
+	}
+}
+
+func writeActiveLifecycleState(t *testing.T, runtimeVersion string) (string, *fakeConnections) {
+	t.Helper()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, RuntimeVersion: runtimeVersion, Connections: flows}, nil)
+	ctx := context.Background()
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	return state, flows
+}
+
+func mutatePersistedGenerationMetadata(t *testing.T, state string, mutate func(map[string]any)) {
+	t.Helper()
+	b, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	generations := raw["generations"].([]any)
+	metadata := generations[0].(map[string]any)["artifact_metadata"].(map[string]any)
+	mutate(metadata)
+	b, err = json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = append(b, '\n')
+	if err := os.WriteFile(state, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestartRequiresExactPersistedArtifactCompatibility(t *testing.T) {
+	t.Run("compatible", func(t *testing.T) {
+		state, flows := writeActiveLifecycleState(t, "runtime-a")
+		c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, RuntimeVersion: "runtime-a", Connections: flows}, nil)
+		if err := c.Start(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if st := c.State(); st.Unsafe || st.ActiveNew != 1 {
+			t.Fatalf("compatible restart state = %+v", st)
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		runtime string
+		mutate  func(map[string]any)
+		want    string
+	}{
+		{name: "runtime", runtime: "runtime-b", mutate: func(map[string]any) {}, want: "runtime version"},
+		{name: "protocol", runtime: "runtime-a", mutate: func(m map[string]any) { m["adapter_protocol"] = float64(2) }, want: "adapter protocol"},
+		{name: "schema", runtime: "runtime-a", mutate: func(m map[string]any) { m["schema_version"] = float64(2) }, want: "schema"},
+		{name: "missing metadata", runtime: "runtime-a", mutate: func(m map[string]any) { clear(m) }, want: "metadata"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state, flows := writeActiveLifecycleState(t, "runtime-a")
+			mutatePersistedGenerationMetadata(t, state, tc.mutate)
+			c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, RuntimeVersion: tc.runtime, Connections: flows}, nil)
+			if err := c.Start(context.Background(), ""); err != nil {
+				t.Fatal(err)
+			}
+			st := c.State()
+			if !st.Unsafe || st.ActiveNew != 0 || !strings.Contains(st.IntegrityFailure, tc.want) {
+				t.Fatalf("incompatible restart state = %+v, want failure containing %q", st, tc.want)
+			}
+			quarantined, err := filepath.Glob(state + ".quarantine-*")
+			if err != nil || len(quarantined) != 1 {
+				t.Fatalf("quarantined state = %v, %v", quarantined, err)
+			}
+		})
+	}
+
+	t.Run("metadata-less v1", func(t *testing.T) {
+		state, flows := writeActiveLifecycleState(t, "runtime-a")
+		b, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var raw map[string]any
+		if err := json.Unmarshal(b, &raw); err != nil {
+			t.Fatal(err)
+		}
+		raw["version"] = float64(1)
+		for _, encoded := range raw["generations"].([]any) {
+			delete(encoded.(map[string]any), "artifact_metadata")
+		}
+		b, err = json.Marshal(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(state, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, RuntimeVersion: "runtime-a", Connections: flows}, nil)
+		if err := c.Start(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		}
+		if st := c.State(); !st.Unsafe || st.ActiveNew != 0 || !strings.Contains(st.IntegrityFailure, "state version 1") {
+			t.Fatalf("metadata-less v1 restart state = %+v", st)
+		}
+	})
+}
+
+func TestIncompatibleStateStillRestoresDurableOffloadOwnership(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	original := &netdev.Original{Interface: "eth-test", Features: []string{"tso"}}
+	c1 := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, RuntimeVersion: "runtime-a", Connections: flows, Iface: "eth-test",
+		CaptureOffloads: func(context.Context, string, string) (*netdev.Original, error) { return original, nil },
+		DisableOffloads: func(context.Context, string, *netdev.Original) error { return nil },
+		RestoreOffloads: func(context.Context, string, *netdev.Original) error { return nil },
+	}, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	restores := 0
+	c2 := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, RuntimeVersion: "runtime-b", Connections: flows, Iface: "eth-test",
+		RestoreOffloads: func(_ context.Context, _ string, got *netdev.Original) error {
+			restores++
+			if got.Interface != original.Interface || len(got.Features) != 1 || got.Features[0] != "tso" {
+				t.Fatalf("restored offload ownership = %+v", got)
+			}
+			return nil
+		},
+	}, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if restores != 1 || c2.State().OffloadsDisabled {
+		t.Fatalf("incompatible restart restores=%d state=%+v", restores, c2.State())
+	}
+}
+
+func TestRollbackAllocatesOnlyGenerationProvenFreeOfOrphanFlows(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	var calls []nftables.Config
+	reg := engine.NewRegistry()
+	c := New(reg, Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			calls = append(calls, cfg)
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.State(); !st.Unsafe || st.ActiveNew != 0 {
+		t.Fatalf("orphan startup state = %+v", st)
+	}
+	calls = nil
+	artifact := lifecycleArtifact(t, "orphan-recovery", genOneDNA)
+	if err := c.Rollback(ctx, artifact); err != nil {
+		t.Fatal(err)
+	}
+	st := c.State()
+	if st.Unsafe || st.ActiveNew != 2 || len(st.Generations) != 1 || st.Generations[0].ID != 2 {
+		t.Fatalf("rollback reused orphan generation: %+v", st)
+	}
+	for _, call := range calls {
+		for _, gen := range call.Generations {
+			if gen.ID == 1 {
+				t.Fatalf("orphan generation entered steering union: %+v", call)
+			}
+		}
+	}
+	raw := testutil.BuildTCP(t, 443, testutil.TCPFlags{SYN: true}, nil)
+	if _, err := reg.ProcessGeneration(1, raw, strategy.DirectionOutbound, nil); !errors.Is(err, engine.ErrGenerationNotFound) {
+		t.Fatalf("orphan generation was dispatchable: %v", err)
+	}
+}
+
+func TestRollbackGenerationProofFailureHasNoMutationAndCanRetry(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	programs := 0
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(context.Context, nftables.Config, bool) error { programs++; return nil },
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	programs = 0
+	flows.countsErr = errors.New("injected conntrack dump failure")
+	artifact := lifecycleArtifact(t, "retry-after-count", genOneDNA)
+	if err := c.Rollback(ctx, artifact); err == nil || !strings.Contains(err.Error(), "cannot prove") {
+		t.Fatalf("rollback count error = %v", err)
+	}
+	after, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) || programs != 0 || len(c.State().Generations) != 0 {
+		t.Fatalf("failed proof mutated state: programs=%d state=%+v", programs, c.State())
+	}
+	flows.countsErr = nil
+	if err := c.Rollback(ctx, artifact); err != nil {
+		t.Fatalf("retry after authoritative snapshot: %v", err)
+	}
+	if got := c.State().ActiveNew; got != 2 {
+		t.Fatalf("retry generation = %d, want 2", got)
+	}
+}
+
+func TestRollbackGenerationProofHandlesExhaustionAndLaterZero(t *testing.T) {
+	ctx := context.Background()
+	counts := make(map[uint32]int, generation.MaxID)
+	for id := uint32(1); id <= generation.MaxID; id++ {
+		counts[id] = 1
+	}
+	flows := &fakeConnections{counts: counts}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: filepath.Join(t.TempDir(), "adapter.json"), Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	artifact := lifecycleArtifact(t, "exhausted", genOneDNA)
+	if err := c.Rollback(ctx, artifact); err == nil || !strings.Contains(err.Error(), "no proven-zero") {
+		t.Fatalf("exhausted rollback error = %v", err)
+	}
+	flows.counts = map[uint32]int{1: 1}
+	if err := c.Rollback(ctx, artifact); err != nil {
+		t.Fatalf("rollback after authoritative zero snapshot: %v", err)
+	}
+	if got := c.State().ActiveNew; got != 2 {
+		t.Fatalf("post-zero generation = %d, want 2", got)
+	}
+}
+
+func TestCorruptStateIsQuarantinedAndOrphanIDsRemainReserved(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	if err := os.WriteFile(state, []byte("{not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.State(); !st.Unsafe || st.ActiveNew != 0 || !strings.Contains(st.IntegrityFailure, "quarantined") {
+		t.Fatalf("corrupt startup state = %+v", st)
+	}
+	quarantined, err := filepath.Glob(state + ".quarantine-*")
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("quarantined files = %v, %v", quarantined, err)
+	}
+	if err := c.Rollback(ctx, lifecycleArtifact(t, "corrupt-recovery", genOneDNA)); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.State().ActiveNew; got != 2 {
+		t.Fatalf("corrupt-state recovery reused orphan: generation=%d", got)
+	}
+}
+
+func TestRestartReenumeratesOrphanReservations(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	first := lifecycleArtifact(t, "first-recovery", genOneDNA)
+	c1 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Rollback(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Rollback(ctx, first); err != nil {
+		t.Fatalf("repair retained generation after orphan re-enumeration: %v", err)
+	}
+	next := lifecycleArtifact(t, "after-restart", genTwoDNA)
+	if err := c2.Prepare(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	c2.mu.Lock()
+	_, gen, err := c2.generationForIdentityLocked(next.Identity())
+	c2.mu.Unlock()
+	if err != nil || gen == nil || gen.ID != 3 {
+		t.Fatalf("post-restart generation = %+v, %v; want 3", gen, err)
 	}
 }
 

@@ -47,6 +47,9 @@ type Providers struct {
 	// InboundTCP returns the inbound TCP event counts (JSON-marshalable), the
 	// box-side censor-reachability signal. It may be nil.
 	InboundTCP func() any
+	// Health reports lifecycle integrity. A process remains reachable for local
+	// rollback remediation while readiness is unhealthy and steering is inactive.
+	Health func() error
 	// Apply installs a strategy end to end: it reprograms the kernel's steering
 	// for what the new strategy can match and then swaps the engine. PUT goes
 	// through it rather than straight to the engine, because a strategy change
@@ -102,6 +105,7 @@ func (s *Server) uptime() float64 { return time.Since(s.started).Seconds() }
 
 type healthResp struct {
 	Status   string          `json:"status"`
+	Error    string          `json:"error,omitempty"`
 	Mode     string          `json:"mode"`
 	Version  string          `json:"version"`
 	Commit   string          `json:"commit"`
@@ -120,6 +124,7 @@ type healthResp struct {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	statusCode := http.StatusOK
 	resp := healthResp{
 		Status:  "ok",
 		Mode:    s.p.Mode,
@@ -140,7 +145,14 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.p.Steering != nil {
 		resp.Steering = s.p.Steering()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	if s.p.Health != nil {
+		if err := s.p.Health(); err != nil {
+			resp.Status = "unhealthy"
+			resp.Error = err.Error()
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
+	writeJSON(w, statusCode, resp)
 }
 
 // handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).

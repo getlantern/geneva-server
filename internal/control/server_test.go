@@ -119,6 +119,30 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+func TestHealthzReportsLifecycleIntegrityFailureWhileControlRemainsReachable(t *testing.T) {
+	eng := engine.NewRegistry()
+	srv := httptest.NewServer(New(Providers{
+		Mode: "prod", Version: "test", Engine: eng,
+		Health: func() error { return errors.New("adapter state quarantined") },
+	}).Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusServiceUnavailable)
+	}
+	var body healthResp
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Status != "unhealthy" || !strings.Contains(body.Error, "quarantined") {
+		t.Fatalf("health body = %+v", body)
+	}
+}
+
 func TestStrategyReloadEval(t *testing.T) {
 	srv := newTestServer(t, "eval", "", false)
 	newDNA := `[TCP:flags:PA]-duplicate-| \/`

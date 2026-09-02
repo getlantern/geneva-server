@@ -242,5 +242,8 @@ func (o *runCmd) validate() error {
 	if !o.LegacyStrategyAPI && (o.Strategy != "" || o.StrategyFile != "") {
 		return errors.New("--strategy/--strategy-file require --legacy-strategy-api and cannot be combined with authoritative v1 lifecycle mode")
 	}
+	if o.Mode == "prod" && !o.LegacyStrategyAPI && strings.TrimSpace(o.AdapterStateFile) == "" {
+		return errors.New("authoritative prod mode requires --adapter-state-file for durable generation reconstruction and rollback continuity")
+	}
 	return nil
 }

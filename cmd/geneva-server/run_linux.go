@@ -261,8 +261,15 @@ func runServer(o *runCmd) error {
 		InboundTCP: func() any { return censorSrc.Snapshot() },
 		// A strategy change is not just an engine swap: it can put the box on
 		// or take it off the data path, so it has to go through the controller.
-		Apply:          ctrl.Apply,
-		Steering:       func() any { return ctrl.State() },
+		Apply:    ctrl.Apply,
+		Steering: func() any { return ctrl.State() },
+		Health: func() error {
+			state := ctrl.State()
+			if state.Unsafe {
+				return errors.New(state.IntegrityFailure)
+			}
+			return nil
+		},
 		Adapter:        ctrl,
 		LegacyStrategy: o.LegacyStrategyAPI,
 	})

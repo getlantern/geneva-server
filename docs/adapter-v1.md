@@ -74,7 +74,10 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
   mapping and permits its private generation ID to be reused.
 - `/v1/adapter/rollback` accepts the complete previous-known-good artifact. It
   can restage a retained drained artifact or recreate a GC'd artifact, is stable
-  on retry, and is the only activation allowed after an integrity latch.
+  on retry, and is the only activation allowed after an integrity latch. Before
+  allocating a private ID for an absent artifact it takes one bounded full
+  conntrack snapshot and selects only an ID authoritatively proven to have zero
+  flows. Snapshot failure rejects the rollback without preparing or steering.
 
 Every handler combines request cancellation with a 30-second timeout. Every
 conntrack dump has a shorter controller-owned hard deadline as well, including
@@ -90,13 +93,26 @@ No generation can be assigned before its engine and queue rules exist.
 First activation installs a temporary neutral new-SYN boundary and neutralizes
 all relevant unowned conntracks before the flip. Every restart which observes a
 durable active artifact repeats that neutral boundary and sweep before restoring
-assignment. This covers crashes immediately after intent persistence and keeps
+assignment. The restart has no intermediate unassigned transaction: the first
+transaction already contains the complete live union, and the next transaction
+changes it directly from neutral assignment to active assignment. This covers
+crashes immediately after intent persistence and keeps
 pre-existing established or half-open SYN-retransmit flows outside a newly
 widened scope. Existing Geneva-marked live flows retain their generation.
 
+State v2 durably stores the complete immutable artifact metadata, including the
+adapter protocol, schema, and exact required runtime name/version. Restart
+reconstructs each artifact and validates it against the installed descriptor
+before loading any engine or assignment. Metadata-less v1, incompatible, or
+corrupt state is durably renamed to a quarantine file; the adapter remains
+reachable for full-artifact rollback remediation but inactive, unsafe, and
+unhealthy. Live orphan generation IDs found by the startup conntrack snapshot
+remain reserved and unruled until a later authoritative zero count.
+
 State replacement requires temporary-file sync, atomic rename, and containing-
 directory sync. A file or directory sync failure is integrity-fatal and cannot
-authorize a kernel transition. Fatal integrity paths exit nonzero so the shipped
+authorize a kernel transition. Authoritative production rejects an empty
+`--adapter-state-file`. Fatal integrity paths exit nonzero so the shipped
 `Restart=on-failure` service restarts and reconciles; ordinary SIGTERM exits
 cleanly after rules are removed while NFQUEUE ownership is still held.
 
