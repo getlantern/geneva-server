@@ -1,70 +1,117 @@
 # Geneva loopback adapter protocol v1
 
-The adapter is a local HTTP implementation of the generic versioned lifecycle.
-It has no lantern-cloud or gRPC dependency and must remain bound to loopback or
-an equivalently protected management network.
+Geneva implements the generic overlay adapter v1 lifecycle over local HTTP. It
+has no lantern-cloud or gRPC dependency and must remain bound to loopback or an
+equivalently protected management network.
 
-`GET /v1/adapter/descriptor` returns numeric `protocol_version: 1`, numeric
-`supported_schema_versions: [1]`, the exact string `runtime_version`, and
-unsigned numeric artifact/generation caps. Geneva DNA uses schema version 1.
-Artifacts are limited to 256 KiB after JSON decoding; the bounded JSON envelope
-allows escaping overhead. The default retained-generation cap is 3 and the
-protocol cap is 32.
-
-Every deployment identity is immutable:
+`GET /v1/adapter/descriptor` returns the exact generic descriptor fields:
 
 ```json
 {
-  "generation": 7,
-  "identity": {
-    "technique": "geneva",
-    "revision": "overlay-revision-42",
-    "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  }
+  "adapter_protocol": 1,
+  "technique": "geneva",
+  "runtime_name": "geneva-engine",
+  "runtime_version": "<exact build version>",
+  "schema_versions": [1],
+  "max_live_generations": 3
 }
 ```
 
-`digest` is bare lowercase 64-character SHA-256 hex over the exact decoded
-artifact bytes. Lifecycle status, results, logs, and telemetry never contain raw
-DNA. Raw DNA remains only in the explicitly legacy `/strategy` and `/healthz`
-compatibility views and the mode-0600 reconstruction file.
+The cap is configurable from 1 through the generic maximum of 32 and defaults
+to 3. The independent every-packet cap defaults to 2 so active/previous-known-
+good plus a challenger can coexist; operators may lower or raise it explicitly
+within the total cap.
 
-Operations use `POST` unless noted:
+## Artifact wire shape
 
-- `/v1/adapter/verify`: `schema_version`, `deployment.identity`, and `artifact`.
-  It parses and validates without changing state.
-- `/v1/adapter/prepare`: `schema_version`, complete `deployment`, and `artifact`.
-  Repeating the same identity/artifact is idempotent; an ID cannot be rebound.
-- `/v1/adapter/activate-new`: complete target `deployment` and complete
-  `expected_active` (or `{}` when inactive). A stale precondition is a conflict
-  and makes no change. A successful retry is idempotent.
-- `/v1/adapter/deactivate-new`: complete `expected_active`. It never removes
-  draining scopes or resets connections. A delayed stale request cannot
-  deactivate a later deployment.
-- `GET /v1/adapter/status`: durable phase/digest/identity plus an authoritative,
-  controller-deadline-bounded conntrack count for each active/draining
-  generation. Routine `/healthz` does not dump conntrack.
-- `/v1/adapter/drain`: complete `deployment`. `DrainResult` contains one bounded
-  count, `drained`, and `checked_at`.
-- `/v1/adapter/gc`: `keep` is a set of complete deployments. Only non-active,
-  identity-matching, authoritative-zero-flow deployments outside that set are
-  removed. A retained drained previous-known-good remains reactivatable.
-- `/v1/adapter/rollback`: complete target `deployment` and complete
-  `expected_active`. It is retry-stable and is the only activation permitted
-  while an integrity fault is latched.
+Mutation requests use the generic immutable artifact directly. Numeric kernel
+generation IDs are never caller-supplied; Geneva allocates and durably retains a
+one-to-one mapping from artifact identity to conntrack generation.
 
-Each handler combines request cancellation with a 30-second server timeout.
-Every conntrack operation also has an independent controller deadline, including
-startup reconstruction. An integrity mismatch atomically latches unsafe state
-on the packet path, accepts the current packet immediately, and performs one
-bounded background deactivation. Until an identity-checked rollback succeeds,
-new mutations are rejected synchronously.
+```json
+{
+  "metadata": {
+    "technique": "geneva",
+    "revision": "overlay-revision-42",
+    "content_sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "size": 123,
+    "adapter_protocol": 1,
+    "required_runtime_name": "geneva-engine",
+    "required_runtime_version": "<exact build version>",
+    "schema_version": 1
+  },
+  "payload": "<base64 Geneva DNA>"
+}
+```
 
-Activation persists reconstructable engines first, verifies and installs the
-union steering transaction while the previous assignment remains active, and
-then performs a second atomic assignment transaction. First activation installs
-a temporary neutral-SYN boundary and neutralizes existing relevant conntracks;
-therefore a pre-existing or half-open flow cannot be captured by a widened
-scope. Every nft write is read back using a fingerprint of the complete desired
-table. An ambiguous command or failed compensation that cannot be confirmed
-latches unsafe state and removes new-SYN assignment rather than continuing.
+`content_sha256` and status identity `digest` are bare lowercase 64-character
+SHA-256 hex over the exact decoded payload. The decoded artifact may be at most
+256 KiB; the bounded HTTP envelope separately allows base64 and metadata
+overhead. Preparing the same identity and content reuses its durable mapping.
+The same identity with different content, or a second retained mapping for that
+identity, is rejected.
+
+## Operations
+
+All mutations are `POST`; `descriptor` and `status` are `GET`.
+
+- `/v1/adapter/prepare` accepts an artifact, validates resource budgets, creates
+  its immutable engine, and durably allocates a private generation.
+- `/v1/adapter/verify` accepts the same artifact and confirms its exact prepared
+  identity, content, runtime, schema, and digest.
+- `/v1/adapter/activate-for-new-connections` accepts an artifact and assigns
+  only future TCP SYNs after its union rules are installed and verified.
+- `/v1/adapter/deactivate-for-new-connections` accepts an `ArtifactIdentity`.
+  A delayed request for an identity which is no longer active is an idempotent
+  no-op; it cannot deactivate a later artifact.
+- `GET /v1/adapter/status` returns generic `active`, `prepared`, and `draining`
+  identity lists. Draining entries contain bounded authoritative conntrack
+  counts. Raw DNA and private numeric generations are absent.
+- `/v1/adapter/drain` accepts an identity and returns `complete` plus
+  `remaining_connections` from one controller-deadline-bounded count.
+- `/v1/adapter/garbage-collect` accepts `{"keep":[<identity>, ...]}`. Active,
+  draining, and explicitly kept artifacts survive. Only GC deletes an identity
+  mapping and permits its private generation ID to be reused.
+- `/v1/adapter/rollback` accepts the complete previous-known-good artifact. It
+  can restage a retained drained artifact or recreate a GC'd artifact, is stable
+  on retry, and is the only activation allowed after an integrity latch.
+
+Every handler combines request cancellation with a 30-second timeout. Every
+conntrack dump has a shorter controller-owned hard deadline as well, including
+startup reconstruction and internal callers.
+
+## Ordering and crash safety
+
+Activation first durably records reconstructable engine intent, then installs
+and verifies the complete union of live generation scopes while the prior SYN
+assignment remains unchanged, then atomically flips only the new-SYN assignment.
+No generation can be assigned before its engine and queue rules exist.
+
+First activation installs a temporary neutral new-SYN boundary and neutralizes
+all relevant unowned conntracks before the flip. Every restart which observes a
+durable active artifact repeats that neutral boundary and sweep before restoring
+assignment. This covers crashes immediately after intent persistence and keeps
+pre-existing established or half-open SYN-retransmit flows outside a newly
+widened scope. Existing Geneva-marked live flows retain their generation.
+
+State replacement requires temporary-file sync, atomic rename, and containing-
+directory sync. A file or directory sync failure is integrity-fatal and cannot
+authorize a kernel transition. Fatal integrity paths exit nonzero so the shipped
+`Restart=on-failure` service restarts and reconciles; ordinary SIGTERM exits
+cleanly after rules are removed while NFQUEUE ownership is still held.
+
+Ambiguous nft command results are read back against the complete desired table.
+If installation, deactivation, or compensation cannot be confirmed, Geneva
+latches unsafe, removes new-SYN assignment or the table, and terminates rather
+than continuing with uncertain steering. Integrity notification on the verdict
+path only atomically latches and schedules this bounded reconciliation; packet
+acceptance never waits for the lifecycle mutex or a conntrack dump.
+
+## Compatibility mode
+
+The unauthenticated raw-DNA `/strategy` surface is disabled by default. It is
+available only with `--legacy-strategy-api`, and that mode does not expose the
+v1 lifecycle routes. `--strategy` and `--strategy-file` require the legacy flag.
+Normal provisioned production starts inactive and is activated solely through
+v1 desired state. `--no-nft` is rejected because dynamic lifecycle success
+cannot be reported without a transactional programmer and readback interface.

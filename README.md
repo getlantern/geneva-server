@@ -71,8 +71,9 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
 The only difference is the canary (eval-only). Both modes support the versioned
 adapter lifecycle below. A strategy update is prepared as a new immutable
 generation and activated only for new TCP connections; existing connections
-remain on their original generation through rollback and drain. `PUT /strategy`
-is retained as a compatibility wrapper around prepare + activate-new.
+remain on their original generation through rollback and drain. The raw-DNA
+`PUT /strategy` surface is disabled unless `--legacy-strategy-api` is selected,
+which is mutually exclusive with authoritative v1 operation.
 
 ## Usage
 
@@ -87,7 +88,8 @@ sudo geneva-server run \
   --control-addr=127.0.0.1:8092
 ```
 
-Requires `CAP_NET_ADMIN` + `CAP_NET_RAW`, `nft`, and (for `--iface`) `ethtool`.
+Requires `CAP_NET_ADMIN` + `CAP_NET_RAW`, `nft`, and `ethtool`. Production
+requires `--iface` so controller-owned offload changes remain restorable.
 See [`deploy/`](deploy/) for the systemd unit and provisioning notes, and
 `--help` for the full flag set.
 
@@ -98,22 +100,22 @@ box. Everything else is exported as metrics (below).
 
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
-| `GET /strategy` | both      | current strategy DNA                                        |
-| `PUT /strategy` | both      | compatibility prepare + activate for new connections        |
+| `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
+| `GET /strategy` | legacy opt-in | current raw strategy DNA                                 |
+| `PUT /strategy` | legacy opt-in | compatibility prepare + activate for new connections     |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
 | `GET /v1/adapter/descriptor` | both | numeric protocol/schema versions and bounded capabilities |
 | `POST /v1/adapter/verify` | both | validate an artifact and immutable identity without mutation |
 | `POST /v1/adapter/prepare` | both | persist an identity-bound deployment (256 KiB decoded artifact limit) |
-| `POST /v1/adapter/activate-new` | both | identity-conditionally assign new SYNs after union staging |
-| `POST /v1/adapter/deactivate-new` | both | identity-conditionally stop new-SYN assignment |
-| `GET /v1/adapter/status` | both | active/previous generation, phases, scopes, integrity state |
-| `POST /v1/adapter/drain` | both | report conntrack count for an identity-bound deployment |
-| `POST /v1/adapter/gc` | both | keep-set GC of identity-bound zero-flow generations |
-| `POST /v1/adapter/rollback` | both | identity-conditionally reactivate a retained deployment |
+| `POST /v1/adapter/activate-for-new-connections` | both | assign future SYNs to a prepared artifact after union staging |
+| `POST /v1/adapter/deactivate-for-new-connections` | both | identity-fenced stop of new-SYN assignment |
+| `GET /v1/adapter/status` | both | generic active/prepared/draining identities and bounded drain counts |
+| `POST /v1/adapter/drain` | both | bounded conntrack count for an artifact identity |
+| `POST /v1/adapter/garbage-collect` | both | identity keep-set GC of zero-flow generations |
+| `POST /v1/adapter/rollback` | both | restage/reactivate a complete previous-known-good artifact |
 
-`PUT /strategy` is unauthenticated, so keep `--control-addr` on a private
-interface (see [`deploy/`](deploy/)).
+All control operations are unauthenticated, so keep `--control-addr` on a
+private interface (see [`deploy/`](deploy/)).
 
 The exact numeric v1 wire schema, identity preconditions, and retry semantics
 are in [`docs/adapter-v1.md`](docs/adapter-v1.md).
@@ -133,16 +135,18 @@ flag is accepted but ignored. A foreign connmark with nonzero
 reserved bits is never overwritten or steered. IDs are not reused while
 present; reuse is allowed only after authoritative zero-flow GC.
 
-`--no-nft` requires an explicit `--reinject-bypass-uid`. External rules must
-exclude that dedicated UID before queueing and leave packet marks unmodified;
-the proxy must use a different UID.
+`--no-nft` is rejected: without a transactional external programmer and exact
+readback interface, the dynamic lifecycle cannot truthfully report successful
+activation, deactivation, rollback, or cleanup.
 
 Activation uses two complete nft transactions. The first verifies and installs
 the union of old and candidate generation scopes while SYN assignment still
 names the old generation. The second changes only the new-SYN assignment. Thus
 no packet can be assigned before its immutable engine and rules are live. The
-state needed to reconstruct every live engine is atomically persisted at
-`--adapter-state-file` before either transaction. On restart, unknown orphaned
+state needed to reconstruct every live engine is atomically persisted and
+file/directory-synced at `--adapter-state-file` before either transaction. Every
+restart which sees active intent first reinstalls the neutral boundary and
+sweeps unowned conntracks before restoring assignment. Unknown orphaned
 namespace marks disable new assignment and fail open rather than being applied
 to the wrong DNA. First activation temporarily neutral-marks both existing
 relevant conntracks and SYNs arriving during the sweep before flipping
@@ -157,9 +161,9 @@ telemetry. The default
 live-generation budget is three (`--max-generations`); preparation refuses a
 fourth until one is drained and collected. The independently configurable
 `--max-scoped-generations` (default three) and
-`--max-every-packet-generations` (default one) admission budgets reflect their
-very different packet-processing costs; lifecycle status reports each
-generation's `resource_class`.
+`--max-every-packet-generations` (default two) admission budgets reflect their
+very different packet-processing costs; the operator-only steering snapshot in
+`/healthz` reports each private generation's `resource_class`.
 
 ## Metrics
 

@@ -10,6 +10,15 @@ cleanup() {
   "${COMPOSE[@]}" unpause sidecar >/dev/null 2>&1 || true
   "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 }
+failure_diagnostics() {
+  local rc=$?
+  echo "kernel-gate: FAILED line $1: $2 (exit $rc)" >&2
+  "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz >&2 || true
+  "${COMPOSE[@]}" exec -T probe nft list table inet geneva_server >&2 || true
+  "${COMPOSE[@]}" logs --tail=100 sidecar >&2 || true
+  return "$rc"
+}
+trap 'failure_diagnostics "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT
 
 api() {
@@ -22,29 +31,42 @@ status() {
   "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/v1/adapter/status
 }
 
-deployment() {
-  local generation=$1 revision=$2 digest=$3
-  jq -cn --argjson generation "$generation" --arg revision "$revision" --arg digest "$digest" \
-    '{generation:$generation,identity:{technique:"geneva",revision:$revision,digest:$digest}}'
+artifact() {
+  local revision=$1 dna=$2 digest size payload
+  digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
+  size=$(printf '%s' "$dna" | wc -c | tr -d ' ')
+  payload=$(printf '%s' "$dna" | base64 -w0)
+  jq -cn \
+    --arg revision "$revision" --arg digest "$digest" --argjson size "$size" \
+    --arg runtime "$runtime_version" --arg payload "$payload" \
+    '{metadata:{technique:"geneva",revision:$revision,content_sha256:$digest,size:$size,adapter_protocol:1,required_runtime_name:"geneva-engine",required_runtime_version:$runtime,schema_version:1},payload:$payload}'
+}
+
+identity() {
+  jq -c '{technique:.metadata.technique,revision:.metadata.revision,digest:.metadata.content_sha256}' <<<"$1"
 }
 
 prepare() {
-  local dep=$1 dna=$2
-  api /v1/adapter/prepare "$(jq -cn --argjson deployment "$dep" --arg artifact "$dna" \
-    '{schema_version:1,deployment:$deployment,artifact:$artifact}')" >/dev/null
+  api /v1/adapter/prepare "$1" >/dev/null
+  api /v1/adapter/verify "$1" >/dev/null
 }
 
 activate() {
-  local target=$1 expected=$2
-  api /v1/adapter/activate-new "$(jq -cn --argjson deployment "$target" --argjson expected_active "$expected" \
-    '{deployment:$deployment,expected_active:$expected_active}')" >/dev/null
+  api /v1/adapter/activate-for-new-connections "$1" >/dev/null
+}
+
+generation_count() {
+  local generation=$1 mark decimal
+  mark=$((0x67000000 + (generation << 12)))
+  printf -v decimal '%u' "$mark"
+  "${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | \
+    grep -Ec "mark=(${decimal}|0x$(printf '%08x' "$mark"))" || true
 }
 
 wait_count() {
-  local generation=$1 comparison=$2 deadline=$((SECONDS + 15)) value
+  local generation=$1 comparison=$2 deadline=$((SECONDS + 15)) value=0
   while (( SECONDS < deadline )); do
-    value=$(status | jq --argjson generation "$generation" \
-      '[.generations[] | select(.generation == $generation) | .connections][0] // 0')
+    value=$(generation_count "$generation")
     if [[ "$comparison" == positive && "$value" -gt 0 ]] || [[ "$comparison" == zero && "$value" -eq 0 ]]; then
       printf '%s' "$value"
       return 0
@@ -55,27 +77,25 @@ wait_count() {
   return 1
 }
 
-echo 'kernel-gate: build and start inactive sidecar in the proxy network namespace'
+echo 'kernel-gate: clean prior state, build, and start inactive'
+"${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
 "${COMPOSE[@]}" up -d --build server sidecar
 "${COMPOSE[@]}" --profile tools up -d --build tester probe
 for _ in $(seq 1 60); do
-  if "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/v1/adapter/descriptor >/dev/null 2>&1; then
+  if descriptor=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/v1/adapter/descriptor 2>/dev/null); then
     break
   fi
   sleep 0.5
 done
-[[ "$(status | jq '.active_new_generation // 0')" -eq 0 ]]
+runtime_version=$(jq -r .runtime_version <<<"$descriptor")
+[[ -n "$runtime_version" ]]
+[[ "$(status | jq '.active == null')" == true ]]
 
-echo 'kernel-gate: open a flow before first activation'
+echo 'kernel-gate: open established and half-open flows before activation'
 "${COMPOSE[@]}" exec -d tester sh -c \
-  'echo $$ >/tmp/preactivation.pid; exec curl -fsS --no-buffer "http://server:8080/hold?duration=55s" >/tmp/preactivation.out'
+  'echo $$ >/tmp/preactivation.pid; exec curl --local-port 39000 -fsS --no-buffer "http://server:8080/hold?duration=55s" >/tmp/preactivation.out'
 sleep 1
 
-# Hold a second connection half-open across activation. The client keeps
-# retransmitting its original SYN while the server namespace temporarily drops
-# SYN-ACKs. Once the drop is removed, that retransmission must retain the
-# neutral connmark installed at the activation boundary rather than acquire the
-# newly active generation.
 tester_ip=$("${COMPOSE[@]}" exec -T probe getent ahostsv4 tester | awk 'NR==1 {print $1}')
 "${COMPOSE[@]}" exec -T probe sh -c "nft add table inet geneva_halfopen; nft 'add chain inet geneva_halfopen output { type filter hook output priority -200; policy accept; }'; nft add rule inet geneva_halfopen output ip daddr $tester_ip tcp sport 8080 tcp dport 39001 tcp flags \& '(syn|ack)' == '(syn|ack)' drop"
 "${COMPOSE[@]}" exec -d tester sh -c \
@@ -83,15 +103,38 @@ tester_ip=$("${COMPOSE[@]}" exec -T probe getent ahostsv4 tester | awk 'NR==1 {p
 sleep 1
 "${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | grep -q 'sport=39001'
 
-dna1='[TCP:flags:A*]-send-| \/'
-dna2='[TCP:flags:A*]-duplicate-| \/'
-digest1=$(printf '%s' "$dna1" | sha256sum | awk '{print $1}')
-digest2=$(printf '%s' "$dna2" | sha256sum | awk '{print $1}')
-one=$(deployment 1 kernel-r1 "$digest1")
-two=$(deployment 2 kernel-r2 "$digest2")
+# Generation 1 has an unexpressible payload scope, so it queues every inbound
+# packet, plus an unchanged outbound ACK path. That widens across the pre-existing
+# flow, proves inbound modification, and exercises unchanged outbound verdicts.
+dna1='[TCP:flags:A*]-send-| \/ [TCP:flags:S]-tamper{IP:ttl:replace:62}-|[TCP:load:GENEVA_NEVER]-send-|'
+dna2='[TCP:flags:A*]-duplicate-| \/ [TCP:flags:S]-tamper{IP:ttl:replace:62}-|[TCP:load:GENEVA_NEVER]-send-|'
+one=$(artifact kernel-r1 "$dna1")
+two=$(artifact kernel-r2 "$dna2")
+identity_one=$(identity "$one")
+identity_two=$(identity "$two")
 
-prepare "$one" "$dna1"
-activate "$one" '{}'
+prepare "$one"
+# Simulate the exact crash point after durable active intent but before its
+# neutral boundary. The stopped container's private state is edited to the
+# post-persist phase; restart must neutralize the already-existing conntracks
+# before it restores generation-1 assignment.
+sidecar_id=$("${COMPOSE[@]}" ps -q sidecar)
+crash_state=$(mktemp)
+docker cp "$sidecar_id:/tmp/kernel-adapter-state.json" "$crash_state"
+jq '.active_new_generation=1 | .generations[0].phase="active"' "$crash_state" >"${crash_state}.new"
+mv "${crash_state}.new" "$crash_state"
+docker cp "$crash_state" "$sidecar_id:/tmp/kernel-adapter-state.json"
+"${COMPOSE[@]}" exec -T sidecar chown 65534:65534 /tmp/kernel-adapter-state.json
+"${COMPOSE[@]}" exec -T sidecar chmod 0600 /tmp/kernel-adapter-state.json
+docker kill --signal KILL "$sidecar_id" >/dev/null
+"${COMPOSE[@]}" start sidecar >/dev/null
+for _ in $(seq 1 60); do
+  if "${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/v1/adapter/status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
+[[ "$(status | jq --argjson want "$identity_one" '.active == $want')" == true ]]
 "${COMPOSE[@]}" exec -T probe nft delete table inet geneva_halfopen
 for _ in $(seq 1 50); do
   if "${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | \
@@ -102,28 +145,30 @@ for _ in $(seq 1 50); do
 done
 "${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | \
   grep 'sport=39001' | grep -Eq 'mark=(1728053248|0x67000000)'
+"${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null | \
+  grep 'sport=39000' | grep -Eq 'mark=(1728053248|0x67000000)'
 "${COMPOSE[@]}" exec -T tester sh -c 'kill -0 "$(cat /tmp/halfopen.pid)"'
 
-# The preactivation connection must have been neutralized, not captured by the
-# widened every-packet scope. No generation-1 connection exists yet.
-[[ "$(wait_count 1 zero)" -eq 0 ]]
 flows=$("${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null || true)
 printf '%s\n' "$flows"
-if printf '%s\n' "$flows" | grep -Eq 'mark=(1728057344|0x67001000)'; then
-  echo 'preactivation flow was captured by generation 1' >&2
-  exit 1
-fi
 "${COMPOSE[@]}" exec -T tester sh -c 'kill -0 "$(cat /tmp/preactivation.pid)"'
 
-echo 'kernel-gate: hold a generation-1 flow and inspect conntrack affinity'
+echo 'kernel-gate: execute a real inbound strategy and hold generation 1'
+tampered_before=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.tampered')
 "${COMPOSE[@]}" exec -d tester sh -c \
-  'echo $$ >/tmp/generation1.pid; exec curl -fsS --no-buffer "http://server:8080/hold?duration=50s" >/tmp/generation1.out'
+  'echo $$ >/tmp/generation1.pid; exec curl --local-port 39002 -fsS --no-buffer "http://server:8080/hold?duration=50s" >/tmp/generation1.out'
 [[ "$(wait_count 1 positive)" -gt 0 ]]
+for _ in $(seq 1 30); do
+  tampered_after=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.tampered')
+  [[ "$tampered_after" -gt "$tampered_before" ]] && break
+  sleep 0.2
+done
+[[ "$tampered_after" -gt "$tampered_before" ]]
+"${COMPOSE[@]}" exec -T probe nft list table inet geneva_server | grep -qE 'tcp dport 8080 .*queue .*101'
 flows=$("${COMPOSE[@]}" exec -T probe conntrack -L -p tcp --dport 8080 -o extended 2>/dev/null || true)
-printf '%s\n' "$flows"
-printf '%s\n' "$flows" | grep -Eq 'mark=(1728057344|0x67001000)' # generation 1, original+reply tuple
+printf '%s\n' "$flows" | grep 'sport=39002' | grep -Eq 'mark=(1728057344|0x67001000)'
 
-echo 'kernel-gate: install exact-fwmark policy routes and a later-hook observer'
+echo 'kernel-gate: install exact-fwmark policy routes and later-hook observer'
 gateway=$("${COMPOSE[@]}" exec -T probe sh -c "ip route show default | awk 'NR==1 {print \$3}'")
 "${COMPOSE[@]}" exec -T probe ip route add table 100 default via "$gateway" dev eth0
 "${COMPOSE[@]}" exec -T probe ip route add table 101 default via "$gateway" dev eth0
@@ -133,22 +178,19 @@ gateway=$("${COMPOSE[@]}" exec -T probe sh -c "ip route show default | awk 'NR==
 "${COMPOSE[@]}" exec -T probe ip route get "$tester_ip" mark 0x438 | grep -q 'table 100'
 "${COMPOSE[@]}" exec -T probe ip route get "$tester_ip" mark 0x440 | grep -q 'table 101'
 
-# Generation 1 is unchanged. Exact 0x438 must survive queue dispatch/verdict
-# without mutation so the later exact-mask rule observes it.
 "${COMPOSE[@]}" exec -T tester curl -fsS 'http://server:8080/?mark=0x438' >/dev/null
 "${COMPOSE[@]}" exec -T probe nft list chain inet geneva_mark_probe observe | \
   grep 'meta mark 0x00000438' | grep -Eq 'packets [1-9]'
 
 echo 'kernel-gate: activate generation 2 while generation 1 remains open'
-prepare "$two" "$dna2"
-activate "$two" "$one"
+prepare "$two"
+activate "$two"
+[[ "$(status | jq --argjson want "$identity_two" '.active == $want')" == true ]]
 "${COMPOSE[@]}" exec -d tester sh -c \
-  'echo $$ >/tmp/generation2.pid; exec curl -fsS --no-buffer "http://server:8080/hold?duration=45s" >/tmp/generation2.out'
+  'echo $$ >/tmp/generation2.pid; exec curl --local-port 39003 -fsS --no-buffer "http://server:8080/hold?duration=45s" >/tmp/generation2.out'
 [[ "$(wait_count 1 positive)" -gt 0 ]]
 [[ "$(wait_count 2 positive)" -gt 0 ]]
 
-# Generation 2 duplicates. The queued replacement and raw extra must preserve
-# exact 0x440; reinjection must happen without re-entering the queue forever.
 before=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq '.engine.packets_in')
 "${COMPOSE[@]}" exec -T tester curl -fsS 'http://server:8080/?mark=0x440' >/dev/null
 health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
@@ -158,34 +200,41 @@ after=$(printf '%s' "$health" | jq '.engine.packets_in')
 "${COMPOSE[@]}" exec -T probe nft list chain inet geneva_mark_probe observe | \
   grep 'meta mark 0x00000440' | grep -Eq 'packets [1-9]'
 
-echo 'kernel-gate: rollback without resetting either retained flow, then drain/GC generation 2'
-api /v1/adapter/rollback "$(jq -cn --argjson deployment "$one" --argjson expected_active "$two" \
-  '{deployment:$deployment,expected_active:$expected_active}')" >/dev/null
+echo 'kernel-gate: rollback keeps both flows, then bounded drain and keep-set GC'
+api /v1/adapter/rollback "$one" >/dev/null
+[[ "$(status | jq --argjson want "$identity_one" '.active == $want')" == true ]]
 [[ "$(wait_count 1 positive)" -gt 0 ]]
 [[ "$(wait_count 2 positive)" -gt 0 ]]
-drain=$(api /v1/adapter/drain "$(jq -cn --argjson deployment "$two" '{deployment:$deployment}')")
-[[ "$(printf '%s' "$drain" | jq '.connections')" -gt 0 ]]
+drain=$(api /v1/adapter/drain "$identity_two")
+[[ "$(printf '%s' "$drain" | jq '.remaining_connections')" -gt 0 ]]
 "${COMPOSE[@]}" exec -T tester sh -c 'kill "$(cat /tmp/generation2.pid)"; wait "$(cat /tmp/generation2.pid)" 2>/dev/null || true'
+"${COMPOSE[@]}" exec -T probe conntrack -D --mark 0x67002000/0xfffff000 >/dev/null
 [[ "$(wait_count 2 zero)" -eq 0 ]]
-gc=$(api /v1/adapter/gc "$(jq -cn --argjson one "$one" '{keep:[$one]}')")
-[[ "$(printf '%s' "$gc" | jq '[.removed[].generation] | index(2)')" != null ]]
+drain=$(api /v1/adapter/drain "$identity_two")
+[[ "$(printf '%s' "$drain" | jq '.complete')" == true ]]
+api /v1/adapter/garbage-collect "$(jq -cn --argjson one "$identity_one" '{keep:[$one]}')" >/dev/null
+[[ "$(status | jq --argjson gone "$identity_two" '[.prepared[] | select(. == $gone)] | length')" -eq 0 ]]
 [[ "$(wait_count 1 positive)" -gt 0 ]]
 
-echo 'kernel-gate: a second listener cannot own the live queues'
-if "${COMPOSE[@]}" run --rm --no-deps sidecar >/tmp/geneva-queue-collision.log 2>&1; then
+echo 'kernel-gate: a verified second process cannot acquire live queues'
+collision_log=$(mktemp)
+if "${COMPOSE[@]}" exec -T sidecar /usr/local/bin/geneva-server run \
+    --mode=prod --port=8080 --iface=eth0 --control-addr=127.0.0.1:8093 \
+    --adapter-state-file=/tmp/collision-state.json --reinject-bypass-uid=65534 \
+    >"$collision_log" 2>&1; then
   echo 'second sidecar unexpectedly acquired NFQUEUE ownership' >&2
   exit 1
 fi
-"${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz >/dev/null
+grep -q 'engine registry ready' "$collision_log"
+grep -Eq 'open (out|in)-queue (100|101): .*bind queue' "$collision_log"
+"${COMPOSE[@]}" exec -T tester curl -fsS http://server:8080/healthz >/dev/null
 
 echo 'kernel-gate: bound queue overload is fail-open at max length 1'
 "${COMPOSE[@]}" pause sidecar >/dev/null
 successes=$("${COMPOSE[@]}" exec -T tester sh -c '
-  n=0
-  pids=""
+  n=0; pids=""
   for i in 1 2 3 4 5 6 7 8; do
-    (curl -fsS --max-time 5 http://server:8080/healthz >/dev/null) &
-    pids="$pids $!"
+    (curl -fsS --max-time 5 http://server:8080/healthz >/dev/null) & pids="$pids $!"
   done
   for p in $pids; do if wait "$p"; then n=$((n+1)); fi; done
   echo "$n"')

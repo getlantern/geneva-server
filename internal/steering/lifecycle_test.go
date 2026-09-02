@@ -28,6 +28,20 @@ const (
 	everyPacketDNA = `[TCP:load:GET]-duplicate-| \/`
 )
 
+func lifecycleArtifact(t *testing.T, revision, dna string) adapter.Artifact {
+	t.Helper()
+	payload := []byte(dna)
+	a, err := adapter.NewArtifact(adapter.ArtifactMetadata{
+		Technique: adapter.TechniqueGeneva, Revision: revision, Digest: adapter.Digest(payload), Size: len(payload),
+		AdapterProtocol: adapter.Version1, RequiredRuntimeName: adapter.RuntimeNameGeneva,
+		RequiredRuntimeVersion: "dev", SchemaVersion: adapter.SchemaVersionV1,
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
 type fakeConnections struct {
 	counts      map[uint32]int
 	namespace   int
@@ -121,13 +135,13 @@ func TestActivationStagesUnionBeforeFlippingNewSYNs(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateNew(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 2, genTwoDNA); err != nil {
 		t.Fatal(err)
 	}
 	calls, verifies = nil, nil
@@ -168,7 +182,7 @@ func TestFirstActivationNeutralizesExactBoundaryBeforeAssignment(t *testing.T) {
 	if err := c.Start(context.Background(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(context.Background(), 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	calls = nil
@@ -191,7 +205,7 @@ func TestDrainScopesCountAndGuardsReuse(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 7, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 7, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateNew(ctx, 7); err != nil {
@@ -201,31 +215,31 @@ func TestDrainScopesCountAndGuardsReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	flows.counts[7] = 2
-	n, err := c.Drain(ctx, 7)
+	n, err := c.DrainGeneration(ctx, 7)
 	if err != nil || n != 2 {
 		t.Fatalf("Drain = %d, %v", n, err)
 	}
 	if flows.gotID != 7 || flows.gotPort != 8443 {
 		t.Fatalf("count scope = generation %d port %d", flows.gotID, flows.gotPort)
 	}
-	if err := c.GarbageCollect(ctx, 7); err == nil {
+	if err := c.GarbageCollectGeneration(ctx, 7); err == nil {
 		t.Fatal("collected generation with live flows")
 	}
 	flows.counts[7] = 0
-	if err := c.GarbageCollect(ctx, 7); err != nil {
+	if err := c.GarbageCollectGeneration(ctx, 7); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 7, genTwoDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 7, genTwoDNA); err != nil {
 		t.Fatalf("safe ID reuse after zero-flow GC: %v", err)
 	}
 }
 
 func TestGenerationIDBoundsPreventWraparound(t *testing.T) {
 	c := New(engine.NewRegistry(), Config{}, nil)
-	if err := c.Prepare(context.Background(), generation.MaxID, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(context.Background(), generation.MaxID, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(context.Background(), generation.MaxID+1, genOneDNA); !errors.Is(err, engine.ErrInvalidStrategy) {
+	if err := c.PrepareGeneration(context.Background(), generation.MaxID+1, genOneDNA); !errors.Is(err, engine.ErrInvalidStrategy) {
 		t.Fatalf("overflow error = %v", err)
 	}
 }
@@ -233,11 +247,11 @@ func TestGenerationIDBoundsPreventWraparound(t *testing.T) {
 func TestPrepareEnforcesDefaultLiveGenerationBudget(t *testing.T) {
 	c := New(engine.NewRegistry(), Config{}, nil)
 	for id := uint32(1); id <= 3; id++ {
-		if err := c.Prepare(context.Background(), id, genOneDNA); err != nil {
+		if err := c.PrepareGeneration(context.Background(), id, genOneDNA); err != nil {
 			t.Fatalf("prepare %d: %v", id, err)
 		}
 	}
-	if err := c.Prepare(context.Background(), 4, genOneDNA); err == nil || !strings.Contains(err.Error(), "budget is full") {
+	if err := c.PrepareGeneration(context.Background(), 4, genOneDNA); err == nil || !strings.Contains(err.Error(), "budget is full") {
 		t.Fatalf("fourth prepare error = %v", err)
 	}
 }
@@ -248,21 +262,176 @@ func TestPrepareEnforcesSeparateResourceBudgets(t *testing.T) {
 		MaxScopedGenerations:      1,
 		MaxEveryPacketGenerations: 1,
 	}, nil)
-	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(context.Background(), 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(context.Background(), 2, genTwoDNA); err == nil || !strings.Contains(err.Error(), "handshake-scoped") {
+	if err := c.PrepareGeneration(context.Background(), 2, genTwoDNA); err == nil || !strings.Contains(err.Error(), "handshake-scoped") {
 		t.Fatalf("second scoped prepare error = %v", err)
 	}
-	if err := c.Prepare(context.Background(), 2, everyPacketDNA); err != nil {
+	if err := c.PrepareGeneration(context.Background(), 2, everyPacketDNA); err != nil {
 		t.Fatalf("first every-packet prepare: %v", err)
 	}
-	if err := c.Prepare(context.Background(), 3, everyPacketDNA); err == nil || !strings.Contains(err.Error(), "every-packet") {
+	if err := c.PrepareGeneration(context.Background(), 3, everyPacketDNA); err == nil || !strings.Contains(err.Error(), "every-packet") {
 		t.Fatalf("second every-packet prepare error = %v", err)
 	}
 	st := c.State()
 	if len(st.Generations) != 2 || st.Generations[0].ResourceClass != resourceHandshake || st.Generations[1].ResourceClass != resourceEvery {
 		t.Fatalf("resource classes = %+v", st.Generations)
+	}
+}
+
+func TestDefaultEveryPacketBudgetAllowsPBGAndChallenger(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{}, nil)
+	if err := c.PrepareGeneration(context.Background(), 1, everyPacketDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareGeneration(context.Background(), 2, everyPacketDNA); err != nil {
+		t.Fatalf("default every-packet budget did not permit PBG plus challenger: %v", err)
+	}
+	if err := c.PrepareGeneration(context.Background(), 3, everyPacketDNA); err == nil || !strings.Contains(err.Error(), "every-packet") {
+		t.Fatalf("third every-packet generation error = %v", err)
+	}
+}
+
+func TestIdentityMappingIsDurableIdempotentAndReusableOnlyAfterGC(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	one := lifecycleArtifact(t, "r1", genOneDNA)
+	c1 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, one); err != nil {
+		t.Fatalf("idempotent prepare: %v", err)
+	}
+	first := c1.State()
+	if len(first.Generations) != 1 || first.Generations[0].ID != 1 {
+		t.Fatalf("first identity mapping = %+v", first.Generations)
+	}
+	duplicate := adapter.Deployment{Generation: 2, Identity: one.Identity()}
+	if err := c1.PrepareDeployment(ctx, duplicate, genOneDNA); err == nil || !strings.Contains(err.Error(), "already mapped") {
+		t.Fatalf("duplicate identity mapping error = %v", err)
+	}
+
+	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Prepare(ctx, one); err != nil {
+		t.Fatalf("restart idempotent prepare: %v", err)
+	}
+	if got := c2.State().Generations; len(got) != 1 || got[0].ID != 1 {
+		t.Fatalf("restart identity mapping = %+v", got)
+	}
+	if err := c2.GarbageCollect(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	two := lifecycleArtifact(t, "r2", genTwoDNA)
+	if err := c2.Prepare(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.State().Generations; len(got) != 1 || got[0].ID != 1 || got[0].Identity != two.Identity() {
+		t.Fatalf("post-GC private ID reuse = %+v", got)
+	}
+}
+
+func TestGenericV1LifecycleIsIdentityFencedAndRetryStable(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	one := lifecycleArtifact(t, "r1", genOneDNA)
+	two := lifecycleArtifact(t, "r2", genTwoDNA)
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Verify(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeactivateForNewConnections(ctx, one.Identity()); err != nil {
+		t.Fatalf("stale deactivation was not an idempotent no-op: %v", err)
+	}
+	if st, err := c.Status(ctx); err != nil || st.Active == nil || *st.Active != two.Identity() {
+		t.Fatalf("status after stale deactivation = %+v, %v", st, err)
+	}
+	flows.counts[1] = 4
+	if st, err := c.Status(ctx); err != nil || len(st.Draining) != 1 || st.Draining[0].Identity != one.Identity() || st.Draining[0].RemainingConnections != 4 {
+		t.Fatalf("authoritative generic drain status = %+v, %v", st, err)
+	}
+	if err := c.Rollback(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rollback(ctx, one); err != nil {
+		t.Fatalf("rollback retry: %v", err)
+	}
+	if err := c.DeactivateForNewConnections(ctx, two.Identity()); err != nil {
+		t.Fatalf("delayed deactivate of challenger: %v", err)
+	}
+	flows.counts[2] = 0
+	result, err := c.Drain(ctx, two.Identity())
+	if err != nil || !result.Complete {
+		t.Fatalf("drain result = %+v, %v", result, err)
+	}
+	if err := c.GarbageCollect(ctx, []adapter.ArtifactIdentity{one.Identity()}); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.Prepared) != 1 || st.Prepared[0] != one.Identity() || st.Active == nil || *st.Active != one.Identity() {
+		t.Fatalf("post-GC generic status = %+v", st)
+	}
+}
+
+func TestGenericRollbackCanRestageGCdArtifactUnderIntegrityLatch(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	one := lifecycleArtifact(t, "known-good", genOneDNA)
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeactivateForNewConnections(ctx, one.Identity()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Drain(ctx, one.Identity()); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GarbageCollect(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	c.unsafe, c.failure = true, "injected integrity fault"
+	c.faultLatched.Store(true)
+	c.mu.Unlock()
+	if err := c.Rollback(ctx, one); err != nil {
+		t.Fatalf("restage GC'd known-good rollback: %v", err)
+	}
+	st, err := c.Status(ctx)
+	if err != nil || st.Active == nil || *st.Active != one.Identity() || c.State().Unsafe {
+		t.Fatalf("rollback recovery state = %+v internal=%+v, %v", st, c.State(), err)
 	}
 }
 
@@ -273,18 +442,17 @@ func TestStatusReportsAuthoritativeCountsAndHonorsContext(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateNew(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 	flows.counts[1] = 7
-	value, err := c.Status(ctx)
+	st, err := c.DetailedStatus(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st := value.(State)
 	if len(st.Generations) != 1 || st.Generations[0].Connections != 7 {
 		t.Fatalf("status = %+v", st)
 	}
@@ -292,7 +460,7 @@ func TestStatusReportsAuthoritativeCountsAndHonorsContext(t *testing.T) {
 	c.cfg.Connections = blockingConnections{}
 	deadline, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
 	defer cancel()
-	if _, err := c.Status(deadline); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := c.DetailedStatus(deadline); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("bounded status error = %v", err)
 	}
 }
@@ -311,7 +479,7 @@ func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if syncs < 2 {
@@ -332,7 +500,7 @@ func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
 
 func TestCanonicalDigestIsBareLowerHex(t *testing.T) {
 	c := New(engine.NewRegistry(), Config{}, nil)
-	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(context.Background(), 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	d := c.State().Generations[0].Digest
@@ -349,13 +517,13 @@ func TestRestartReconstructsEveryLiveEngineBeforeSteering(t *testing.T) {
 	if err := c1.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c1.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.ActivateNew(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.Prepare(ctx, 2, genTwoDNA); err != nil {
+	if err := c1.PrepareGeneration(ctx, 2, genTwoDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.ActivateNew(ctx, 2); err != nil {
@@ -457,31 +625,158 @@ func TestRetainedDrainedPreviousKnownGoodCanReactivate(t *testing.T) {
 	if err := c.ActivateDeployment(ctx, two, one); err != nil {
 		t.Fatal(err)
 	}
-	if result, err := c.DrainDeployment(ctx, one); err != nil || !result.Drained {
-		t.Fatalf("drain = %+v, %v", result, err)
+	if remaining, err := c.DrainDeployment(ctx, one); err != nil || remaining != 0 {
+		t.Fatalf("drain remaining = %d, %v", remaining, err)
 	}
 	if err := c.RollbackDeployment(ctx, one, two); err != nil {
 		t.Fatalf("reactivate retained drained PBG: %v", err)
 	}
 }
 
-func TestDirectorySyncFailureReconcilesCommittedTransition(t *testing.T) {
+func TestDirectorySyncFailureIsFatalAndDoesNotProgramKernel(t *testing.T) {
 	ctx := context.Background()
 	state := filepath.Join(t.TempDir(), "adapter.json")
 	syncErr := errors.New("injected directory sync failure")
-	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, SyncDirectory: func(string) error { return syncErr }}, nil)
+	failSync := false
+	programCalls := 0
+	fatal := make(chan error, 1)
+	c := New(engine.NewRegistry(), Config{
+		StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}},
+		SyncDirectory: func(string) error {
+			if failSync {
+				return syncErr
+			}
+			return nil
+		},
+		Program: func(context.Context, nftables.Config, bool) error { programCalls++; return nil },
+		Fatal:   func(err error) { fatal <- err },
+	}, nil)
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
-		t.Fatalf("rename-committed prepare reported inverse-safe failure: %v", err)
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
 	}
-	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state}, nil)
+	before := programCalls
+	failSync = true
+	if err := c.ActivateNew(ctx, 1); err == nil || !strings.Contains(err.Error(), syncErr.Error()) {
+		t.Fatalf("activation durability error = %v", err)
+	}
+	if programCalls != before {
+		t.Fatalf("kernel programmed after uncertain directory durability: before=%d after=%d", before, programCalls)
+	}
+	select {
+	case err := <-fatal:
+		if !strings.Contains(err.Error(), "durability") {
+			t.Fatalf("fatal error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("directory-sync failure did not request process restart")
+	}
+	if st := c.State(); !st.Unsafe {
+		t.Fatalf("directory-sync failure did not latch unsafe: %+v", st)
+	}
+}
+
+func TestFileSyncFailureDoesNotRenameOrProgramKernel(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	failSync := false
+	programCalls := 0
+	fatal := make(chan error, 1)
+	c := New(engine.NewRegistry(), Config{
+		StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}},
+		SyncFile: func(file *os.File) error {
+			if failSync {
+				return errors.New("injected file sync failure")
+			}
+			return file.Sync()
+		},
+		Program: func(context.Context, nftables.Config, bool) error { programCalls++; return nil },
+		Fatal:   func(err error) { fatal <- err },
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforePrograms := programCalls
+	failSync = true
+	if err := c.ActivateNew(ctx, 1); err == nil || !strings.Contains(err.Error(), "file sync") {
+		t.Fatalf("activation file-sync error = %v", err)
+	}
+	afterState, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterState) != string(beforeState) {
+		t.Fatal("file-sync failure replaced durable state")
+	}
+	if programCalls != beforePrograms {
+		t.Fatal("file-sync failure allowed kernel mutation")
+	}
+	select {
+	case <-fatal:
+	case <-time.After(time.Second):
+		t.Fatal("file-sync failure did not request process restart")
+	}
+}
+
+func TestRestartRestagesDurableActiveThroughNeutralBoundary(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows1 := &fakeConnections{counts: map[uint32]int{}}
+	c1 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows1}, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// A durable active record is indistinguishable from a crash immediately
+	// after intent persistence, including one with a preactivation half-open SYN.
+	// Restart must never install active assignment directly from that record.
+	flows2 := &fakeConnections{counts: map[uint32]int{1: 2}}
+	var calls []nftables.Config
+	c2 := New(engine.NewRegistry(), Config{
+		StateFile: state, Connections: flows2,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			calls = append(calls, cfg)
+			return nil
+		},
+	}, nil)
 	if err := c2.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if len(c2.State().Generations) != 1 {
-		t.Fatalf("committed transition not reconstructed: %+v", c2.State())
+	if len(calls) != 4 {
+		t.Fatalf("restart program calls = %d, want stale removal + neutral + stage + flip: %+v", len(calls), calls)
+	}
+	if calls[0].ActiveGeneration != 0 || len(calls[0].Generations) != 0 {
+		t.Fatalf("restart did not first remove stale assignment: %+v", calls[0])
+	}
+	if !calls[1].NeutralizeNew || calls[1].ActiveGeneration != 0 || len(calls[1].Generations) != 1 {
+		t.Fatalf("restart neutral boundary = %+v", calls[1])
+	}
+	if calls[2].NeutralizeNew || calls[2].ActiveGeneration != 0 || len(calls[2].Generations) != 1 {
+		t.Fatalf("restart staged union = %+v", calls[2])
+	}
+	if calls[3].NeutralizeNew || calls[3].ActiveGeneration != 1 {
+		t.Fatalf("restart assignment flip = %+v", calls[3])
+	}
+	if flows2.neutralized != 1 {
+		t.Fatalf("pre-existing/half-open conntrack neutralization calls = %d", flows2.neutralized)
+	}
+	if got := c2.State().ActiveNew; got != 1 {
+		t.Fatalf("restored active generation = %d", got)
 	}
 }
 
@@ -505,7 +800,7 @@ func TestOffloadOwnershipSurvivesCrashAndNeverClaimsPreDisabled(t *testing.T) {
 	if err := c1.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c1.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.ActivateNew(ctx, 1); err != nil {
@@ -525,10 +820,10 @@ func TestOffloadOwnershipSurvivesCrashAndNeverClaimsPreDisabled(t *testing.T) {
 	if err := c2.DeactivateNew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c2.Drain(ctx, 1); err != nil {
+	if _, err := c2.DrainGeneration(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c2.GarbageCollect(ctx, 1); err != nil {
+	if err := c2.GarbageCollectGeneration(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
 	if restores != 1 {
@@ -545,7 +840,7 @@ func TestOffloadOwnershipSurvivesCrashAndNeverClaimsPreDisabled(t *testing.T) {
 	if err := c3.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c3.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c3.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c3.ActivateNew(ctx, 1); err != nil {
@@ -580,7 +875,7 @@ func TestPartialOffloadRestoreRetainsRetryableOwnership(t *testing.T) {
 	if err := c1.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c1.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c1.ActivateNew(ctx, 1); err != nil {
@@ -589,10 +884,10 @@ func TestPartialOffloadRestoreRetainsRetryableOwnership(t *testing.T) {
 	if err := c1.DeactivateNew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c1.Drain(ctx, 1); err != nil {
+	if _, err := c1.DrainGeneration(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.GarbageCollect(ctx, 1); err == nil {
+	if err := c1.GarbageCollectGeneration(ctx, 1); err == nil {
 		t.Fatal("partial offload restoration reported success")
 	}
 	if !c1.State().OffloadsDisabled {
@@ -709,13 +1004,13 @@ func TestAmbiguousKernelCommitIsResolvedByExactReadback(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateNew(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 2, genTwoDNA); err != nil {
 		t.Fatal(err)
 	}
 	ambiguous = true
@@ -752,13 +1047,13 @@ func TestUnconfirmedKernelCompensationLatchesUnsafe(t *testing.T) {
 	if err := c.Start(ctx, ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 1, genOneDNA); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateNew(ctx, 1); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+	if err := c.PrepareGeneration(ctx, 2, genTwoDNA); err != nil {
 		t.Fatal(err)
 	}
 	fail = true
@@ -769,7 +1064,7 @@ func TestUnconfirmedKernelCompensationLatchesUnsafe(t *testing.T) {
 	if !st.Unsafe || st.ActiveNew != 0 {
 		t.Fatalf("unconfirmed compensation state = %+v", st)
 	}
-	if err := c.Prepare(ctx, 3, genOneDNA); err == nil {
+	if err := c.PrepareGeneration(ctx, 3, genOneDNA); err == nil {
 		t.Fatal("unsafe latch allowed a new mutation")
 	}
 }

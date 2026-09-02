@@ -52,6 +52,7 @@ services:
     command:
       - "run"
       - "--mode=prod"
+      - "--legacy-strategy-api"
       - "--strategy-file=/strategy.txt"
       - "--port=8080"
       - "--iface=eth0"

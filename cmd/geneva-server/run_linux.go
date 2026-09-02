@@ -73,6 +73,14 @@ func runServer(o *runCmd) error {
 	// Signals cancel the root context so cleanup (nft teardown) always runs.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	fatalCause := make(chan error, 1)
+	reportFatal := func(err error) {
+		select {
+		case fatalCause <- err:
+		default:
+		}
+		stop()
+	}
 
 	// The controller owns both halves of "what reaches userspace": the NIC's
 	// offload state and the steering rules. It installs rules only for the
@@ -103,7 +111,7 @@ func runServer(o *runCmd) error {
 		RuntimeVersion:            version,
 		Fatal: func(err error) {
 			log.Error("fatal steering integrity failure", "err", err)
-			stop()
+			reportFatal(err)
 		},
 	}, slogLogger{l: log})
 	// The inbound censor classifier runs in both modes: a prod box's IP gets
@@ -253,9 +261,10 @@ func runServer(o *runCmd) error {
 		InboundTCP: func() any { return censorSrc.Snapshot() },
 		// A strategy change is not just an engine swap: it can put the box on
 		// or take it off the data path, so it has to go through the controller.
-		Apply:    ctrl.Apply,
-		Steering: func() any { return ctrl.State() },
-		Adapter:  ctrl,
+		Apply:          ctrl.Apply,
+		Steering:       func() any { return ctrl.State() },
+		Adapter:        ctrl,
+		LegacyStrategy: o.LegacyStrategyAPI,
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,
@@ -282,6 +291,21 @@ func runServer(o *runCmd) error {
 
 	log.Info("nfqueue runtime starting", "out_queue", o.OutQueue, "in_queue", o.InQueue)
 	err = rt.Run(ctx)
+	resultErr := runtimeExitError(err, fatalCause, serveErr)
+	if resultErr == nil {
+		log.Info("shutting down")
+	}
+	return resultErr
+}
+
+// runtimeExitError preserves the difference systemd needs: operator shutdown
+// is clean, while an integrity fatal or failed control listener exits nonzero.
+func runtimeExitError(runErr error, fatalCause <-chan error, serveErr <-chan error) error {
+	select {
+	case fatalErr := <-fatalCause:
+		return fmt.Errorf("fatal steering integrity failure: %w", fatalErr)
+	default:
+	}
 
 	// If the control listener failed, surface that as the exit error rather than
 	// reporting a clean shutdown: the process must not exit 0 when the control
@@ -292,9 +316,8 @@ func runServer(o *runCmd) error {
 	default:
 	}
 
-	if errors.Is(err, context.Canceled) {
-		log.Info("shutting down")
+	if errors.Is(runErr, context.Canceled) {
 		return nil
 	}
-	return err
+	return runErr
 }

@@ -58,21 +58,13 @@ type Providers struct {
 	// It may be nil.
 	Steering func() any
 	Adapter  Adapter
+	// LegacyStrategy enables the raw-DNA /strategy compatibility surface. It is
+	// mutually exclusive with the authoritative generic v1 adapter routes.
+	LegacyStrategy bool
 }
 
-// Adapter is the versioned local Geneva lifecycle. It deliberately contains no
-// cloud or transport types; the generic overlay agent can drive it over loopback.
-type Adapter interface {
-	Descriptor() adapter.Descriptor
-	VerifyArtifact(context.Context, adapter.Identity, string) (adapter.VerifyResult, error)
-	PrepareDeployment(context.Context, adapter.Deployment, string) error
-	ActivateDeployment(context.Context, adapter.Deployment, adapter.Deployment) error
-	DeactivateDeployment(context.Context, adapter.Deployment) error
-	Status(context.Context) (any, error)
-	DrainDeployment(context.Context, adapter.Deployment) (adapter.DrainResult, error)
-	GarbageCollectKeep(context.Context, []adapter.Deployment) (adapter.GCResult, error)
-	RollbackDeployment(context.Context, adapter.Deployment, adapter.Deployment) error
-}
+// Adapter is deliberately generic and contains no cloud or transport types.
+type Adapter = adapter.Adapter
 
 // Server is the HTTP control surface.
 type Server struct {
@@ -89,16 +81,19 @@ func New(p Providers) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/strategy", s.handleStrategy)
 	mux.HandleFunc("/canary", s.handleCanary)
+	if s.p.LegacyStrategy {
+		mux.HandleFunc("/strategy", s.handleStrategy)
+		return mux
+	}
 	mux.HandleFunc("/v1/adapter/prepare", s.handlePrepare)
 	mux.HandleFunc("/v1/adapter/descriptor", s.handleDescriptor)
 	mux.HandleFunc("/v1/adapter/verify", s.handleVerify)
-	mux.HandleFunc("/v1/adapter/activate-new", s.handleActivateNew)
-	mux.HandleFunc("/v1/adapter/deactivate-new", s.handleDeactivateNew)
+	mux.HandleFunc("/v1/adapter/activate-for-new-connections", s.handleActivateNew)
+	mux.HandleFunc("/v1/adapter/deactivate-for-new-connections", s.handleDeactivateNew)
 	mux.HandleFunc("/v1/adapter/status", s.handleAdapterStatus)
 	mux.HandleFunc("/v1/adapter/drain", s.handleDrain)
-	mux.HandleFunc("/v1/adapter/gc", s.handleGC)
+	mux.HandleFunc("/v1/adapter/garbage-collect", s.handleGC)
 	mux.HandleFunc("/v1/adapter/rollback", s.handleRollback)
 	return mux
 }
@@ -111,7 +106,7 @@ type healthResp struct {
 	Version  string          `json:"version"`
 	Commit   string          `json:"commit"`
 	Uptime   float64         `json:"uptime_seconds"`
-	Strategy string          `json:"strategy"`
+	Strategy string          `json:"strategy,omitempty"`
 	Engine   engine.Snapshot `json:"engine"`
 	Verdicts any             `json:"verdicts,omitempty"`
 	// InboundTCP is reported here as well as over OTLP so the counters can be
@@ -126,13 +121,15 @@ type healthResp struct {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResp{
-		Status:   "ok",
-		Mode:     s.p.Mode,
-		Version:  s.p.Version,
-		Commit:   s.p.Commit,
-		Uptime:   s.uptime(),
-		Strategy: s.p.Engine.DNA(),
-		Engine:   s.p.Engine.Snapshot(),
+		Status:  "ok",
+		Mode:    s.p.Mode,
+		Version: s.p.Version,
+		Commit:  s.p.Commit,
+		Uptime:  s.uptime(),
+		Engine:  s.p.Engine.Snapshot(),
+	}
+	if s.p.LegacyStrategy {
+		resp.Strategy = s.p.Engine.DNA()
 	}
 	if s.p.Verdicts != nil {
 		resp.Verdicts = s.p.Verdicts()
@@ -201,18 +198,13 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 }
 
 const (
-	maxArtifact = 256 << 10
-	// JSON escaping can expand one artifact byte to six serialized bytes. The
-	// artifact itself, not its transport envelope, is the protocol limit.
-	maxArtifactRequest = 6*maxArtifact + 4096
+	// Base64 expands the generic []byte payload by 4/3. Keep a bounded allowance
+	// for immutable metadata while enforcing the decoded payload separately.
+	maxArtifactRequest = 2*adapter.MaxArtifactSize + 4096
 )
 
-type lifecycleRequest struct {
-	Deployment     adapter.Deployment   `json:"deployment"`
-	ExpectedActive adapter.Deployment   `json:"expected_active"`
-	Artifact       string               `json:"artifact,omitempty"`
-	SchemaVersion  uint32               `json:"schema_version,omitempty"`
-	Keep           []adapter.Deployment `json:"keep,omitempty"`
+type garbageCollectRequest struct {
+	Keep []adapter.ArtifactIdentity `json:"keep"`
 }
 
 func operationContext(r *http.Request) (context.Context, context.CancelFunc) {
@@ -226,31 +218,32 @@ func (s *Server) adapter(w http.ResponseWriter) Adapter {
 	return s.p.Adapter
 }
 
-func decodeLifecycleRequest(w http.ResponseWriter, r *http.Request) (lifecycleRequest, bool) {
+func decodeAdapterRequest(w http.ResponseWriter, r *http.Request, dst any) bool {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return lifecycleRequest{}, false
+		return false
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRequest)
-	var req lifecycleRequest
 	body, err := io.ReadAll(r.Body)
 	if err == nil {
-		err = json.Unmarshal(body, &req)
+		err = json.Unmarshal(body, dst)
 	}
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			writeError(w, http.StatusRequestEntityTooLarge, "serialized adapter request exceeds its bounded envelope")
+		} else if errors.Is(err, adapter.ErrPayloadTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
 		} else {
 			writeError(w, http.StatusBadRequest, "decode request: "+err.Error())
 		}
-		return lifecycleRequest{}, false
+		return false
 	}
-	if len([]byte(req.Artifact)) > maxArtifact {
+	if artifact, ok := dst.(*adapter.Artifact); ok && len(artifact.Payload()) > adapter.MaxArtifactSize {
 		writeError(w, http.StatusRequestEntityTooLarge, "artifact exceeds 256 KiB")
-		return lifecycleRequest{}, false
+		return false
 	}
-	return req, true
+	return true
 }
 
 func lifecycleResult(w http.ResponseWriter, err error) {
@@ -270,17 +263,13 @@ func (s *Server) handlePrepare(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
-		return
-	}
-	if req.SchemaVersion != adapter.SchemaVersionV1 || req.Deployment.Generation == 0 {
-		writeError(w, http.StatusBadRequest, "schema_version=1 and deployment.generation are required")
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	lifecycleResult(w, a.PrepareDeployment(ctx, req.Deployment, req.Artifact))
+	lifecycleResult(w, a.Prepare(ctx, artifact))
 }
 
 func (s *Server) handleDescriptor(w http.ResponseWriter, r *http.Request) {
@@ -300,22 +289,13 @@ func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
-		return
-	}
-	if req.SchemaVersion != adapter.SchemaVersionV1 {
-		writeError(w, http.StatusBadRequest, "unsupported schema_version")
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	result, err := a.VerifyArtifact(ctx, req.Deployment.Identity, req.Artifact)
-	if err != nil {
-		lifecycleResult(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
+	lifecycleResult(w, a.Verify(ctx, artifact))
 }
 
 func (s *Server) handleActivateNew(w http.ResponseWriter, r *http.Request) {
@@ -323,13 +303,13 @@ func (s *Server) handleActivateNew(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	lifecycleResult(w, a.ActivateDeployment(ctx, req.Deployment, req.ExpectedActive))
+	lifecycleResult(w, a.ActivateForNewConnections(ctx, artifact))
 }
 
 func (s *Server) handleDeactivateNew(w http.ResponseWriter, r *http.Request) {
@@ -337,13 +317,13 @@ func (s *Server) handleDeactivateNew(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
+	var identity adapter.ArtifactIdentity
+	if !decodeAdapterRequest(w, r, &identity) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	lifecycleResult(w, a.DeactivateDeployment(ctx, req.ExpectedActive))
+	lifecycleResult(w, a.DeactivateForNewConnections(ctx, identity))
 }
 
 func (s *Server) handleAdapterStatus(w http.ResponseWriter, r *http.Request) {
@@ -370,13 +350,13 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
+	var identity adapter.ArtifactIdentity
+	if !decodeAdapterRequest(w, r, &identity) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	result, err := a.DrainDeployment(ctx, req.Deployment)
+	result, err := a.Drain(ctx, identity)
 	if err != nil {
 		lifecycleResult(w, err)
 		return
@@ -389,18 +369,13 @@ func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
+	var req garbageCollectRequest
+	if !decodeAdapterRequest(w, r, &req) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	result, err := a.GarbageCollectKeep(ctx, req.Keep)
-	if err != nil {
-		lifecycleResult(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
+	lifecycleResult(w, a.GarbageCollect(ctx, req.Keep))
 }
 
 func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
@@ -408,13 +383,13 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	req, ok := decodeLifecycleRequest(w, r)
-	if !ok {
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
 		return
 	}
 	ctx, cancel := operationContext(r)
 	defer cancel()
-	lifecycleResult(w, a.RollbackDeployment(ctx, req.Deployment, req.ExpectedActive))
+	lifecycleResult(w, a.Rollback(ctx, artifact))
 }
 
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {

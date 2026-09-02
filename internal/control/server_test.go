@@ -18,8 +18,8 @@ import (
 )
 
 type fakeAdapter struct {
-	prepared lifecycleRequest
-	active   uint32
+	prepared adapter.Artifact
+	active   *adapter.ArtifactIdentity
 }
 
 type canceledAdapter struct {
@@ -27,39 +27,51 @@ type canceledAdapter struct {
 	saw error
 }
 
-func (a *canceledAdapter) PrepareDeployment(ctx context.Context, _ adapter.Deployment, _ string) error {
+func testArtifact(t *testing.T, revision string, payload []byte) adapter.Artifact {
+	t.Helper()
+	artifact, err := adapter.NewArtifact(adapter.ArtifactMetadata{
+		Technique: adapter.TechniqueGeneva, Revision: revision, Digest: adapter.Digest(payload), Size: len(payload),
+		AdapterProtocol: adapter.Version1, RequiredRuntimeName: adapter.RuntimeNameGeneva,
+		RequiredRuntimeVersion: "test-runtime", SchemaVersion: adapter.SchemaVersionV1,
+	}, payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return artifact
+}
+
+func (a *canceledAdapter) Prepare(ctx context.Context, _ adapter.Artifact) error {
 	<-ctx.Done()
 	a.saw = ctx.Err()
 	return ctx.Err()
 }
 
 func (*fakeAdapter) Descriptor() adapter.Descriptor {
-	return adapter.Descriptor{ProtocolVersion: 1, Technique: "geneva", SupportedSchemaVersions: []uint32{1}, RuntimeVersion: "test-runtime", MaxArtifactBytes: 256 << 10, MaxLiveGenerations: 3}
+	return adapter.Descriptor{AdapterProtocol: 1, Technique: "geneva", RuntimeName: "geneva-engine", RuntimeVersion: "test-runtime", SchemaVersions: []uint32{1}, MaxLiveGenerations: 3}
 }
-func (*fakeAdapter) VerifyArtifact(_ context.Context, identity adapter.Identity, _ string) (adapter.VerifyResult, error) {
-	return adapter.VerifyResult{Identity: identity}, nil
-}
-func (f *fakeAdapter) PrepareDeployment(_ context.Context, deployment adapter.Deployment, dna string) error {
-	f.prepared = lifecycleRequest{Deployment: deployment, Artifact: dna}
+func (*fakeAdapter) Verify(context.Context, adapter.Artifact) error { return nil }
+func (f *fakeAdapter) Prepare(_ context.Context, artifact adapter.Artifact) error {
+	f.prepared = artifact
 	return nil
 }
-func (f *fakeAdapter) ActivateDeployment(_ context.Context, deployment, _ adapter.Deployment) error {
-	f.active = deployment.Generation
+func (f *fakeAdapter) ActivateForNewConnections(_ context.Context, artifact adapter.Artifact) error {
+	identity := artifact.Identity()
+	f.active = &identity
 	return nil
 }
-func (*fakeAdapter) DeactivateDeployment(context.Context, adapter.Deployment) error { return nil }
-func (f *fakeAdapter) Status(context.Context) (any, error) {
-	return map[string]any{"version": 1, "active_new_generation": f.active}, nil
-}
-func (*fakeAdapter) DrainDeployment(_ context.Context, deployment adapter.Deployment) (adapter.DrainResult, error) {
-	return adapter.DrainResult{Deployment: deployment, Drained: true}, nil
-}
-func (*fakeAdapter) GarbageCollectKeep(context.Context, []adapter.Deployment) (adapter.GCResult, error) {
-	return adapter.GCResult{}, nil
-}
-func (*fakeAdapter) RollbackDeployment(context.Context, adapter.Deployment, adapter.Deployment) error {
+func (*fakeAdapter) DeactivateForNewConnections(context.Context, adapter.ArtifactIdentity) error {
 	return nil
 }
+func (f *fakeAdapter) Status(context.Context) (adapter.Status, error) {
+	return adapter.Status{Active: f.active}, nil
+}
+func (*fakeAdapter) Drain(context.Context, adapter.ArtifactIdentity) (adapter.DrainResult, error) {
+	return adapter.DrainResult{Complete: true}, nil
+}
+func (*fakeAdapter) GarbageCollect(context.Context, []adapter.ArtifactIdentity) error {
+	return nil
+}
+func (*fakeAdapter) Rollback(context.Context, adapter.Artifact) error { return nil }
 
 func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Server {
 	t.Helper()
@@ -74,7 +86,8 @@ func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Se
 		Verdicts: func() any { return map[string]int{"accepted": 0} },
 		// Engine-only apply: these tests exercise the HTTP surface, not the
 		// kernel-reprogramming half a real box wires in.
-		Apply: func(_ context.Context, dna string) error { return eng.SetStrategy(dna) },
+		Apply:          func(_ context.Context, dna string) error { return eng.SetStrategy(dna) },
+		LegacyStrategy: true,
 	}
 	if withCanary {
 		p.Canary = canary.NewPool("RU", 16)
@@ -275,26 +288,29 @@ func TestVersionedAdapterPrepareAndActivate(t *testing.T) {
 	a := &fakeAdapter{}
 	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler())
 	t.Cleanup(srv.Close)
-	post := func(path, body string) *http.Response {
+	payload := []byte(`[TCP:flags:R]-drop-| \/`)
+	artifact := testArtifact(t, "r1", payload)
+	body, _ := json.Marshal(artifact)
+	post := func(path string, body []byte) *http.Response {
 		t.Helper()
-		resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(body))
+		resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(string(body)))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return resp
 	}
-	resp := post("/v1/adapter/prepare", `{"schema_version":1,"deployment":{"generation":42,"identity":{"technique":"geneva","revision":"r1","digest":"d"}},"artifact":"[TCP:flags:R]-drop-| \\/"}`)
+	resp := post("/v1/adapter/prepare", body)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("prepare status = %d", resp.StatusCode)
 	}
-	if a.prepared.Deployment.Generation != 42 || a.prepared.Artifact != `[TCP:flags:R]-drop-| \/` {
+	if a.prepared.Identity() != artifact.Identity() || string(a.prepared.Payload()) != string(payload) {
 		t.Fatalf("prepared = %+v", a.prepared)
 	}
-	resp2 := post("/v1/adapter/activate-new", `{"deployment":{"generation":42,"identity":{"technique":"geneva","revision":"r1","digest":"d"}},"expected_active":{}}`)
+	resp2 := post("/v1/adapter/activate-for-new-connections", body)
 	defer resp2.Body.Close()
-	if resp2.StatusCode != http.StatusOK || a.active != 42 {
-		t.Fatalf("activate status=%d active=%d", resp2.StatusCode, a.active)
+	if resp2.StatusCode != http.StatusOK || a.active == nil || *a.active != artifact.Identity() {
+		t.Fatalf("activate status=%d active=%+v", resp2.StatusCode, a.active)
 	}
 }
 
@@ -313,16 +329,21 @@ func TestAdapterDescriptorUsesExactNumericV1WireContract(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw["protocol_version"] != float64(1) {
-		t.Fatalf("protocol_version wire value = %#v", raw["protocol_version"])
+	if raw["adapter_protocol"] != float64(1) {
+		t.Fatalf("adapter_protocol wire value = %#v", raw["adapter_protocol"])
 	}
-	versions, ok := raw["supported_schema_versions"].([]any)
+	versions, ok := raw["schema_versions"].([]any)
 	if !ok || len(versions) != 1 || versions[0] != float64(1) {
-		t.Fatalf("supported_schema_versions wire value = %#v", raw["supported_schema_versions"])
+		t.Fatalf("schema_versions wire value = %#v", raw["schema_versions"])
 	}
-	for _, field := range []string{"max_artifact_bytes", "max_live_generations"} {
-		if _, ok := raw[field].(float64); !ok {
-			t.Fatalf("%s is not a JSON number: %#v", field, raw[field])
+	for _, field := range []string{"runtime_name", "runtime_version"} {
+		if raw[field] == "" || raw[field] == nil {
+			t.Fatalf("%s is absent: %#v", field, raw[field])
+		}
+	}
+	for _, forbidden := range []string{"protocol_version", "supported_schema_versions", "max_artifact_bytes"} {
+		if _, ok := raw[forbidden]; ok {
+			t.Fatalf("non-generic descriptor field %s is present", forbidden)
 		}
 	}
 }
@@ -334,8 +355,13 @@ func TestVersionedAdapterRejectsSerializedRequestOver256KiB(t *testing.T) {
 	}
 	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler())
 	t.Cleanup(srv.Close)
-	body := `{"schema_version":1,"deployment":{"generation":1},"artifact":"` + strings.Repeat("x", maxArtifact+1) + `"}`
-	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(body))
+	payload := []byte(strings.Repeat("x", adapter.MaxArtifactSize+1))
+	body, _ := json.Marshal(map[string]any{"metadata": adapter.ArtifactMetadata{
+		Technique: adapter.TechniqueGeneva, Revision: "too-large", Digest: adapter.Digest(payload), Size: len(payload),
+		AdapterProtocol: adapter.Version1, RequiredRuntimeName: adapter.RuntimeNameGeneva,
+		RequiredRuntimeVersion: "test-runtime", SchemaVersion: adapter.SchemaVersionV1,
+	}, "payload": payload})
+	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,8 +379,9 @@ func TestVersionedAdapterAcceptsFull256KiBArtifact(t *testing.T) {
 	a := &fakeAdapter{}
 	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler())
 	t.Cleanup(srv.Close)
-	body := `{"schema_version":1,"deployment":{"generation":1},"artifact":"` + strings.Repeat("x", maxArtifact) + `"}`
-	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(body))
+	artifact := testArtifact(t, "full-size", []byte(strings.Repeat("x", adapter.MaxArtifactSize)))
+	body, _ := json.Marshal(artifact)
+	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(string(body)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -362,8 +389,8 @@ func TestVersionedAdapterAcceptsFull256KiBArtifact(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if len(a.prepared.Artifact) != maxArtifact {
-		t.Fatalf("artifact bytes = %d", len(a.prepared.Artifact))
+	if len(a.prepared.Payload()) != adapter.MaxArtifactSize {
+		t.Fatalf("artifact bytes = %d", len(a.prepared.Payload()))
 	}
 }
 
@@ -376,11 +403,36 @@ func TestAdapterOperationUsesRequestCancellation(t *testing.T) {
 	h := New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	req := httptest.NewRequest(http.MethodPost, "/v1/adapter/prepare", strings.NewReader(`{"schema_version":1,"deployment":{"generation":1},"artifact":"x"}`)).WithContext(ctx)
+	body, _ := json.Marshal(testArtifact(t, "cancel", []byte("x")))
+	req := httptest.NewRequest(http.MethodPost, "/v1/adapter/prepare", strings.NewReader(string(body))).WithContext(ctx)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if !errors.Is(a.saw, context.Canceled) {
 		t.Fatalf("adapter context error = %v", a.saw)
+	}
+}
+
+func TestLegacyStrategyAndAuthoritativeV1AreMutuallyExclusive(t *testing.T) {
+	legacy := newTestServer(t, "eval", "", false)
+	resp, err := http.Get(legacy.URL + "/v1/adapter/descriptor")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("legacy server exposed v1 adapter: %d", resp.StatusCode)
+	}
+
+	eng, _ := engine.New("")
+	authoritative := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler())
+	defer authoritative.Close()
+	resp2, err := http.Get(authoritative.URL + "/strategy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusNotFound {
+		t.Fatalf("authoritative v1 server exposed raw-DNA strategy API: %d", resp2.StatusCode)
 	}
 }
 

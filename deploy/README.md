@@ -50,9 +50,9 @@ back up when it stops — a sidecar with no strategy leaves the NIC alone.
     --control-addr=127.0.0.1:8092
   ```
 
-- **eval** — a candidate on a dedicated test box, with canary capture. The GA
-  brain assigns candidates via `PUT /strategy` and reads the per-market canary
-  pool from `GET /canary`:
+- **eval** — a candidate on a dedicated test box, with canary capture. The
+  overlay agent assigns candidates through v1 and the GA reads the per-market
+  canary pool from `GET /canary`:
 
   ```sh
   geneva-server run \
@@ -61,16 +61,14 @@ back up when it stops — a sidecar with no strategy leaves the NIC alone.
     --control-addr=127.0.0.1:8092
   ```
 
-Both modes use immutable per-connection generations. `PUT /strategy` remains a
-compatibility wrapper, but it prepares a new generation and activates it only
-for new TCP connections. Existing flows retain their conntrack generation until
-drain; rollback changes new-SYN assignment without resetting them. Normal
-production startup is inactive. `--strategy`/`--strategy-file` is an explicit
-legacy compatibility seed only; provision/install defaults must not use it.
+Both modes use immutable per-connection generations. Existing flows retain
+their conntrack generation through drain and rollback. Normal production startup
+is inactive and accepts desired state through v1. Raw-DNA `/strategy`,
+`--strategy`, and `--strategy-file` are available only with the explicit
+`--legacy-strategy-api` compatibility mode, which does not expose v1 routes.
 
-The control API is unauthenticated, so it must not listen on `0.0.0.0`:
-`PUT /strategy` lets any reachable client replace the active strategy on either a
-prod or an eval box. If the GA brain needs to reach it remotely, bind only a
+The control API is unauthenticated, so it must not listen on `0.0.0.0`. If an
+overlay agent needs to reach it remotely, bind only a
 dedicated management interface (e.g. a WireGuard/VPC address) and gate it with
 network ACLs — never the public interface.
 
@@ -80,17 +78,16 @@ Bind `--control-addr` to a private address (localhost or a management network).
 
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
-| `GET /strategy` | both      | current strategy DNA                                        |
-| `PUT /strategy` | both      | compatibility prepare + activate for new connections        |
+| `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
+| `GET /strategy` / `PUT /strategy` | legacy opt-in | raw-DNA compatibility lifecycle                 |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
 | `GET /v1/adapter/descriptor` / `POST /v1/adapter/verify` | both | generic numeric v1 capabilities / artifact validation |
 | `POST /v1/adapter/prepare` | both | validate and persist an immutable identity-bound deployment |
-| `POST /v1/adapter/activate-new` | both | stage union scopes, then flip new SYNs |
-| `POST /v1/adapter/deactivate-new` | both | identity-conditionally stop assigning new connections |
-| `GET /v1/adapter/status` | both | generation phases and integrity status |
-| `POST /v1/adapter/drain` / `POST /v1/adapter/gc` | both | count, then collect a drained generation |
-| `POST /v1/adapter/rollback` | both | identity-conditionally activate retained previous-known-good |
+| `POST /v1/adapter/activate-for-new-connections` | both | stage union scopes, then flip new SYNs |
+| `POST /v1/adapter/deactivate-for-new-connections` | both | identity-fenced stop of new assignments |
+| `GET /v1/adapter/status` | both | generic active/prepared/draining identity state |
+| `POST /v1/adapter/drain` / `POST /v1/adapter/garbage-collect` | both | bounded count, then keep-set collection |
+| `POST /v1/adapter/rollback` | both | restage a complete previous-known-good artifact |
 
 There is no scrape endpoint. Counters are exported as OTLP metrics to the box's
 local collector and read from the fleet's backend (see "Metric export" below);
@@ -171,9 +168,9 @@ Mirror the `lantern-box` provisioning flow:
 3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
    the sidecar stopped until the next boot.
 
-In eval mode the strategy file is optional: the sidecar starts with no strategy,
-steering nothing at all, until the GA brain assigns a candidate over
-`PUT /strategy`.
+In eval mode the sidecar starts with no strategy, steering nothing at all, until
+the overlay agent prepares and activates an artifact through v1. A strategy
+file is used only by an explicitly legacy deployment.
 
 The nftables rules are runtime-owned: the sidecar programs its table from the
 loaded strategy and deletes it on stop, so provisioning must **not** install
@@ -204,11 +201,9 @@ requeue through the dedicated service socket UID.
 The legacy `--mark` flag is ignored. A foreign nonzero value inside the reserved
 high 20 bits is left alone and the connection is not steered.
 
-With `--no-nft`, startup requires an explicit `--reinject-bypass-uid`. The
-externally managed output rules must exclude that UID before every Geneva queue
-rule and must not mutate packet marks for dispatch; otherwise fan-out
-reinjections can loop or exact policy-routing identities can be lost. The proxy
-must run under a different UID.
+`--no-nft` is rejected because the versioned lifecycle has no transactional
+external programmer and readback interface. Merely documenting a reinjection
+UID cannot make activate/deactivate/rollback results truthful.
 
 Drain/status read conntrack over netlink, filter by the full Geneva generation
 mask, then by original IPv4/TCP destination port. GC refuses an active
@@ -219,7 +214,7 @@ cannot bind an old conntrack entry to new DNA.
 At most three generations are retained by default; change this deliberately
 with `--max-generations` (1..32). The handshake-scoped and every-packet subsets
 also have separate `--max-scoped-generations` (default three) and
-`--max-every-packet-generations` (default one) limits. Prepare rejects when any
+`--max-every-packet-generations` (default two) limits. Prepare rejects when any
 applicable budget is full, and status exposes the generation resource class.
 Lifecycle status reports authoritative connection counts and bare lowercase
 SHA-256 hex digests, never raw DNA. `/healthz` uses the cached lifecycle view and

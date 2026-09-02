@@ -1,6 +1,7 @@
 package steering
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/getlantern/geneva"
@@ -18,6 +19,18 @@ func mustScope(t *testing.T, dna string) Scope {
 		t.Fatalf("parse %q: %v", dna, err)
 	}
 	return Of(s)
+}
+
+func TestScopeCanonicalizesDuplicateAndSubsumedSelectors(t *testing.T) {
+	duplicateDNA := strings.Repeat(`[TCP:flags:S]-duplicate-|`, 64) + ` \/`
+	duplicate := mustScope(t, duplicateDNA)
+	if got := duplicate.Outbound.Flags; len(got) != 1 || got[0] != (nftables.FlagMatch{Mask: 0xff, Value: 0x02}) {
+		t.Fatalf("duplicate selector amplification was not canonicalized: %+v", got)
+	}
+	subsumed := mustScope(t, `[TCP:flags:S]-duplicate-|[TCP:flags:S*]-duplicate-| \/`)
+	if got := subsumed.Outbound.Flags; len(got) != 1 || got[0] != (nftables.FlagMatch{Mask: 0x02, Value: 0x02}) {
+		t.Fatalf("subsumed selector was not removed: %+v", got)
+	}
 }
 
 func TestScopeOf(t *testing.T) {

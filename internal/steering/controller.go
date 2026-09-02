@@ -58,6 +58,7 @@ type Config struct {
 	MaxScopedGenerations      int
 	MaxEveryPacketGenerations int
 	SyncDirectory             func(string) error
+	SyncFile                  func(*os.File) error
 	CaptureOffloads           func(context.Context, string, string) (*netdev.Original, error)
 	DisableOffloads           func(context.Context, string, *netdev.Original) error
 	RestoreOffloads           func(context.Context, string, *netdev.Original) error
@@ -73,7 +74,7 @@ type Config struct {
 const (
 	defaultMaxGenerations            = 3
 	defaultMaxScopedGenerations      = 3
-	defaultMaxEveryPacketGenerations = 1
+	defaultMaxEveryPacketGenerations = 2
 	maxGenerationArtifact            = 256 << 10
 )
 
@@ -141,7 +142,10 @@ type Controller struct {
 	nft          *nftables.Manager
 	offloads     *netdev.Original
 	faultLatched atomic.Bool
+	persistFatal atomic.Bool
 }
+
+var _ adapter.Adapter = (*Controller)(nil)
 
 func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 	if log == nil {
@@ -150,8 +154,8 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 	if cfg.MaxGenerations == 0 {
 		cfg.MaxGenerations = defaultMaxGenerations
 	}
-	if cfg.MaxGenerations > adapter.MaxGenerations {
-		cfg.MaxGenerations = adapter.MaxGenerations
+	if cfg.MaxGenerations > int(adapter.MaxLiveGenerationBudget) {
+		cfg.MaxGenerations = int(adapter.MaxLiveGenerationBudget)
 	}
 	if cfg.MaxScopedGenerations == 0 {
 		cfg.MaxScopedGenerations = min(defaultMaxScopedGenerations, cfg.MaxGenerations)
@@ -161,6 +165,9 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 	}
 	if cfg.ConntrackTimeout <= 0 {
 		cfg.ConntrackTimeout = 5 * time.Second
+	}
+	if cfg.RuntimeVersion == "" {
+		cfg.RuntimeVersion = "dev"
 	}
 	if cfg.CaptureOffloads == nil {
 		cfg.CaptureOffloads = netdev.Capture
@@ -265,6 +272,16 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 			return err
 		}
 	}
+	// A durable active identity is desired state, not proof that the previous
+	// process completed its neutral boundary. Every restart therefore rebuilds
+	// active assignment through that boundary. Already marked generations keep
+	// their union rules throughout; only unowned/pre-existing flows are neutral.
+	if loaded && c.activeNew != 0 && !c.unsafe {
+		if err := c.restoreActiveAfterRestartLocked(ctx); err != nil {
+			return err
+		}
+		return nil
+	}
 	if err := c.programLocked(ctx, c.liveLocked(), c.activeNew, true); err != nil {
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -301,9 +318,34 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 	return nil
 }
 
+func (c *Controller) restoreActiveAfterRestartLocked(ctx context.Context) error {
+	if c.cfg.Connections == nil {
+		return errors.New("cannot restore active generation without conntrack neutralization")
+	}
+	active := c.activeNew
+	live := c.liveLocked()
+	if err := c.programModeLocked(ctx, live, 0, true, true); err != nil {
+		return fmt.Errorf("install restart neutral boundary: %w", err)
+	}
+	if _, err := c.neutralizeConnections(ctx); err != nil {
+		return fmt.Errorf("neutralize conntracks during active restart: %w", err)
+	}
+	if err := c.programLocked(ctx, live, 0, false); err != nil {
+		return fmt.Errorf("stage restart generation union: %w", err)
+	}
+	if err := c.programLocked(ctx, live, active, false); err != nil {
+		return fmt.Errorf("restore restart active assignment: %w", err)
+	}
+	if err := c.eng.Activate(active); err != nil {
+		return err
+	}
+	c.log.Infof("restored active generation %d through neutral restart boundary", active)
+	return nil
+}
+
 // Prepare is the legacy compatibility path. Versioned callers use
 // PrepareDeployment with a complete immutable identity.
-func (c *Controller) Prepare(ctx context.Context, id uint32, dna string) error {
+func (c *Controller) PrepareGeneration(ctx context.Context, id uint32, dna string) error {
 	return c.prepare(ctx, id, legacyIdentity(id, dna), dna)
 }
 
@@ -321,6 +363,11 @@ func (c *Controller) prepare(ctx context.Context, id uint32, identity adapter.Id
 	}
 	if _, err := generation.Mark(id); err != nil {
 		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+	}
+	if existingID, existing, err := c.generationForIdentityLocked(identity); err != nil {
+		return err
+	} else if existing != nil && existingID != id {
+		return fmt.Errorf("artifact identity is already mapped to generation %d", existingID)
 	}
 	if old := c.generations[id]; old != nil {
 		if old.DNA == dna && old.Identity == identity {
@@ -364,7 +411,7 @@ func (c *Controller) Apply(ctx context.Context, dna string) error {
 	if id == 0 {
 		return errors.New("all generation IDs are in use; drain and garbage-collect an old generation")
 	}
-	if err := c.Prepare(ctx, id, dna); err != nil {
+	if err := c.PrepareGeneration(ctx, id, dna); err != nil {
 		return err
 	}
 	return c.ActivateNew(ctx, id)
@@ -418,37 +465,199 @@ func validateIdentity(identity adapter.Identity, artifactDigest string) error {
 
 func (c *Controller) Descriptor() adapter.Descriptor {
 	return adapter.Descriptor{
-		ProtocolVersion: adapter.ProtocolVersionV1, Technique: adapter.TechniqueGeneva,
-		SupportedSchemaVersions: []uint32{adapter.SchemaVersionV1}, RuntimeVersion: c.cfg.RuntimeVersion,
-		MaxArtifactBytes: adapter.MaxArtifactBytes, MaxLiveGenerations: uint32(c.cfg.MaxGenerations),
-		Lifecycle: []string{"prepare", "verify", "activate-new", "deactivate-new", "status", "drain", "gc", "rollback"},
+		AdapterProtocol: adapter.Version1, Technique: adapter.TechniqueGeneva,
+		RuntimeName: adapter.RuntimeNameGeneva, RuntimeVersion: c.cfg.RuntimeVersion,
+		SchemaVersions: []uint32{adapter.SchemaVersionV1}, MaxLiveGenerations: uint32(c.cfg.MaxGenerations),
 	}
 }
 
-func (c *Controller) VerifyArtifact(ctx context.Context, identity adapter.Identity, dna string) (adapter.VerifyResult, error) {
+func (c *Controller) verifyArtifact(ctx context.Context, identity adapter.Identity, dna string) error {
 	if err := ctx.Err(); err != nil {
-		return adapter.VerifyResult{}, err
+		return err
 	}
-	if len(dna) > adapter.MaxArtifactBytes {
-		return adapter.VerifyResult{}, fmt.Errorf("%w: artifact exceeds 256 KiB", engine.ErrInvalidStrategy)
+	if len(dna) > adapter.MaxArtifactSize {
+		return fmt.Errorf("%w: artifact exceeds 256 KiB", engine.ErrInvalidStrategy)
 	}
 	sum := sha256.Sum256([]byte(dna))
 	if err := validateIdentity(identity, hex.EncodeToString(sum[:])); err != nil {
-		return adapter.VerifyResult{}, fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
 	}
 	parsed, err := geneva.NewStrategy(dna)
 	if err != nil {
-		return adapter.VerifyResult{}, fmt.Errorf("%w: parse: %w", engine.ErrInvalidStrategy, err)
+		return fmt.Errorf("%w: parse: %w", engine.ErrInvalidStrategy, err)
 	}
 	if err := geneva.Validate(parsed); err != nil {
-		return adapter.VerifyResult{}, fmt.Errorf("%w: validate: %w", engine.ErrInvalidStrategy, err)
+		return fmt.Errorf("%w: validate: %w", engine.ErrInvalidStrategy, err)
 	}
-	scope := c.widen(Of(parsed))
-	return adapter.VerifyResult{Identity: identity, ResourceClass: resourceClass(scope), Outbound: describe(scope.Outbound), Inbound: describe(scope.Inbound)}, nil
+	return nil
 }
 
 func (c *Controller) PrepareDeployment(ctx context.Context, deployment adapter.Deployment, dna string) error {
 	return c.prepare(ctx, deployment.Generation, deployment.Identity, dna)
+}
+
+// Prepare implements the generic identity-based adapter contract. The
+// numeric conntrack generation is a private durable mapping owned here.
+func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) error {
+	if err := artifact.ValidateFor(c.Descriptor()); err != nil {
+		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+	}
+	dna := string(artifact.Payload())
+	if err := c.verifyArtifact(ctx, artifact.Identity(), dna); err != nil {
+		return err
+	}
+	if c.faultLatched.Load() {
+		return errors.New("adapter integrity fault is latched")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.faultLatched.Load() {
+		return errors.New("adapter integrity fault is latched")
+	}
+	if id, gen, err := c.generationForIdentityLocked(artifact.Identity()); err != nil {
+		return err
+	} else if gen != nil {
+		if gen.DNA != dna {
+			return fmt.Errorf("artifact identity is already mapped to generation %d with different content", id)
+		}
+		return nil
+	}
+	if len(c.generations) >= c.cfg.MaxGenerations {
+		return fmt.Errorf("live generation budget is full (%d); drain and garbage-collect one before prepare", c.cfg.MaxGenerations)
+	}
+	id := c.nextGenerationLocked()
+	if id == 0 {
+		return errors.New("no private generation ID is available")
+	}
+	if err := c.prepareLocked(id, artifact.Identity(), dna); err != nil {
+		return err
+	}
+	if err := c.validateResourceBudgetsLocked(); err != nil {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return err
+	}
+	if err := c.persistLocked(); err != nil {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) Verify(ctx context.Context, artifact adapter.Artifact) error {
+	if err := artifact.ValidateFor(c.Descriptor()); err != nil {
+		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+	}
+	if err := c.verifyArtifact(ctx, artifact.Identity(), string(artifact.Payload())); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, gen, err := c.generationForIdentityLocked(artifact.Identity())
+	if err != nil {
+		return err
+	}
+	if gen == nil || gen.DNA != string(artifact.Payload()) {
+		return errors.New("artifact has not been prepared")
+	}
+	return nil
+}
+
+func (c *Controller) ActivateForNewConnections(ctx context.Context, artifact adapter.Artifact) error {
+	if err := artifact.ValidateFor(c.Descriptor()); err != nil {
+		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+	}
+	if c.faultLatched.Load() {
+		return errors.New("adapter integrity fault is latched; rollback is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id, gen, err := c.generationForIdentityLocked(artifact.Identity())
+	if err != nil {
+		return err
+	}
+	if gen == nil || gen.DNA != string(artifact.Payload()) {
+		return errors.New("artifact has not been prepared")
+	}
+	if c.activeNew == id {
+		return nil
+	}
+	return c.activateLocked(ctx, id, false)
+}
+
+func (c *Controller) DeactivateForNewConnections(ctx context.Context, identity adapter.ArtifactIdentity) error {
+	if c.faultLatched.Load() {
+		return errors.New("adapter integrity fault is latched; rollback is required")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.activeNew == 0 {
+		return nil
+	}
+	active := c.generations[c.activeNew]
+	if active == nil || active.Identity != identity {
+		return nil // identity-fenced stale retry
+	}
+	return c.deactivateLocked(ctx)
+}
+
+func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) error {
+	if c.persistFatal.Load() {
+		return errors.New("adapter durability failure requires process restart")
+	}
+	if err := artifact.ValidateFor(c.Descriptor()); err != nil {
+		return fmt.Errorf("%w: %v", engine.ErrInvalidStrategy, err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	id, gen, err := c.generationForIdentityLocked(artifact.Identity())
+	if err != nil {
+		return err
+	}
+	dna := string(artifact.Payload())
+	if gen == nil {
+		if len(c.generations) >= c.cfg.MaxGenerations {
+			return fmt.Errorf("live generation budget is full (%d); cannot restore rollback artifact", c.cfg.MaxGenerations)
+		}
+		id = c.nextGenerationLocked()
+		if id == 0 {
+			return errors.New("no private generation ID is available for rollback")
+		}
+		if err := c.prepareLocked(id, artifact.Identity(), dna); err != nil {
+			return err
+		}
+		if err := c.validateResourceBudgetsLocked(); err != nil {
+			delete(c.generations, id)
+			_ = c.eng.Remove(id)
+			return err
+		}
+		if err := c.persistLocked(); err != nil {
+			delete(c.generations, id)
+			_ = c.eng.Remove(id)
+			return err
+		}
+		gen = c.generations[id]
+	}
+	if gen.DNA != dna {
+		return errors.New("rollback artifact identity is retained with different content")
+	}
+	return c.activateLocked(ctx, id, true)
+}
+
+func (c *Controller) generationForIdentityLocked(identity adapter.ArtifactIdentity) (uint32, *generationState, error) {
+	var foundID uint32
+	var found *generationState
+	for id, gen := range c.generations {
+		if gen.Identity != identity {
+			continue
+		}
+		if found != nil {
+			return 0, nil, fmt.Errorf("artifact identity is ambiguously mapped to generations %d and %d", foundID, id)
+		}
+		foundID, found = id, gen
+	}
+	return foundID, found, nil
 }
 
 func (c *Controller) ActivateDeployment(ctx context.Context, target adapter.Deployment, expected adapter.Deployment) error {
@@ -655,7 +864,7 @@ func (c *Controller) deactivateLocked(ctx context.Context) error {
 }
 
 // Rollback changes only new SYN assignment; existing conntrack marks are untouched.
-func (c *Controller) Rollback(ctx context.Context, id uint32) error {
+func (c *Controller) RollbackGeneration(ctx context.Context, id uint32) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if id == 0 {
@@ -682,7 +891,7 @@ func (c *Controller) RollbackDeployment(ctx context.Context, target, expected ad
 	return c.activateLocked(ctx, target.Generation, true)
 }
 
-func (c *Controller) Drain(ctx context.Context, id uint32) (int, error) {
+func (c *Controller) DrainGeneration(ctx context.Context, id uint32) (int, error) {
 	c.mu.Lock()
 	gen := c.generations[id]
 	if gen == nil {
@@ -716,22 +925,37 @@ func (c *Controller) Drain(ctx context.Context, id uint32) (int, error) {
 	return n, nil
 }
 
-func (c *Controller) DrainDeployment(ctx context.Context, deployment adapter.Deployment) (adapter.DrainResult, error) {
+func (c *Controller) DrainDeployment(ctx context.Context, deployment adapter.Deployment) (int, error) {
 	c.mu.Lock()
 	if !c.matchesLocked(deployment) {
 		c.mu.Unlock()
-		return adapter.DrainResult{}, errors.New("drain deployment identity does not match")
+		return 0, errors.New("drain deployment identity does not match")
 	}
 	c.mu.Unlock()
-	n, err := c.Drain(ctx, deployment.Generation)
+	return c.DrainGeneration(ctx, deployment.Generation)
+}
+
+func (c *Controller) Drain(ctx context.Context, identity adapter.ArtifactIdentity) (adapter.DrainResult, error) {
+	c.mu.Lock()
+	id, gen, err := c.generationForIdentityLocked(identity)
+	if err != nil {
+		c.mu.Unlock()
+		return adapter.DrainResult{}, err
+	}
+	if gen == nil {
+		c.mu.Unlock()
+		return adapter.DrainResult{Complete: true}, nil
+	}
+	c.mu.Unlock()
+	n, err := c.DrainGeneration(ctx, id)
 	if err != nil {
 		return adapter.DrainResult{}, err
 	}
-	return adapter.DrainResult{Deployment: deployment, Connections: n, Drained: n == 0, CheckedAt: time.Now().UTC()}, nil
+	return adapter.DrainResult{Complete: n == 0, RemainingConnections: uint64(n)}, nil
 }
 
 // GarbageCollect removes kernel rules before the engine and only at zero flows.
-func (c *Controller) GarbageCollect(ctx context.Context, id uint32) error {
+func (c *Controller) GarbageCollectGeneration(ctx context.Context, id uint32) error {
 	if c.faultLatched.Load() {
 		return errors.New("adapter integrity fault is latched; rollback is required")
 	}
@@ -802,53 +1026,32 @@ func (c *Controller) GarbageCollect(ctx context.Context, id uint32) error {
 	return c.persistLocked()
 }
 
-func (c *Controller) GarbageCollectKeep(ctx context.Context, keep []adapter.Deployment) (adapter.GCResult, error) {
-	keepByID := make(map[uint32]adapter.Identity, len(keep))
-	for _, deployment := range keep {
-		if prior, ok := keepByID[deployment.Generation]; ok && prior != deployment.Identity {
-			return adapter.GCResult{}, fmt.Errorf("conflicting keep identities for generation %d", deployment.Generation)
-		}
-		keepByID[deployment.Generation] = deployment.Identity
+func (c *Controller) GarbageCollect(ctx context.Context, keep []adapter.ArtifactIdentity) error {
+	keepSet := make(map[adapter.ArtifactIdentity]bool, len(keep))
+	for _, identity := range keep {
+		keepSet[identity] = true
 	}
 	c.mu.Lock()
 	candidates := make([]adapter.Deployment, 0, len(c.generations))
-	result := adapter.GCResult{}
 	for id, gen := range c.generations {
-		deployment := adapter.Deployment{Generation: id, Identity: gen.Identity}
-		if identity, ok := keepByID[id]; ok {
-			if identity != gen.Identity {
-				c.mu.Unlock()
-				return adapter.GCResult{}, fmt.Errorf("keep identity does not match generation %d", id)
-			}
-			result.Kept = append(result.Kept, deployment)
+		if keepSet[gen.Identity] || id == c.activeNew || gen.Phase == PhaseDraining {
 			continue
 		}
-		candidates = append(candidates, deployment)
+		candidates = append(candidates, adapter.Deployment{Generation: id, Identity: gen.Identity})
 	}
 	c.mu.Unlock()
 	for _, deployment := range candidates {
-		drain, err := c.DrainDeployment(ctx, deployment)
-		if err != nil {
-			return result, err
-		}
-		if !drain.Drained {
-			result.Kept = append(result.Kept, deployment)
-			continue
-		}
 		c.mu.Lock()
 		matches := c.matchesLocked(deployment)
 		c.mu.Unlock()
 		if !matches {
-			return result, fmt.Errorf("generation %d identity changed during GC", deployment.Generation)
+			return fmt.Errorf("generation %d identity changed during GC", deployment.Generation)
 		}
-		if err := c.GarbageCollect(ctx, deployment.Generation); err != nil {
-			return result, err
+		if err := c.GarbageCollectGeneration(ctx, deployment.Generation); err != nil {
+			return err
 		}
-		result.Removed = append(result.Removed, deployment)
 	}
-	sort.Slice(result.Removed, func(i, j int) bool { return result.Removed[i].Generation < result.Removed[j].Generation })
-	sort.Slice(result.Kept, func(i, j int) bool { return result.Kept[i].Generation < result.Kept[j].Generation })
-	return result, nil
+	return nil
 }
 
 func (c *Controller) connectionCount(ctx context.Context, id uint32) (int, error) {
@@ -935,22 +1138,22 @@ func (c *Controller) stateLocked() State {
 
 // Status adds one bounded, authoritative conntrack snapshot to lifecycle state.
 // Health uses State instead so routine probes never dump conntrack.
-func (c *Controller) Status(ctx context.Context) (any, error) {
+func (c *Controller) DetailedStatus(ctx context.Context) (State, error) {
 	c.mu.Lock()
 	before := c.stateLocked()
 	c.mu.Unlock()
 	if c.cfg.Connections == nil {
-		return nil, errors.New("conntrack status counter is not configured")
+		return State{}, errors.New("conntrack status counter is not configured")
 	}
 	counts, err := c.connectionCounts(ctx)
 	if err != nil {
-		return nil, err
+		return State{}, err
 	}
 	c.mu.Lock()
 	out := c.stateLocked()
 	c.mu.Unlock()
 	if !sameStatusGenerationView(before, out) {
-		return nil, errors.New("adapter generations changed while conntrack status was in progress; retry status")
+		return State{}, errors.New("adapter generations changed while conntrack status was in progress; retry status")
 	}
 	for i := range out.Generations {
 		phase := out.Generations[i].Phase
@@ -958,6 +1161,39 @@ func (c *Controller) Status(ctx context.Context) (any, error) {
 			out.Generations[i].Connections = counts[out.Generations[i].ID]
 		}
 	}
+	return out, nil
+}
+
+func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
+	detailed, err := c.DetailedStatus(ctx)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	out := adapter.Status{Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations))}
+	for _, gen := range detailed.Generations {
+		out.Prepared = append(out.Prepared, gen.Identity)
+		if gen.ID == detailed.ActiveNew {
+			identity := gen.Identity
+			out.Active = &identity
+		}
+		if gen.Phase == PhaseDraining {
+			out.Draining = append(out.Draining, adapter.DrainGeneration{
+				Identity: gen.Identity, RemainingConnections: uint64(gen.Connections),
+			})
+		}
+	}
+	sort.Slice(out.Prepared, func(i, j int) bool {
+		if out.Prepared[i].Technique != out.Prepared[j].Technique {
+			return out.Prepared[i].Technique < out.Prepared[j].Technique
+		}
+		if out.Prepared[i].Revision != out.Prepared[j].Revision {
+			return out.Prepared[i].Revision < out.Prepared[j].Revision
+		}
+		return out.Prepared[i].Digest < out.Prepared[j].Digest
+	})
+	sort.Slice(out.Draining, func(i, j int) bool {
+		return out.Draining[i].Identity.Revision < out.Draining[j].Identity.Revision
+	})
 	return out, nil
 }
 
@@ -1166,10 +1402,15 @@ func (c *Controller) CensorCounts(ctx context.Context) (map[string]uint64, error
 	return n.ReadCounters(ctx)
 }
 
-func (c *Controller) persistLocked() error {
+func (c *Controller) persistLocked() (retErr error) {
 	if c.cfg.StateFile == "" {
 		return nil
 	}
+	defer func() {
+		if retErr != nil {
+			retErr = c.persistenceFailureLocked(retErr)
+		}
+	}()
 	s := persistedState{Version: 1, ActiveNew: c.activeNew, Previous: c.previous, Unsafe: c.unsafe, Failure: c.failure, Offloads: c.offloads, Generations: make([]generationState, 0, len(c.generations))}
 	for _, g := range c.generations {
 		x := *g
@@ -1204,7 +1445,11 @@ func (c *Controller) persistLocked() error {
 	if _, err := tmp.Write(b); err != nil {
 		return err
 	}
-	if err := tmp.Sync(); err != nil {
+	syncFile := c.cfg.SyncFile
+	if syncFile == nil {
+		syncFile = func(file *os.File) error { return file.Sync() }
+	}
+	if err := syncFile(tmp); err != nil {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
@@ -1218,19 +1463,28 @@ func (c *Controller) persistLocked() error {
 		syncDirectory = fsyncDirectory
 	}
 	if err := syncDirectory(dir); err != nil {
-		// Rename already committed the visible state. Reconcile the exact bytes
-		// and treat that state as authoritative so callers never apply the
-		// inverse transition after a durability-ack uncertainty.
-		committed, readErr := os.ReadFile(c.cfg.StateFile)
-		if readErr != nil || !bytes.Equal(committed, b) {
-			c.log.Errorf("adapter state rename committed but durability reconciliation is indeterminate; retaining committed transition: sync=%v read=%v", err, readErr)
-			ok = true
-			return nil
-		}
-		c.log.Errorf("adapter state directory sync uncertain after committed rename; reconciled visible state: %v", err)
+		// A successful rename is only visible-state evidence, not crash
+		// durability. Never authorize a kernel transition without the directory
+		// sync acknowledgement.
+		ok = true
+		return fmt.Errorf("sync adapter state directory after rename: %w", err)
 	}
 	ok = true
 	return nil
+}
+
+func (c *Controller) persistenceFailureLocked(err error) error {
+	cause := fmt.Errorf("adapter durability failure: %w", err)
+	if c.persistFatal.CompareAndSwap(false, true) {
+		c.faultLatched.Store(true)
+		c.unsafe = true
+		c.failure = cause.Error()
+		c.log.Errorf("%v", cause)
+		if c.cfg.Fatal != nil {
+			go c.cfg.Fatal(cause)
+		}
+	}
+	return cause
 }
 
 func (c *Controller) loadLocked() (bool, error) {
@@ -1278,6 +1532,11 @@ func (c *Controller) loadLocked() (bool, error) {
 		}
 		if c.generations[saved.ID] != nil {
 			return false, fmt.Errorf("adapter state contains duplicate generation %d", saved.ID)
+		}
+		if existingID, existing, err := c.generationForIdentityLocked(saved.Identity); err != nil {
+			return false, err
+		} else if existing != nil {
+			return false, fmt.Errorf("adapter state maps artifact identity to both generations %d and %d", existingID, saved.ID)
 		}
 		if saved.Phase != PhasePrepared && saved.Phase != PhaseActive && saved.Phase != PhaseDraining && saved.Phase != PhaseDrained {
 			return false, fmt.Errorf("generation %d has invalid phase %q", saved.ID, saved.Phase)

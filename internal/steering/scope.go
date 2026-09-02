@@ -20,6 +20,7 @@
 package steering
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -82,7 +83,40 @@ func selectorOf(f strategy.Forest) nftables.Selector {
 		}
 		sel.Flags = append(sel.Flags, m)
 	}
+	sel.Flags = canonicalFlags(sel.Flags)
 	return sel
+}
+
+func canonicalFlags(in []nftables.FlagMatch) []nftables.FlagMatch {
+	unique := make(map[nftables.FlagMatch]struct{}, len(in))
+	for _, match := range in {
+		unique[match] = struct{}{}
+	}
+	out := make([]nftables.FlagMatch, 0, len(unique))
+	for candidate := range unique {
+		subsumed := false
+		for broader := range unique {
+			if candidate == broader {
+				continue
+			}
+			// Every packet matching candidate also matches broader when broader
+			// constrains only bits candidate already fixes to the same values.
+			if broader.Mask & ^candidate.Mask == 0 && candidate.Value&broader.Mask == broader.Value {
+				subsumed = true
+				break
+			}
+		}
+		if !subsumed {
+			out = append(out, candidate)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Mask != out[j].Mask {
+			return out[i].Mask < out[j].Mask
+		}
+		return out[i].Value < out[j].Value
+	})
+	return out
 }
 
 // flagMatchOf reduces one action tree's trigger to a flags match, reporting
