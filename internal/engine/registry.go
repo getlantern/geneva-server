@@ -57,6 +57,19 @@ func (r *Registry) Prepare(id uint32, dna string) error {
 	return nil
 }
 
+// VerifyGeneration confirms that the immutable engine named by id is present
+// and contains the exact durable DNA expected by the lifecycle controller.
+func (r *Registry) VerifyGeneration(id uint32, dna string) error {
+	eng := (*r.byID.Load())[id]
+	if eng == nil {
+		return fmt.Errorf("%w: %d", ErrGenerationNotFound, id)
+	}
+	if eng.DNA() != dna {
+		return fmt.Errorf("generation %d engine does not match durable DNA", id)
+	}
+	return nil
+}
+
 // Activate changes the generation used by compatibility reads and direct
 // Process calls. NFQUEUE dispatch itself always names a generation explicitly.
 func (r *Registry) Activate(id uint32) error {

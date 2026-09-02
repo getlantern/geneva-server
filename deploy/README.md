@@ -190,7 +190,10 @@ sequence after Geneva freshly proves exact neutral kernel state and snapshots
 conntrack; rollback remains available for a full known-good fallback. This proof
 is process-local, repeated after every restart, and retryable in the same process
 after transient startup proof failure or completed integrity reconciliation. Do
-not edit or delete conntrack marks.
+not edit or delete conntrack marks. Missing-engine signals are never coalesced
+away merely because the adapter is already unsafe: a monotonic fault epoch
+invalidates startup and recovery proofs, and retained live engines are rebuilt
+and checked against durable DNA before activation can clear unhealthy state.
 
 ### Conntrack mark reservation and drain
 

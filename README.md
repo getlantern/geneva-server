@@ -164,7 +164,10 @@ Geneva freshly verifies neutral kernel state and snapshots conntrack. The proof
 is never persisted; Prepare can repeat it in the same process after a transient
 startup proof failure or completed integrity reconciliation. Prepare and Verify
 keep health unsafe, and only successful safe activation clears it. Orphan
-generation IDs remain reserved and never enter union rules. An absent-artifact
+generation IDs remain reserved and never enter union rules. Every integrity
+signal advances a process-local fault epoch, including signals received before a
+recovery guard is armed. Recovery reconstructs and verifies every retained live
+engine against durable DNA before the epoch can be cleared. An absent-artifact
 rollback likewise allocates only an ID proven zero-flow by a fresh authoritative
 snapshot. Production authoritative mode requires a nonempty
 `--adapter-state-file`.

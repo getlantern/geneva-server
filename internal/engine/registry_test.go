@@ -20,6 +20,15 @@ func TestRegistryGenerationsAreImmutable(t *testing.T) {
 	if err := r.Prepare(7, `[TCP:flags:S]-drop-| \/`); err == nil {
 		t.Fatal("replaced immutable generation")
 	}
+	if err := r.VerifyGeneration(7, `[TCP:flags:R]-drop-| \/`); err != nil {
+		t.Fatalf("verify immutable generation: %v", err)
+	}
+	if err := r.VerifyGeneration(7, `[TCP:flags:S]-drop-| \/`); err == nil {
+		t.Fatal("verified generation against different durable DNA")
+	}
+	if err := r.VerifyGeneration(8, ""); !errors.Is(err, ErrGenerationNotFound) {
+		t.Fatalf("verify missing generation error = %v", err)
+	}
 }
 
 func TestRegistryDispatchesExplicitGeneration(t *testing.T) {

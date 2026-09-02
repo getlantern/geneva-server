@@ -47,6 +47,27 @@ func lifecycleArtifactForRuntime(t *testing.T, revision, dna, runtimeVersion str
 	return a
 }
 
+func missingCTAGenerationError(t *testing.T, reg *engine.Registry, id uint32) error {
+	t.Helper()
+	raw := testutil.BuildTCP(t, 443, testutil.TCPFlags{ACK: true}, nil)
+	_, err := reg.ProcessGeneration(id, raw, strategy.DirectionOutbound, nil)
+	if !errors.Is(err, engine.ErrGenerationNotFound) {
+		t.Fatalf("CTA generation %d dispatch error = %v", id, err)
+	}
+	return err
+}
+
+func waitForIntegrityReconciliation(t *testing.T, c *Controller) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for c.integrityReconciling.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("integrity reconciliation did not finish: %+v", c.State())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 type fakeConnections struct {
 	counts      map[uint32]int
 	countsErr   error
@@ -1399,6 +1420,149 @@ func TestGenericRecoveryRearmsAfterAsyncIntegrityReconciliation(t *testing.T) {
 	}
 	if st := c.State(); st.Unsafe || st.Remediation || st.ActiveNew != 2 || len(st.Generations) != 2 {
 		t.Fatalf("post-integrity generic recovery state = %+v", st)
+	}
+}
+
+func TestMissingCTAEngineSignalDuringUnsafeStartupInvalidatesRecoveryGate(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	one := lifecycleArtifact(t, "startup-retained", genOneDNA)
+	two := lifecycleArtifact(t, "startup-replacement", genTwoDNA)
+
+	seed := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := seed.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	flows.counts[1] = 1
+	seed.mu.Lock()
+	seed.integrityFailureLocked(ctx, errors.New("persist unsafe retained generation for restart"))
+	seed.mu.Unlock()
+
+	reg := engine.NewRegistry()
+	var installed nftables.Config
+	var c *Controller
+	injectMissingCTA := true
+	c = New(reg, Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			if injectMissingCTA && len(cfg.Generations) == 1 && cfg.Generations[0].ID == 1 {
+				injectMissingCTA = false
+				if err := reg.Remove(1); err != nil {
+					t.Fatalf("remove retained engine during startup: %v", err)
+				}
+				c.IntegrityFailure(missingCTAGenerationError(t, reg, 1))
+			}
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	waitForIntegrityReconciliation(t, c)
+	if c.faultEpoch.Load() == 0 {
+		t.Fatal("startup CTA engine signal was not recorded")
+	}
+	if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 {
+		t.Fatalf("startup signal incorrectly armed recovery: %+v", st)
+	}
+	if err := reg.VerifyGeneration(1, genOneDNA); !errors.Is(err, engine.ErrGenerationNotFound) {
+		t.Fatalf("missing retained engine unexpectedly restored before generic proof: %v", err)
+	}
+
+	if err := c.Prepare(ctx, two); err != nil {
+		t.Fatalf("generic Prepare did not reconstruct retained engine: %v", err)
+	}
+	if err := reg.VerifyGeneration(1, genOneDNA); err != nil {
+		t.Fatalf("retained engine was not reconstructed from durable state: %v", err)
+	}
+	if err := c.Verify(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.State(); st.Unsafe || st.Remediation || st.ActiveNew != 2 {
+		t.Fatalf("startup CTA recovery result = %+v", st)
+	}
+}
+
+func TestMissingCTAEngineSignalBeforeRearmCannotClearUnresolvedIntegrity(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	reg := engine.NewRegistry()
+	var installed nftables.Config
+	c := New(reg, Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	one := lifecycleArtifact(t, "prearm-retained", genOneDNA)
+	two := lifecycleArtifact(t, "prearm-replacement", everyPacketDNA)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	flows.counts[1] = 1
+	reg.Deactivate()
+	if err := reg.Remove(1); err != nil {
+		t.Fatal(err)
+	}
+	c.IntegrityFailure(missingCTAGenerationError(t, reg, 1))
+	waitForIntegrityReconciliation(t, c)
+	if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 {
+		t.Fatalf("first missing-engine reconciliation state = %+v", st)
+	}
+
+	// This second real dispatch failure lands while faultLatched is already true
+	// and repairGuard is false: the window which previously dropped the signal.
+	epoch := c.faultEpoch.Load()
+	c.IntegrityFailure(missingCTAGenerationError(t, reg, 1))
+	if got := c.faultEpoch.Load(); got != epoch+1 {
+		t.Fatalf("pre-arm missing-engine signal epoch = %d, want %d", got, epoch+1)
+	}
+	waitForIntegrityReconciliation(t, c)
+
+	// A wrong immutable engine cannot satisfy reconstruction. Exact nft and
+	// conntrack proofs alone must not let generic activation clear unsafe state.
+	if err := reg.Prepare(1, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, two); err == nil || !strings.Contains(err.Error(), "durable") {
+		t.Fatalf("recovery Prepare with unresolved retained engine error = %v", err)
+	}
+	if err := c.ActivateForNewConnections(ctx, two); err == nil {
+		t.Fatal("generic activation cleared unresolved retained-engine integrity")
+	}
+	if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 1 {
+		t.Fatalf("unresolved retained-engine state = %+v", st)
 	}
 }
 

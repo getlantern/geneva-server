@@ -62,6 +62,9 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
   failure changes no engine, nft, or durable state and is retryable. Prepare can
   establish the gate itself after a transient startup proof failure or after an
   asynchronous integrity reconciliation has finished and verified inactivity.
+  The proof also reconstructs and verifies every retained live engine against
+  durable DNA. A monotonic process-local epoch invalidates it on every integrity
+  signal, including signals arriving before the repair guard exists.
 - `/v1/adapter/verify` accepts the same artifact and confirms its exact prepared
   identity, content, runtime, schema, and digest.
 - `/v1/adapter/activate-for-new-connections` accepts an artifact and assigns

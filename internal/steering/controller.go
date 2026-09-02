@@ -154,13 +154,17 @@ type Controller struct {
 	offloads     *netdev.Original
 	faultLatched atomic.Bool
 	persistFatal atomic.Bool
+	// faultEpoch records every hot-path integrity signal, including signals
+	// received while the adapter is already unsafe and no repair guard is armed.
+	faultEpoch atomic.Uint64
 	// integrityReconciling closes the window between the nonblocking hot-path
 	// latch and the background transition to a verified inactive program.
 	integrityReconciling atomic.Bool
 	// repairGuard lets a new hot-path integrity signal interrupt remediation
 	// even though the original quarantine fault remains latched.
-	repairGuard atomic.Bool
-	remediation bool
+	repairGuard      atomic.Bool
+	remediation      bool
+	remediationEpoch uint64
 	// reservedGenerations contains namespace IDs observed on orphaned live
 	// conntracks. They cannot be reused until a later authoritative full dump
 	// proves the ID has no flows.
@@ -214,6 +218,7 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	startFaultEpoch := c.faultEpoch.Load()
 	if c.faultLatched.Load() {
 		return errors.New("adapter integrity fault is latched; only identity-checked rollback may repair it")
 	}
@@ -295,7 +300,7 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		}
 	}
 	if c.unsafe {
-		c.remediation = false
+		c.remediation, c.remediationEpoch = false, 0
 		c.faultLatched.Store(true)
 		if c.activeNew != 0 && c.generations[c.activeNew] != nil {
 			c.generations[c.activeNew].Phase = PhaseDraining
@@ -338,11 +343,26 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 	// This proof is deliberately process-local. A restart must repeat the exact
 	// kernel readback and bounded conntrack snapshot before generic remediation.
 	if c.unsafe && conntrackAuthoritative && c.cfg.StateFile != "" && !c.persistFatal.Load() {
-		if err := c.verifyCurrentProgramLocked(ctx); err == nil {
-			c.remediation = true
-			c.repairGuard.Store(true)
+		c.repairGuard.Store(true)
+		var gateErr error
+		switch {
+		case c.faultEpoch.Load() != startFaultEpoch || c.integrityReconciling.Load():
+			gateErr = errors.New("integrity signal interrupted startup recovery proof")
+		default:
+			if err := c.reconstructAndVerifyLiveEnginesLocked(); err != nil {
+				gateErr = fmt.Errorf("verify retained engines during startup recovery: %w", err)
+			} else if err := c.verifyCurrentProgramLocked(ctx); err != nil {
+				gateErr = err
+			} else if c.faultEpoch.Load() != startFaultEpoch || !c.repairGuard.Load() || c.integrityReconciling.Load() {
+				gateErr = errors.New("integrity signal interrupted startup recovery proof")
+			}
+		}
+		if gateErr == nil {
+			c.remediation, c.remediationEpoch = true, startFaultEpoch
 		} else {
-			c.appendFailureLocked(fmt.Sprintf("verified-neutral recovery gate failed: %v", err))
+			c.remediation, c.remediationEpoch = false, 0
+			c.repairGuard.CompareAndSwap(true, false)
+			c.appendFailureLocked(fmt.Sprintf("verified-neutral recovery gate failed: %v", gateErr))
 		}
 	}
 	if !steering && c.offloads != nil {
@@ -579,16 +599,21 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	recovery := c.faultLatched.Load()
+	recoveryEpoch := uint64(0)
 	if recovery {
 		if err := c.establishRemediationGateLocked(ctx); err != nil {
 			return err
 		}
+		recoveryEpoch = c.remediationEpoch
 	}
 	if id, gen, err := c.generationForIdentityLocked(artifact.Identity()); err != nil {
 		return err
 	} else if gen != nil {
 		if gen.DNA != dna || gen.Metadata != artifact.Metadata() {
 			return fmt.Errorf("artifact identity is already mapped to generation %d with different immutable artifact metadata or content", id)
+		}
+		if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
+			return errors.New("integrity failure interrupted recovery prepare")
 		}
 		return nil
 	}
@@ -599,13 +624,13 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	if id == 0 {
 		return errors.New("no private generation ID is available")
 	}
-	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+	if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 		return errors.New("integrity failure interrupted recovery prepare")
 	}
 	if err := c.prepareArtifactLocked(id, artifact.Metadata(), dna); err != nil {
 		return err
 	}
-	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+	if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 		delete(c.generations, id)
 		_ = c.eng.Remove(id)
 		return errors.New("integrity failure interrupted recovery prepare")
@@ -615,7 +640,7 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 		_ = c.eng.Remove(id)
 		return err
 	}
-	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+	if recovery && !c.recoveryGateIntactLocked(recoveryEpoch) {
 		delete(c.generations, id)
 		_ = c.eng.Remove(id)
 		return errors.New("integrity failure interrupted recovery prepare")
@@ -653,7 +678,7 @@ func (c *Controller) ActivateForNewConnections(ctx context.Context, artifact ada
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	remediation := c.faultLatched.Load() && c.remediation && c.repairGuard.Load() && c.activeNew == 0 && !c.persistFatal.Load()
+	remediation := c.faultLatched.Load() && c.activeNew == 0 && !c.persistFatal.Load() && c.recoveryGateIntactLocked(c.remediationEpoch)
 	if c.faultLatched.Load() && !remediation {
 		return errors.New("adapter integrity fault is latched; rollback is required")
 	}
@@ -727,7 +752,7 @@ func (c *Controller) Rollback(ctx context.Context, artifact adapter.Artifact) er
 		c.mu.Lock()
 		c.faultLatched.Store(true)
 		c.repairGuard.Store(false)
-		c.unsafe, c.remediation = true, false
+		c.unsafe, c.remediation, c.remediationEpoch = true, false, 0
 		c.appendFailureLocked(cause.Error())
 		active := c.activeNew
 		if active != 0 {
@@ -853,16 +878,18 @@ func (c *Controller) activateLocked(ctx context.Context, id uint32, repair bool)
 	oldActive, oldPrevious := c.activeNew, c.previous
 	oldUnsafe, oldFailure := c.unsafe, c.failure
 	oldRemediation := c.remediation
+	oldRemediationEpoch := c.remediationEpoch
 	oldRepairGuard := c.repairGuard.Load()
+	repairEpoch := c.faultEpoch.Load()
 	oldPhases := c.phasesLocked()
 	restoreState := func() {
 		fatalFailure := c.failure
-		c.restoreLocked(oldActive, oldPrevious, oldUnsafe, oldFailure, oldRemediation, oldPhases)
+		c.restoreLocked(oldActive, oldPrevious, oldUnsafe, oldFailure, oldRemediation, oldRemediationEpoch, oldPhases)
 		if !oldRepairGuard {
 			c.repairGuard.Store(false)
 		}
 		if c.persistFatal.Load() {
-			c.unsafe, c.remediation, c.failure = true, false, fatalFailure
+			c.unsafe, c.remediation, c.remediationEpoch, c.failure = true, false, 0, fatalFailure
 			c.faultLatched.Store(true)
 			c.repairGuard.Store(false)
 		}
@@ -878,7 +905,21 @@ func (c *Controller) activateLocked(ctx context.Context, id uint32, repair bool)
 			c.repairGuard.Store(true)
 		}
 		c.unsafe, c.failure = false, ""
-		c.remediation = false
+		c.remediation, c.remediationEpoch = false, 0
+		if err := c.reconstructAndVerifyLiveEnginesLocked(); err != nil {
+			restoreState()
+			c.remediation, c.remediationEpoch = false, 0
+			c.repairGuard.Store(false)
+			c.faultLatched.Store(true)
+			return fmt.Errorf("verify retained engines before lifecycle repair: %w", err)
+		}
+		if c.faultEpoch.Load() != repairEpoch || !c.repairGuard.Load() || c.integrityReconciling.Load() {
+			restoreState()
+			c.remediation, c.remediationEpoch = false, 0
+			c.repairGuard.Store(false)
+			c.faultLatched.Store(true)
+			return errors.New("integrity failure interrupted retained-engine verification")
+		}
 	}
 	// Durable intent comes first: after a crash every mark either transaction can
 	// assign still has a reconstructable engine.
@@ -962,7 +1003,8 @@ func (c *Controller) activateLocked(ctx context.Context, id uint32, repair bool)
 	}
 	if repair {
 		c.faultLatched.Store(false)
-		if !c.repairGuard.CompareAndSwap(true, false) {
+		guardIntact := c.repairGuard.CompareAndSwap(true, false)
+		if !guardIntact || c.faultEpoch.Load() != repairEpoch {
 			// IntegrityFailure consumed the repair guard and queued fail-closed
 			// reconciliation while this lifecycle operation held the mutex.
 			c.faultLatched.Store(true)
@@ -1237,11 +1279,10 @@ func (c *Controller) connectionCount(ctx context.Context, id uint32) (int, error
 
 // IntegrityFailure makes the hot-path callback non-blocking while disabling new assignment.
 func (c *Controller) IntegrityFailure(err error) {
-	newFault := c.faultLatched.CompareAndSwap(false, true)
-	interruptedRepair := c.repairGuard.CompareAndSwap(true, false)
-	if !newFault && !interruptedRepair {
-		return
+	if err == nil {
+		err = errors.New("unspecified integrity failure")
 	}
+	c.recordIntegrityFailure()
 	if !c.integrityReconciling.CompareAndSwap(false, true) {
 		return
 	}
@@ -1251,14 +1292,24 @@ func (c *Controller) IntegrityFailure(err error) {
 		defer c.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		c.integrityFailureLocked(ctx, err)
+		c.reconcileIntegrityFailureLocked(ctx, err)
 	}()
 }
 
-func (c *Controller) integrityFailureLocked(ctx context.Context, cause error) {
+func (c *Controller) recordIntegrityFailure() uint64 {
+	epoch := c.faultEpoch.Add(1)
 	c.faultLatched.Store(true)
 	c.repairGuard.Store(false)
-	c.unsafe, c.remediation, c.failure = true, false, cause.Error()
+	return epoch
+}
+
+func (c *Controller) integrityFailureLocked(ctx context.Context, cause error) {
+	c.recordIntegrityFailure()
+	c.reconcileIntegrityFailureLocked(ctx, cause)
+}
+
+func (c *Controller) reconcileIntegrityFailureLocked(ctx context.Context, cause error) {
+	c.unsafe, c.remediation, c.remediationEpoch, c.failure = true, false, 0, cause.Error()
 	if c.activeNew != 0 && c.generations[c.activeNew] != nil {
 		c.generations[c.activeNew].Phase = PhaseDraining
 	}
@@ -1488,8 +1539,9 @@ func (c *Controller) verifyCurrentProgramLocked(ctx context.Context) error {
 // establishRemediationGateLocked proves that this process may safely accept a
 // generic Prepare while an integrity fault is latched. The permission is
 // intentionally process-local and retryable: neither startup nor a previous
-// proof is trusted. repairGuard is armed before the read-only proofs so a new
-// hot-path signal can atomically invalidate the attempt.
+// proof is trusted. The monotonic epoch is sampled before repairGuard is armed,
+// so signals from both the pre-arm window and the proof itself invalidate the
+// attempt. Retained live engines are reconstructed and verified before repair.
 func (c *Controller) establishRemediationGateLocked(ctx context.Context) error {
 	if c.activeNew != 0 || !c.unsafe || c.persistFatal.Load() {
 		return errors.New("adapter integrity fault is latched")
@@ -1511,15 +1563,19 @@ func (c *Controller) establishRemediationGateLocked(ctx context.Context) error {
 		return errors.New("integrity reconciliation is still in progress")
 	}
 
-	c.remediation = false
+	proofEpoch := c.faultEpoch.Load()
+	c.remediation, c.remediationEpoch = false, 0
 	c.repairGuard.Store(true)
 	armed := false
 	defer func() {
 		if !armed {
-			c.remediation = false
+			c.remediation, c.remediationEpoch = false, 0
 			c.repairGuard.CompareAndSwap(true, false)
 		}
 	}()
+	if !c.integrityProofIntact(proofEpoch) {
+		return errors.New("integrity failure interrupted recovery pre-arm")
+	}
 	if err := c.verifyCurrentProgramLocked(ctx); err != nil {
 		return fmt.Errorf("verify neutral steering before recovery prepare: %w", err)
 	}
@@ -1527,20 +1583,49 @@ func (c *Controller) establishRemediationGateLocked(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("snapshot conntracks before recovery prepare: %w", err)
 	}
-	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+	if !c.integrityProofIntact(proofEpoch) {
 		return errors.New("integrity failure interrupted recovery proof")
 	}
-	// Reservation reconciliation is delayed until both authoritative read-only
-	// proofs have completed and the integrity watch is still intact.
+	if err := c.reconstructAndVerifyLiveEnginesLocked(); err != nil {
+		return fmt.Errorf("reconstruct retained engines before recovery prepare: %w", err)
+	}
+	if !c.integrityProofIntact(proofEpoch) {
+		return errors.New("integrity failure interrupted retained-engine verification")
+	}
+	// Reservation reconciliation is delayed until the authoritative read-only
+	// proofs and retained-engine verification have completed.
 	c.reconcileReservedGenerationsLocked(counts)
-	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+	if !c.integrityProofIntact(proofEpoch) {
 		return errors.New("integrity failure interrupted recovery proof")
 	}
-	c.remediation = true
-	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+	c.remediation, c.remediationEpoch = true, proofEpoch
+	if !c.recoveryGateIntactLocked(proofEpoch) {
 		return errors.New("integrity failure interrupted recovery arm")
 	}
 	armed = true
+	return nil
+}
+
+func (c *Controller) integrityProofIntact(epoch uint64) bool {
+	return c.faultEpoch.Load() == epoch && c.repairGuard.Load() && !c.integrityReconciling.Load()
+}
+
+func (c *Controller) recoveryGateIntactLocked(epoch uint64) bool {
+	return c.remediation && c.remediationEpoch == epoch && c.integrityProofIntact(epoch)
+}
+
+func (c *Controller) reconstructAndVerifyLiveEnginesLocked() error {
+	live := c.liveLocked()
+	for _, gen := range live {
+		if err := c.eng.Prepare(gen.ID, gen.DNA); err != nil {
+			return fmt.Errorf("generation %d from durable state: %w", gen.ID, err)
+		}
+	}
+	for _, gen := range live {
+		if err := c.eng.VerifyGeneration(gen.ID, gen.DNA); err != nil {
+			return fmt.Errorf("generation %d against durable state: %w", gen.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -1719,7 +1804,7 @@ func (c *Controller) persistenceFailureLocked(err error) error {
 	if c.persistFatal.CompareAndSwap(false, true) {
 		c.faultLatched.Store(true)
 		c.repairGuard.Store(false)
-		c.unsafe, c.remediation = true, false
+		c.unsafe, c.remediation, c.remediationEpoch = true, false, 0
 		c.failure = cause.Error()
 		c.log.Errorf("%v", cause)
 		if c.cfg.Fatal != nil {
@@ -1844,7 +1929,7 @@ func (c *Controller) loadLocked() (bool, error) {
 		return false, fmt.Errorf("adapter state resource budget: %w", err)
 	}
 	c.activeNew, c.previous, c.unsafe, c.failure, c.offloads = s.ActiveNew, s.Previous, s.Unsafe, s.Failure, s.Offloads
-	c.remediation = false
+	c.remediation, c.remediationEpoch = false, 0
 	return true, nil
 }
 
@@ -1982,8 +2067,8 @@ func (c *Controller) phasesLocked() map[uint32]Phase {
 	}
 	return m
 }
-func (c *Controller) restoreLocked(active, previous uint32, unsafe bool, failure string, remediation bool, phases map[uint32]Phase) {
-	c.activeNew, c.previous, c.unsafe, c.failure, c.remediation = active, previous, unsafe, failure, remediation
+func (c *Controller) restoreLocked(active, previous uint32, unsafe bool, failure string, remediation bool, remediationEpoch uint64, phases map[uint32]Phase) {
+	c.activeNew, c.previous, c.unsafe, c.failure, c.remediation, c.remediationEpoch = active, previous, unsafe, failure, remediation, remediationEpoch
 	for id, p := range phases {
 		if c.generations[id] != nil {
 			c.generations[id].Phase = p
