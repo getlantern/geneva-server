@@ -59,7 +59,9 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
   its immutable engine, and durably allocates a private generation. While state
   is quarantined, a generic Prepare is accepted only after a process-local exact
   neutral-rules readback and fresh bounded full conntrack snapshot; proof
-  failure changes no engine, nft, or durable state and is retryable.
+  failure changes no engine, nft, or durable state and is retryable. Prepare can
+  establish the gate itself after a transient startup proof failure or after an
+  asynchronous integrity reconciliation has finished and verified inactivity.
 - `/v1/adapter/verify` accepts the same artifact and confirms its exact prepared
   identity, content, runtime, schema, and digest.
 - `/v1/adapter/activate-for-new-connections` accepts an artifact and assigns

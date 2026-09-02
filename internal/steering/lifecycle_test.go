@@ -55,6 +55,7 @@ type fakeConnections struct {
 	gotID       uint32
 	gotPort     uint16
 	neutralized int
+	countsHook  func()
 }
 
 func (f *fakeConnections) Count(_ context.Context, id uint32, port uint16) (int, error) {
@@ -63,6 +64,9 @@ func (f *fakeConnections) Count(_ context.Context, id uint32, port uint16) (int,
 }
 func (f *fakeConnections) Counts(context.Context, uint16) (map[uint32]int, error) {
 	f.countCalls++
+	if f.countsHook != nil {
+		f.countsHook()
+	}
 	if f.countsErr != nil {
 		return nil, f.countsErr
 	}
@@ -1216,6 +1220,241 @@ func TestQuarantineRemediatesThroughGenericT8ChampionSequence(t *testing.T) {
 				t.Fatalf("replayed remediation state = %+v", st)
 			}
 		})
+	}
+}
+
+func TestRecoveryPrepareRearmsAfterTransientStartupFailures(t *testing.T) {
+	t.Run("conntrack snapshot", func(t *testing.T) {
+		ctx := context.Background()
+		state := filepath.Join(t.TempDir(), "adapter.json")
+		if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		flows := &fakeConnections{counts: map[uint32]int{1: 1}, countsErr: errors.New("transient startup count failure")}
+		var installed nftables.Config
+		programs := 0
+		c := New(engine.NewRegistry(), Config{
+			NoNFT: true, StateFile: state, Connections: flows,
+			Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+				programs++
+				installed = cfg
+				return nil
+			},
+			VerifyProgram: func(_ context.Context, want nftables.Config) error {
+				if !sameProgram(installed, want) {
+					return errors.New("unexpected installed steering")
+				}
+				return nil
+			},
+		}, nil)
+		if err := c.Start(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 {
+			t.Fatalf("startup count failure state = %+v", st)
+		}
+		artifact := lifecycleArtifact(t, "startup-count-retry", genOneDNA)
+		before, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		programs = 0
+		if err := c.Prepare(ctx, artifact); err == nil {
+			t.Fatal("recovery Prepare succeeded while the conntrack snapshot still failed")
+		}
+		after, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if programs != 0 || string(after) != string(before) || len(c.State().Generations) != 0 {
+			t.Fatalf("failed startup-count retry mutated state: programs=%d state=%+v", programs, c.State())
+		}
+
+		flows.countsErr = nil
+		if err := c.Prepare(ctx, artifact); err != nil {
+			t.Fatalf("same-process recovery Prepare retry: %v", err)
+		}
+		if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 1 || st.Generations[0].ID != 2 {
+			t.Fatalf("rearmed startup-count recovery state = %+v", st)
+		}
+	})
+
+	t.Run("final exact readback", func(t *testing.T) {
+		ctx := context.Background()
+		state := filepath.Join(t.TempDir(), "adapter.json")
+		if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+		var installed nftables.Config
+		programs, verifies := 0, 0
+		c := New(engine.NewRegistry(), Config{
+			NoNFT: true, StateFile: state, Connections: flows,
+			Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+				programs++
+				installed = cfg
+				return nil
+			},
+			VerifyProgram: func(_ context.Context, want nftables.Config) error {
+				verifies++
+				// Call 1 verifies the startup program. Call 2 is Start's final
+				// recovery readback; call 3 is the first Prepare retry.
+				if verifies == 2 || verifies == 3 {
+					return errors.New("transient final exact-readback failure")
+				}
+				if !sameProgram(installed, want) {
+					return errors.New("unexpected installed steering")
+				}
+				return nil
+			},
+		}, nil)
+		if err := c.Start(ctx, ""); err != nil {
+			t.Fatal(err)
+		}
+		if st := c.State(); !st.Unsafe || st.Remediation || st.ActiveNew != 0 {
+			t.Fatalf("startup readback failure state = %+v", st)
+		}
+		artifact := lifecycleArtifact(t, "startup-readback-retry", genOneDNA)
+		before, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		programs = 0
+		if err := c.Prepare(ctx, artifact); err == nil {
+			t.Fatal("first recovery Prepare unexpectedly passed transient readback failure")
+		}
+		after, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if programs != 0 || string(after) != string(before) || len(c.State().Generations) != 0 {
+			t.Fatalf("failed startup-readback retry mutated state: programs=%d state=%+v", programs, c.State())
+		}
+		if err := c.Prepare(ctx, artifact); err != nil {
+			t.Fatalf("same-process recovery Prepare retry: %v", err)
+		}
+		if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 1 || st.Generations[0].ID != 2 {
+			t.Fatalf("rearmed startup-readback recovery state = %+v", st)
+		}
+	})
+}
+
+func TestGenericRecoveryRearmsAfterAsyncIntegrityReconciliation(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	var installed nftables.Config
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	one := lifecycleArtifact(t, "integrity-pbg", genOneDNA)
+	two := lifecycleArtifact(t, "integrity-newer", genTwoDNA)
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Verify(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	flows.counts[1] = 1
+	c.IntegrityFailure(errors.New("injected post-activation integrity failure"))
+	deadline := time.Now().Add(time.Second)
+	for {
+		st := c.State()
+		if st.Unsafe && !st.Remediation && st.ActiveNew == 0 && !c.integrityReconciling.Load() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("async integrity reconciliation did not become inactive: %+v", st)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if err := c.Prepare(ctx, two); err != nil {
+		t.Fatalf("generic Prepare did not re-arm after async reconciliation: %v", err)
+	}
+	if st := c.State(); !st.Unsafe || !st.Remediation || st.ActiveNew != 0 || len(st.Generations) != 2 {
+		t.Fatalf("post-integrity recovery Prepare state = %+v", st)
+	}
+	if err := c.Verify(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.State(); st.Unsafe || st.Remediation || st.ActiveNew != 2 || len(st.Generations) != 2 {
+		t.Fatalf("post-integrity generic recovery state = %+v", st)
+	}
+}
+
+func TestIntegritySignalInterruptsRecoveryPrepareRearm(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	if err := os.WriteFile(state, []byte("{corrupt\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flows := &fakeConnections{counts: map[uint32]int{1: 1}}
+	var installed nftables.Config
+	var c *Controller
+	c = New(engine.NewRegistry(), Config{
+		NoNFT: true, StateFile: state, Connections: flows,
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unexpected installed steering")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	c.IntegrityFailure(errors.New("clear initial recovery gate"))
+	deadline := time.Now().Add(time.Second)
+	for c.integrityReconciling.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("initial integrity reconciliation did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	flows.countsHook = func() {
+		c.IntegrityFailure(errors.New("interrupt recovery conntrack proof"))
+	}
+	artifact := lifecycleArtifact(t, "interrupted-rearm", genOneDNA)
+	if err := c.Prepare(ctx, artifact); err == nil || !strings.Contains(err.Error(), "interrupted") {
+		t.Fatalf("interrupted recovery Prepare error = %v", err)
+	}
+	if len(c.State().Generations) != 0 {
+		t.Fatalf("interrupted recovery Prepare created an engine: %+v", c.State())
+	}
+	flows.countsHook = nil
+	deadline = time.Now().Add(time.Second)
+	for c.integrityReconciling.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("interrupting integrity reconciliation did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := c.Prepare(ctx, artifact); err != nil {
+		t.Fatalf("recovery Prepare did not re-arm after interruption: %v", err)
 	}
 }
 

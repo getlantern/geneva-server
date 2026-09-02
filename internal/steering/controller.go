@@ -154,6 +154,9 @@ type Controller struct {
 	offloads     *netdev.Original
 	faultLatched atomic.Bool
 	persistFatal atomic.Bool
+	// integrityReconciling closes the window between the nonblocking hot-path
+	// latch and the background transition to a verified inactive program.
+	integrityReconciling atomic.Bool
 	// repairGuard lets a new hot-path integrity signal interrupt remediation
 	// even though the original quarantine fault remains latched.
 	repairGuard atomic.Bool
@@ -577,20 +580,9 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	defer c.mu.Unlock()
 	recovery := c.faultLatched.Load()
 	if recovery {
-		if !c.remediation || !c.repairGuard.Load() || c.activeNew != 0 || c.persistFatal.Load() {
-			return errors.New("adapter integrity fault is latched")
+		if err := c.establishRemediationGateLocked(ctx); err != nil {
+			return err
 		}
-		// Re-prove the process-local neutral gate on every recovery Prepare.
-		// Both operations are read-only; failure leaves engine, nft, and durable
-		// state untouched so t8 can retry the same newer snapshot.
-		if err := c.verifyCurrentProgramLocked(ctx); err != nil {
-			return fmt.Errorf("verify neutral steering before recovery prepare: %w", err)
-		}
-		counts, err := c.connectionCounts(ctx)
-		if err != nil {
-			return fmt.Errorf("snapshot conntracks before recovery prepare: %w", err)
-		}
-		c.reconcileReservedGenerationsLocked(counts)
 	}
 	if id, gen, err := c.generationForIdentityLocked(artifact.Identity()); err != nil {
 		return err
@@ -607,13 +599,26 @@ func (c *Controller) Prepare(ctx context.Context, artifact adapter.Artifact) err
 	if id == 0 {
 		return errors.New("no private generation ID is available")
 	}
+	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+		return errors.New("integrity failure interrupted recovery prepare")
+	}
 	if err := c.prepareArtifactLocked(id, artifact.Metadata(), dna); err != nil {
 		return err
+	}
+	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return errors.New("integrity failure interrupted recovery prepare")
 	}
 	if err := c.validateResourceBudgetsLocked(); err != nil {
 		delete(c.generations, id)
 		_ = c.eng.Remove(id)
 		return err
+	}
+	if recovery && (!c.remediation || !c.repairGuard.Load() || c.integrityReconciling.Load()) {
+		delete(c.generations, id)
+		_ = c.eng.Remove(id)
+		return errors.New("integrity failure interrupted recovery prepare")
 	}
 	if err := c.persistLocked(); err != nil {
 		delete(c.generations, id)
@@ -1237,7 +1242,11 @@ func (c *Controller) IntegrityFailure(err error) {
 	if !newFault && !interruptedRepair {
 		return
 	}
+	if !c.integrityReconciling.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
+		defer c.integrityReconciling.Store(false)
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1474,6 +1483,65 @@ func (c *Controller) verifyCurrentProgramLocked(ctx context.Context) error {
 		return errors.New("exact steering readback is unavailable with no-nft mode")
 	}
 	return m.VerifyInstalled(verifyCtx)
+}
+
+// establishRemediationGateLocked proves that this process may safely accept a
+// generic Prepare while an integrity fault is latched. The permission is
+// intentionally process-local and retryable: neither startup nor a previous
+// proof is trusted. repairGuard is armed before the read-only proofs so a new
+// hot-path signal can atomically invalidate the attempt.
+func (c *Controller) establishRemediationGateLocked(ctx context.Context) error {
+	if c.activeNew != 0 || !c.unsafe || c.persistFatal.Load() {
+		return errors.New("adapter integrity fault is latched")
+	}
+	if c.cfg.StateFile == "" {
+		return errors.New("adapter integrity fault cannot be remediated without durable state")
+	}
+	info, err := os.Stat(c.cfg.StateFile)
+	if err != nil {
+		return fmt.Errorf("verify durable state before recovery prepare: %w", err)
+	}
+	if info.Size() == 0 {
+		return errors.New("verify durable state before recovery prepare: state file is empty")
+	}
+	if c.cfg.Connections == nil {
+		return errors.New("snapshot conntracks before recovery prepare: counter is not configured")
+	}
+	if c.integrityReconciling.Load() {
+		return errors.New("integrity reconciliation is still in progress")
+	}
+
+	c.remediation = false
+	c.repairGuard.Store(true)
+	armed := false
+	defer func() {
+		if !armed {
+			c.remediation = false
+			c.repairGuard.CompareAndSwap(true, false)
+		}
+	}()
+	if err := c.verifyCurrentProgramLocked(ctx); err != nil {
+		return fmt.Errorf("verify neutral steering before recovery prepare: %w", err)
+	}
+	counts, err := c.connectionCounts(ctx)
+	if err != nil {
+		return fmt.Errorf("snapshot conntracks before recovery prepare: %w", err)
+	}
+	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+		return errors.New("integrity failure interrupted recovery proof")
+	}
+	// Reservation reconciliation is delayed until both authoritative read-only
+	// proofs have completed and the integrity watch is still intact.
+	c.reconcileReservedGenerationsLocked(counts)
+	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+		return errors.New("integrity failure interrupted recovery proof")
+	}
+	c.remediation = true
+	if !c.repairGuard.Load() || c.integrityReconciling.Load() {
+		return errors.New("integrity failure interrupted recovery arm")
+	}
+	armed = true
+	return nil
 }
 
 func (c *Controller) programModeLocked(ctx context.Context, live []*generationState, active uint32, neutral bool, verify bool) error {

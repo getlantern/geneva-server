@@ -188,8 +188,9 @@ and unknown flows bypass userspace. The overlay manager can repair with its
 normal newer-snapshot `Prepare` → `Verify` → `ActivateForNewConnections`
 sequence after Geneva freshly proves exact neutral kernel state and snapshots
 conntrack; rollback remains available for a full known-good fallback. This proof
-is process-local and repeated after every restart. Do not edit or delete
-conntrack marks.
+is process-local, repeated after every restart, and retryable in the same process
+after transient startup proof failure or completed integrity reconciliation. Do
+not edit or delete conntrack marks.
 
 ### Conntrack mark reservation and drain
 
