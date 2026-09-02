@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 go build -trimpath -o /out/echo ./e2e/echo
 FROM debian:bookworm-slim
 RUN set -ex \
     && apt-get update \
-    && apt-get install -y --no-install-recommends curl jq ca-certificates \
+    && apt-get install -y --no-install-recommends curl jq ca-certificates conntrack iproute2 nftables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/echo /usr/local/bin/echo
 COPY e2e/entrypoint-server.sh /usr/local/bin/entrypoint-server.sh

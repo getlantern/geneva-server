@@ -41,7 +41,13 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/getlantern/geneva-server/internal/engine"
+	"github.com/getlantern/geneva-server/internal/generation"
 )
+
+// Processor dispatches a packet to one immutable engine generation.
+type Processor interface {
+	ProcessGeneration(id uint32, raw []byte, dir strategy.Direction, scratch *engine.Scratch) (engine.Result, error)
+}
 
 // Observer is notified of every packet before manipulation, for eval-mode canary
 // capture. It must be safe for concurrent use and must not retain the slice.
@@ -64,12 +70,19 @@ func (nopLogger) Errorf(string, ...any) {}
 type Config struct {
 	OutQueue uint16
 	InQueue  uint16
-	Mark     uint32
 	// MaxPacketLen bounds how many bytes the kernel copies per packet. 0xffff
 	// covers any IPv4 packet.
 	MaxPacketLen uint32
-	Observer     Observer
-	Logger       Logger
+	// MaxQueueLen bounds packets waiting for userspace. Production defaults to
+	// 65535; the kernel integration gate deliberately constrains it to prove
+	// NFQA_CFG_F_FAIL_OPEN under overload.
+	MaxQueueLen uint32
+	Observer    Observer
+	Logger      Logger
+	// IntegrityFailure is called when a queued packet does not name a live
+	// Geneva generation. The packet itself fails open; the controller uses the
+	// callback to stop assigning new connections until rollback repairs state.
+	IntegrityFailure func(error)
 }
 
 // Stats counts verdicts and reinjection outcomes.
@@ -95,9 +108,9 @@ type Stats struct {
 	Modified    atomic.Uint64
 	Reinjected  atomic.Uint64
 	InjectFails atomic.Uint64
-	// Overruns counts socket-buffer overflows. The packets lost to one were
-	// accepted by the queue rules' bypass flag, so the proxy kept serving —
-	// they simply never reached the strategy.
+	// Overruns counts userspace-delivery ENOBUFS events. The number and eventual
+	// verdict of affected packets are not observable, so they are deliberately
+	// not included in Accepted or Dropped.
 	Overruns atomic.Uint64
 	// Truncated counts packets the kernel copied only part of. They are
 	// accepted unmodified, since manipulating a prefix would put a corrupt
@@ -119,23 +132,28 @@ type Snapshot struct {
 
 // Runtime binds the engine to the two queues and the reinjector.
 type Runtime struct {
-	eng        *engine.Engine
+	eng        Processor
 	reinjector *Reinjector
 	cfg        Config
 	log        Logger
 	Stats      Stats
+	outQ       *queue
+	inQ        *queue
 }
 
 // New builds a runtime. The reinjector is created here so a missing capability
 // fails fast at startup rather than on the first packet.
-func New(eng *engine.Engine, cfg Config) (*Runtime, error) {
+func New(eng Processor, cfg Config) (*Runtime, error) {
 	if cfg.MaxPacketLen == 0 {
 		cfg.MaxPacketLen = 0xffff
+	}
+	if cfg.MaxQueueLen == 0 {
+		cfg.MaxQueueLen = maxQueueLen
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = nopLogger{}
 	}
-	r, err := NewReinjector(cfg.Mark)
+	r, err := NewReinjector()
 	if err != nil {
 		return nil, err
 	}
@@ -155,26 +173,54 @@ func (rt *Runtime) Snapshot() Snapshot {
 	}
 }
 
-// Run opens both queues and pumps them until ctx is cancelled. It always
-// releases the queues and the raw socket before returning.
+// Open binds and verifies exclusive ownership of both queues. Call it before
+// installing any steering rules.
+func (rt *Runtime) Open() error {
+	if rt.outQ != nil || rt.inQ != nil {
+		return errors.New("NFQUEUE runtime is already open")
+	}
+	outQ, err := openQueue(rt.cfg.OutQueue, rt.cfg.MaxPacketLen, rt.cfg.MaxQueueLen)
+	if err != nil {
+		return fmt.Errorf("open out-queue %d: %w", rt.cfg.OutQueue, err)
+	}
+	inQ, err := openQueue(rt.cfg.InQueue, rt.cfg.MaxPacketLen, rt.cfg.MaxQueueLen)
+	if err != nil {
+		_ = outQ.Close()
+		return fmt.Errorf("open in-queue %d: %w", rt.cfg.InQueue, err)
+	}
+	rt.outQ, rt.inQ = outQ, inQ
+	return nil
+}
+
+// Close releases queues only after the caller has removed steering rules.
+func (rt *Runtime) Close() error {
+	var errs []error
+	if rt.outQ != nil {
+		errs = append(errs, rt.outQ.Close())
+		rt.outQ = nil
+	}
+	if rt.inQ != nil {
+		errs = append(errs, rt.inQ.Close())
+		rt.inQ = nil
+	}
+	if rt.reinjector != nil {
+		errs = append(errs, rt.reinjector.Close())
+	}
+	return errors.Join(errs...)
+}
+
+// Run pumps already-open queues until ctx is cancelled. The caller owns Close
+// ordering so rules are removed while queue listeners are still bound.
 //
 // One goroutine per queue, and one read buffer and one Scratch per goroutine:
 // each queue is processed strictly in order, which is what lets the verdict
 // batching hold accepts back safely and lets the engine reuse its working
 // memory without synchronization.
 func (rt *Runtime) Run(ctx context.Context) error {
-	outQ, err := openQueue(rt.cfg.OutQueue, rt.cfg.MaxPacketLen, maxQueueLen)
-	if err != nil {
-		return fmt.Errorf("open out-queue %d: %w", rt.cfg.OutQueue, err)
+	if rt.outQ == nil || rt.inQ == nil {
+		return errors.New("NFQUEUE runtime must be opened before Run")
 	}
-	defer func() { _ = outQ.Close() }()
-
-	inQ, err := openQueue(rt.cfg.InQueue, rt.cfg.MaxPacketLen, maxQueueLen)
-	if err != nil {
-		return fmt.Errorf("open in-queue %d: %w", rt.cfg.InQueue, err)
-	}
-	defer func() { _ = inQ.Close() }()
-	defer func() { _ = rt.reinjector.Close() }()
+	outQ, inQ := rt.outQ, rt.inQ
 
 	// A context of our own, cancelled the moment either pump gives up. Without
 	// it, one pump failing would leave the other looping: interrupt makes its
@@ -222,11 +268,11 @@ func (rt *Runtime) pump(ctx context.Context, q *queue, dir strategy.Direction) e
 		switch {
 		case err == nil:
 		case errors.Is(err, unix.ENOBUFS):
-			// The socket buffer overflowed and the kernel dropped packets.
-			// Those packets were accepted by the bypass flag, so the proxy is
-			// unharmed; the strategy simply did not see them.
+			// Userspace delivery overran. NFQA_CFG_F_FAIL_OPEN protects new
+			// arrivals once the kernel queue fills, but the exact number and
+			// outcome of messages associated with this ENOBUFS are unknown.
 			rt.Stats.Overruns.Add(1)
-			rt.log.Errorf("nfqueue socket overrun: packets bypassed the strategy")
+			rt.log.Errorf("nfqueue socket overrun: packet outcomes unknown")
 		case errors.Is(err, unix.EAGAIN), errors.Is(err, os.ErrDeadlineExceeded):
 			// Expected on an idle queue.
 			rt.log.Debugf("nfqueue read: %v", err)
@@ -240,6 +286,16 @@ func (rt *Runtime) pump(ctx context.Context, q *queue, dir strategy.Direction) e
 
 // handle runs one packet through the engine and issues its verdict.
 func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *engine.Scratch) {
+	gen, ok := generation.ID(p.generationMark)
+	if !ok {
+		err := fmt.Errorf("queued packet has no Geneva generation in NFQUEUE conntrack metadata: %#x", p.generationMark)
+		rt.log.Errorf("integrity failure: %v", err)
+		rt.accept(q, p.id)
+		if rt.cfg.IntegrityFailure != nil {
+			rt.cfg.IntegrityFailure(err)
+		}
+		return
+	}
 	if p.truncated {
 		// Fail open: a prefix of a packet cannot be manipulated or reinjected.
 		rt.Stats.Truncated.Add(1)
@@ -258,17 +314,22 @@ func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *e
 		rt.cfg.Observer.Observe(p.payload, dir)
 	}
 
-	res, err := rt.eng.Process(p.payload, dir, scratch)
+	res, err := rt.eng.ProcessGeneration(gen, p.payload, dir, scratch)
 	if err != nil {
 		// Fail open: a strategy or decode error must never black-hole the
 		// proxy's traffic.
-		rt.log.Errorf("process %s packet: %v", dir, err)
+		rt.log.Errorf("process %s packet in generation %d: %v", dir, gen, err)
+		if errors.Is(err, engine.ErrGenerationNotFound) && rt.cfg.IntegrityFailure != nil {
+			rt.accept(q, p.id)
+			rt.cfg.IntegrityFailure(err)
+			return
+		}
 		rt.accept(q, p.id)
 		return
 	}
 
 	if dir == strategy.DirectionOutbound {
-		rt.verdictOutbound(q, p.id, res)
+		rt.verdictOutbound(q, p.id, p.routingMark, res)
 	} else {
 		rt.verdictInbound(q, p.id, res)
 	}
@@ -280,7 +341,7 @@ func (rt *Runtime) handle(q *queue, dir strategy.Direction, p packet, scratch *e
 // If a strategy produced replacement packets but none of them could be
 // delivered, the original is accepted instead of dropped: dropping it would
 // black-hole the flow, and failing open keeps the proxy serving.
-func (rt *Runtime) verdictOutbound(q *queue, id uint32, res engine.Result) {
+func (rt *Runtime) verdictOutbound(q *queue, id uint32, routingMark uint32, res engine.Result) {
 	if res.Outcome == engine.OutcomeUnchanged {
 		rt.accept(q, id)
 		return
@@ -296,7 +357,7 @@ func (rt *Runtime) verdictOutbound(q *queue, id uint32, res engine.Result) {
 	last := res.Packets[len(res.Packets)-1]
 	injected := 0
 	for _, p := range extras {
-		if err := rt.reinjector.Inject(p); err != nil {
+		if err := rt.reinjector.Inject(p, routingMark); err != nil {
 			rt.log.Errorf("reinject: %v", err)
 			rt.Stats.InjectFails.Add(1)
 			continue
@@ -309,7 +370,7 @@ func (rt *Runtime) verdictOutbound(q *queue, id uint32, res engine.Result) {
 		// — inject the replacement and drop the original — so a kernel that
 		// rejects the modified verdict still applies the strategy.
 		rt.log.Errorf("mod-accept outbound: %v", err)
-		if err := rt.reinjector.Inject(last); err != nil {
+		if err := rt.reinjector.Inject(last, routingMark); err != nil {
 			rt.log.Errorf("reinject after mod-accept failure: %v", err)
 			rt.Stats.InjectFails.Add(1)
 			if injected == 0 {

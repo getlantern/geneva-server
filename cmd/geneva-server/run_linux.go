@@ -18,6 +18,7 @@ import (
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/control"
 	"github.com/getlantern/geneva-server/internal/engine"
+	"github.com/getlantern/geneva-server/internal/flowtrack"
 	"github.com/getlantern/geneva-server/internal/nfqueue"
 	"github.com/getlantern/geneva-server/internal/nftables"
 	"github.com/getlantern/geneva-server/internal/steering"
@@ -58,11 +59,8 @@ func runServer(o *runCmd) error {
 	if err != nil {
 		return err
 	}
-	eng, err := engine.New(dna)
-	if err != nil {
-		return err
-	}
-	log.Info("engine ready", "mode", o.Mode, "strategy", eng.DNA())
+	eng := engine.NewRegistry()
+	log.Info("engine registry ready", "mode", o.Mode)
 
 	// eval mode captures a per-market canary pool from live traffic.
 	var pool *canary.Pool
@@ -84,32 +82,30 @@ func runServer(o *runCmd) error {
 	ctrl := steering.New(eng, steering.Config{
 		Mode: o.Mode,
 		NFT: nftables.Config{
-			Table:    o.Table,
-			Port:     o.Port,
-			OutQueue: o.OutQueue,
-			InQueue:  o.InQueue,
-			Mark:     uint32(o.Mark),
-			NFTPath:  o.NFTPath,
-			Censor:   o.CensorCounters,
+			Table:     o.Table,
+			Port:      o.Port,
+			OutQueue:  o.OutQueue,
+			InQueue:   o.InQueue,
+			BypassUID: uint32(o.ReinjectBypassUID),
+			NFTPath:   o.NFTPath,
+			Censor:    o.CensorCounters,
 		},
 		EthtoolPath: o.EthtoolPath,
 		Iface:       o.Iface,
 		NoNFT:       o.NoNFT,
 
-		ObserveInbound: o.ObserveInbound,
+		ObserveInbound:            o.ObserveInbound,
+		StateFile:                 o.AdapterStateFile,
+		Connections:               flowtrack.Counter{},
+		MaxGenerations:            o.MaxGenerations,
+		MaxScopedGenerations:      o.MaxScopedGenerations,
+		MaxEveryPacketGenerations: o.MaxEveryPacketGenerations,
+		RuntimeVersion:            version,
+		Fatal: func(err error) {
+			log.Error("fatal steering integrity failure", "err", err)
+			stop()
+		},
 	}, slogLogger{l: log})
-	if err := ctrl.Start(ctx); err != nil {
-		return err
-	}
-	defer func() {
-		// Use a fresh context: the root one is already cancelled at shutdown.
-		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := ctrl.Close(rmCtx); err != nil {
-			log.Error("steering teardown failed", "err", err)
-		}
-	}()
-
 	// The inbound censor classifier runs in both modes: a prod box's IP gets
 	// burned the same way a test box's does, and the fleet-wide burn rate is
 	// what sizes the clean-IP budget for exploration.
@@ -133,15 +129,59 @@ func runServer(o *runCmd) error {
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
-		OutQueue: o.OutQueue,
-		InQueue:  o.InQueue,
-		Mark:     uint32(o.Mark),
-		Observer: observer,
-		Logger:   slogLogger{l: log},
+		OutQueue:         o.OutQueue,
+		InQueue:          o.InQueue,
+		MaxQueueLen:      o.QueueMaxLen,
+		Observer:         observer,
+		Logger:           slogLogger{l: log},
+		IntegrityFailure: ctrl.IntegrityFailure,
 	})
 	if err != nil {
 		return err
 	}
+	// Queue ownership and required kernel fail-open configuration must be
+	// acknowledged before any active steering can exist.
+	if err := rt.Open(); err != nil {
+		_ = rt.Close()
+		return err
+	}
+	if err := ctrl.Start(ctx, dna); err != nil {
+		startErr := err
+		var teardownErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			teardownErr = ctrl.Close(rmCtx)
+			cancel()
+			if teardownErr == nil {
+				return errors.Join(startErr, rt.Close())
+			}
+		}
+		// Do not explicitly release the queues while kernel steering might remain.
+		// The command is terminating, so process teardown becomes the last-resort
+		// fail-open boundary after reporting the unconfirmed cleanup.
+		return errors.Join(startErr, fmt.Errorf("startup steering cleanup could not be confirmed: %w", teardownErr))
+	}
+	// Queue descriptors stay owned until teardown has read back the absence of
+	// steering. On a failed removal, retry while the queues remain bound; never
+	// deliberately create a foreign-listener/no-listener window.
+	defer func() {
+		var teardownErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			teardownErr = ctrl.Close(rmCtx)
+			cancel()
+			if teardownErr == nil {
+				if err := rt.Close(); err != nil {
+					log.Error("NFQUEUE close failed", "err", err)
+				}
+				return
+			}
+			log.Error("steering teardown failed while queues remain bound", "attempt", attempt, "err", teardownErr)
+		}
+		// The process is already terminating. Leave the descriptors open until
+		// kernel process cleanup rather than releasing them ahead of live rules.
+		log.Error("unable to confirm steering removal; retaining NFQUEUE ownership until process exit", "err", teardownErr)
+	}()
 
 	// Profiling is opt-in and separate from the control surface: it is a
 	// benchmarking tool, and the control surface is unauthenticated on a box
@@ -191,6 +231,7 @@ func runServer(o *runCmd) error {
 					Modified:    s.Modified,
 					Reinjected:  s.Reinjected,
 					InjectFails: s.InjectFails,
+					Overruns:    s.Overruns,
 				}
 			},
 		}); err != nil {
@@ -214,6 +255,7 @@ func runServer(o *runCmd) error {
 		// or take it off the data path, so it has to go through the controller.
 		Apply:    ctrl.Apply,
 		Steering: func() any { return ctrl.State() },
+		Adapter:  ctrl,
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,

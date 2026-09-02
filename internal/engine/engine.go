@@ -235,6 +235,15 @@ func (e *Engine) Process(raw []byte, dir strategy.Direction, scratch *Scratch) (
 	return res, nil
 }
 
+// ProcessGeneration lets a single Engine satisfy nfqueue.Processor in tests
+// and legacy callers. A standalone Engine represents generation 1.
+func (e *Engine) ProcessGeneration(id uint32, raw []byte, dir strategy.Direction, scratch *Scratch) (Result, error) {
+	if id != 1 {
+		return Result{}, fmt.Errorf("%w: %d", ErrGenerationNotFound, id)
+	}
+	return e.Process(raw, dir, scratch)
+}
+
 // Scratch is one packet's worth of reusable working memory, owned by a single
 // goroutine. The NFQUEUE runtime keeps one per queue, since each queue's
 // callback is serialized on one goroutine.

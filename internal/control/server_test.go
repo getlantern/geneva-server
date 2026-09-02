@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,10 +11,55 @@ import (
 
 	"github.com/getlantern/geneva/strategy"
 
+	"github.com/getlantern/geneva-server/internal/adapter"
 	"github.com/getlantern/geneva-server/internal/canary"
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/engine"
 )
+
+type fakeAdapter struct {
+	prepared lifecycleRequest
+	active   uint32
+}
+
+type canceledAdapter struct {
+	fakeAdapter
+	saw error
+}
+
+func (a *canceledAdapter) PrepareDeployment(ctx context.Context, _ adapter.Deployment, _ string) error {
+	<-ctx.Done()
+	a.saw = ctx.Err()
+	return ctx.Err()
+}
+
+func (*fakeAdapter) Descriptor() adapter.Descriptor {
+	return adapter.Descriptor{ProtocolVersion: 1, Technique: "geneva", SupportedSchemaVersions: []uint32{1}, RuntimeVersion: "test-runtime", MaxArtifactBytes: 256 << 10, MaxLiveGenerations: 3}
+}
+func (*fakeAdapter) VerifyArtifact(_ context.Context, identity adapter.Identity, _ string) (adapter.VerifyResult, error) {
+	return adapter.VerifyResult{Identity: identity}, nil
+}
+func (f *fakeAdapter) PrepareDeployment(_ context.Context, deployment adapter.Deployment, dna string) error {
+	f.prepared = lifecycleRequest{Deployment: deployment, Artifact: dna}
+	return nil
+}
+func (f *fakeAdapter) ActivateDeployment(_ context.Context, deployment, _ adapter.Deployment) error {
+	f.active = deployment.Generation
+	return nil
+}
+func (*fakeAdapter) DeactivateDeployment(context.Context, adapter.Deployment) error { return nil }
+func (f *fakeAdapter) Status(context.Context) (any, error) {
+	return map[string]any{"version": 1, "active_new_generation": f.active}, nil
+}
+func (*fakeAdapter) DrainDeployment(_ context.Context, deployment adapter.Deployment) (adapter.DrainResult, error) {
+	return adapter.DrainResult{Deployment: deployment, Drained: true}, nil
+}
+func (*fakeAdapter) GarbageCollectKeep(context.Context, []adapter.Deployment) (adapter.GCResult, error) {
+	return adapter.GCResult{}, nil
+}
+func (*fakeAdapter) RollbackDeployment(context.Context, adapter.Deployment, adapter.Deployment) error {
+	return nil
+}
 
 func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Server {
 	t.Helper()
@@ -218,6 +264,123 @@ func TestHealthzReportsInboundTCP(t *testing.T) {
 	}
 	if got := body.InboundTCP.Events["undecodable"]; got != 0 {
 		t.Fatalf("undecodable = %d, want 0", got)
+	}
+}
+
+func TestVersionedAdapterPrepareAndActivate(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &fakeAdapter{}
+	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler())
+	t.Cleanup(srv.Close)
+	post := func(path, body string) *http.Response {
+		t.Helper()
+		resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	resp := post("/v1/adapter/prepare", `{"schema_version":1,"deployment":{"generation":42,"identity":{"technique":"geneva","revision":"r1","digest":"d"}},"artifact":"[TCP:flags:R]-drop-| \\/"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("prepare status = %d", resp.StatusCode)
+	}
+	if a.prepared.Deployment.Generation != 42 || a.prepared.Artifact != `[TCP:flags:R]-drop-| \/` {
+		t.Fatalf("prepared = %+v", a.prepared)
+	}
+	resp2 := post("/v1/adapter/activate-new", `{"deployment":{"generation":42,"identity":{"technique":"geneva","revision":"r1","digest":"d"}},"expected_active":{}}`)
+	defer resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK || a.active != 42 {
+		t.Fatalf("activate status=%d active=%d", resp2.StatusCode, a.active)
+	}
+}
+
+func TestAdapterDescriptorUsesExactNumericV1WireContract(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/adapter/descriptor", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("descriptor status = %d: %s", w.Code, w.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if raw["protocol_version"] != float64(1) {
+		t.Fatalf("protocol_version wire value = %#v", raw["protocol_version"])
+	}
+	versions, ok := raw["supported_schema_versions"].([]any)
+	if !ok || len(versions) != 1 || versions[0] != float64(1) {
+		t.Fatalf("supported_schema_versions wire value = %#v", raw["supported_schema_versions"])
+	}
+	for _, field := range []string{"max_artifact_bytes", "max_live_generations"} {
+		if _, ok := raw[field].(float64); !ok {
+			t.Fatalf("%s is not a JSON number: %#v", field, raw[field])
+		}
+	}
+}
+
+func TestVersionedAdapterRejectsSerializedRequestOver256KiB(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler())
+	t.Cleanup(srv.Close)
+	body := `{"schema_version":1,"deployment":{"generation":1},"artifact":"` + strings.Repeat("x", maxArtifact+1) + `"}`
+	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", resp.StatusCode)
+	}
+}
+
+func TestVersionedAdapterAcceptsFull256KiBArtifact(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &fakeAdapter{}
+	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler())
+	t.Cleanup(srv.Close)
+	body := `{"schema_version":1,"deployment":{"generation":1},"artifact":"` + strings.Repeat("x", maxArtifact) + `"}`
+	resp, err := http.Post(srv.URL+"/v1/adapter/prepare", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if len(a.prepared.Artifact) != maxArtifact {
+		t.Fatalf("artifact bytes = %d", len(a.prepared.Artifact))
+	}
+}
+
+func TestAdapterOperationUsesRequestCancellation(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &canceledAdapter{}
+	h := New(Providers{Mode: "eval", Engine: eng, Adapter: a}).Handler()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/adapter/prepare", strings.NewReader(`{"schema_version":1,"deployment":{"generation":1},"artifact":"x"}`)).WithContext(ctx)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if !errors.Is(a.saw, context.Canceled) {
+		t.Fatalf("adapter context error = %v", a.saw)
 	}
 }
 

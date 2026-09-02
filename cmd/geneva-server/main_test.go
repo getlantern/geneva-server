@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMarkFlagUnmarshalText(t *testing.T) {
 	tests := []struct {
@@ -41,21 +44,29 @@ func TestMarkFlagUnmarshalText(t *testing.T) {
 	}
 }
 
-// TestValidateRequiresNonZeroMark pins that the mark is required even with
-// --no-nft. The mark is what the reinjector stamps via SO_MARK, and with rules
-// managed externally it is the only thing that ruleset can use to tell a
-// reinjected packet from an original one — at zero, reinjected packets are
-// re-queued forever.
-func TestValidateRequiresNonZeroMark(t *testing.T) {
+// TestValidateAllowsDeprecatedMarkZero pins that the old high-bit loop guard
+// no longer participates in steering. Reinjection uses the packet's exact
+// routing mark and the dedicated adapter socket UID.
+func TestValidateAllowsDeprecatedMarkZero(t *testing.T) {
 	for _, noNFT := range []bool{false, true} {
-		o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, NoNFT: noNFT}
-		if err := o.validate(); err == nil {
-			t.Errorf("validate accepted --mark=0 with --no-nft=%v", noNFT)
+		o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, NoNFT: noNFT, ReinjectBypassUID: -1}
+		if noNFT {
+			o.ReinjectBypassUID = 65534
 		}
-		o.Mark = 0x67656e
 		if err := o.validate(); err != nil {
-			t.Errorf("validate rejected a valid config with --no-nft=%v: %v", noNFT, err)
+			t.Errorf("deprecated --mark affected validation with --no-nft=%v: %v", noNFT, err)
 		}
+	}
+}
+
+func TestNoNFTRequiresExplicitReinjectionUIDContract(t *testing.T) {
+	o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, NoNFT: true, ReinjectBypassUID: -1}
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "--reinject-bypass-uid") {
+		t.Fatalf("no-nft without reinjection UID contract error = %v", err)
+	}
+	o.ReinjectBypassUID = 4242
+	if err := o.validate(); err != nil {
+		t.Fatalf("explicit no-nft reinjection UID rejected: %v", err)
 	}
 }
 
@@ -80,5 +91,26 @@ func TestObserveInboundRefusedInProd(t *testing.T) {
 	}
 	if err := base("prod", false).validate(); err != nil {
 		t.Errorf("validate rejected prod without the flag: %v", err)
+	}
+}
+
+func TestValidateGenerationBudget(t *testing.T) {
+	for _, n := range []int{-1, 33} {
+		o := &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: n}
+		if err := o.validate(); err == nil {
+			t.Errorf("accepted max generations %d", n)
+		}
+	}
+	o := &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e}
+	if err := o.validate(); err != nil || o.MaxGenerations != 3 || o.MaxScopedGenerations != 3 || o.MaxEveryPacketGenerations != 1 {
+		t.Fatalf("default budgets = total %d scoped %d every %d, %v", o.MaxGenerations, o.MaxScopedGenerations, o.MaxEveryPacketGenerations, err)
+	}
+	o = &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: 1}
+	if err := o.validate(); err != nil || o.MaxScopedGenerations != 1 || o.MaxEveryPacketGenerations != 1 {
+		t.Fatalf("single-generation defaults = scoped %d every %d, %v", o.MaxScopedGenerations, o.MaxEveryPacketGenerations, err)
+	}
+	o = &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: 2, MaxScopedGenerations: 3}
+	if err := o.validate(); err == nil {
+		t.Fatal("accepted scoped budget above total")
 	}
 }

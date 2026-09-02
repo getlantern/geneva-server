@@ -18,7 +18,9 @@ import (
 	"strings"
 
 	"github.com/alexflint/go-arg"
+	"github.com/getlantern/geneva-server/internal/adapter"
 	"github.com/getlantern/geneva-server/internal/engine"
+	"github.com/getlantern/geneva-server/internal/generation"
 )
 
 var (
@@ -48,24 +50,31 @@ func (m *markFlag) UnmarshalText(b []byte) error {
 
 // runCmd holds the flags for the run subcommand.
 type runCmd struct {
-	Mode           string   `arg:"--mode" default:"prod" help:"operating mode: prod or eval"`
-	Strategy       string   `arg:"--strategy" help:"Geneva strategy DNA (prod: required unless --strategy-file)"`
-	StrategyFile   string   `arg:"--strategy-file" help:"path to a file containing the strategy DNA"`
-	Port           uint16   `arg:"--port,required" help:"proxy TCP port to steer"`
-	OutQueue       uint16   `arg:"--out-queue" default:"100" help:"NFQUEUE number for egress (outbound) packets"`
-	InQueue        uint16   `arg:"--in-queue" default:"101" help:"NFQUEUE number for ingress (inbound) packets"`
-	Mark           markFlag `arg:"--mark" default:"0x67656e" help:"firewall mark for reinjected packets (skips the queue); decimal or 0x hex"`
-	Table          string   `arg:"--table" default:"geneva_server" help:"dedicated nftables table name"`
-	ControlAddr    string   `arg:"--control-addr" default:"127.0.0.1:8092" help:"address for the control/health HTTP surface"`
-	Market         string   `arg:"--market" default:"unknown" help:"market label for the eval-mode canary pool"`
-	CanaryCapacity int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
-	NFTPath        string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
-	NoNFT          bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
-	CensorCounters bool     `arg:"--censor-counters" default:"true" help:"classify inbound packets with nftables counters, so the censor-reachability signal does not depend on steering inbound through userspace"`
-	ObserveInbound bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
-	Iface          string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
-	EthtoolPath    string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
-	PprofAddr      string   `arg:"--pprof-addr" help:"debug only: serve net/http/pprof on this address; never enable on a box carrying client traffic"`
+	Mode                      string   `arg:"--mode" default:"prod" help:"operating mode: prod or eval"`
+	Strategy                  string   `arg:"--strategy" help:"legacy opt-in initial Geneva DNA; normal production starts inactive and uses the v1 lifecycle"`
+	StrategyFile              string   `arg:"--strategy-file" help:"path to a file containing the strategy DNA"`
+	Port                      uint16   `arg:"--port,required" help:"proxy TCP port to steer"`
+	OutQueue                  uint16   `arg:"--out-queue" default:"100" help:"NFQUEUE number for egress (outbound) packets"`
+	InQueue                   uint16   `arg:"--in-queue" default:"101" help:"NFQUEUE number for ingress (inbound) packets"`
+	QueueMaxLen               uint32   `arg:"--queue-max-len" default:"65535" help:"maximum packets waiting in each NFQUEUE; overload is kernel fail-open"`
+	Mark                      markFlag `arg:"--mark" default:"0x67656e" help:"deprecated compatibility flag; reinjection now preserves the packet's exact routing mark"`
+	ReinjectBypassUID         int64    `arg:"--reinject-bypass-uid" default:"-1" help:"dedicated Geneva socket UID excluded before output queueing; required explicitly with --no-nft"`
+	GenerationMarkNamespace   markFlag `arg:"--generation-mark-namespace" default:"0x67000000" help:"must acknowledge the fleet-reserved Geneva conntrack namespace 0x67000000/0xfffff000"`
+	Table                     string   `arg:"--table" default:"geneva_server" help:"dedicated nftables table name"`
+	ControlAddr               string   `arg:"--control-addr" default:"127.0.0.1:8092" help:"address for the control/health HTTP surface"`
+	Market                    string   `arg:"--market" default:"unknown" help:"market label for the eval-mode canary pool"`
+	CanaryCapacity            int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
+	NFTPath                   string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
+	NoNFT                     bool     `arg:"--no-nft" help:"do not program nftables rules (rules managed externally)"`
+	CensorCounters            bool     `arg:"--censor-counters" default:"true" help:"classify inbound packets with nftables counters, so the censor-reachability signal does not depend on steering inbound through userspace"`
+	ObserveInbound            bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
+	Iface                     string   `arg:"--iface" help:"steered interface; NIC offloads are disabled on it so NFQUEUE yields MTU-sized, checksummed packets (strongly recommended)"`
+	EthtoolPath               string   `arg:"--ethtool" default:"ethtool" help:"path to the ethtool binary (used with --iface)"`
+	PprofAddr                 string   `arg:"--pprof-addr" help:"debug only: serve net/http/pprof on this address; never enable on a box carrying client traffic"`
+	AdapterStateFile          string   `arg:"--adapter-state-file" default:"/var/lib/geneva-server/adapter-state.json" help:"durable local state for reconstructing live connection generations after restart"`
+	MaxGenerations            int      `arg:"--max-generations" default:"3" help:"maximum prepared/live immutable engine generations"`
+	MaxScopedGenerations      int      `arg:"--max-scoped-generations" help:"maximum handshake-scoped generations within the total generation budget (default: min(3, total))"`
+	MaxEveryPacketGenerations int      `arg:"--max-every-packet-generations" help:"maximum every-packet generations within the total generation budget (default: min(1, total))"`
 }
 
 // validateCmd holds the flags for the validate subcommand.
@@ -141,8 +150,8 @@ func validateCommand(v *validateCmd) error {
 	return nil
 }
 
-// resolveStrategy returns the DNA from --strategy or --strategy-file. In prod
-// mode a strategy is required; eval may start empty (pass-through until assigned).
+// resolveStrategy returns the legacy opt-in initial DNA. Normal production
+// starts inactive and is activated only by durable versioned adapter intent.
 func (o *runCmd) resolveStrategy() (string, error) {
 	if o.Strategy != "" && o.StrategyFile != "" {
 		return "", fmt.Errorf("--strategy and --strategy-file are mutually exclusive")
@@ -155,13 +164,6 @@ func (o *runCmd) resolveStrategy() (string, error) {
 		}
 		// Tolerate a trailing newline in an operator-managed file.
 		dna = strings.TrimSpace(string(b))
-	}
-	// Checked against the resolved DNA, not against the flags: an empty
-	// strategy file passed --strategy-file used to satisfy the flag check and
-	// boot prod in pass-through. That now also means no steering at all, so a
-	// truncated file would take a prod box off the data path silently.
-	if dna == "" && o.Mode == "prod" {
-		return "", fmt.Errorf("prod mode requires a non-empty strategy (--strategy or --strategy-file)")
 	}
 	return dna, nil
 }
@@ -195,16 +197,41 @@ func (o *runCmd) validate() error {
 	if o.OutQueue == o.InQueue {
 		return fmt.Errorf("--out-queue and --in-queue must differ")
 	}
-	if o.Mark == 0 {
-		// Required whether or not this process programs the rules. With internal
-		// rules, a zero mark makes the "accept marked packets" rule match every
-		// unmarked packet (mark defaults to 0), so the proxy's traffic is
-		// accepted before the queue rule and nothing is ever steered. With
-		// --no-nft the mark is still what the reinjector stamps via SO_MARK, and
-		// it is the only thing an externally managed ruleset can use to tell a
-		// reinjected packet from an original one — a zero mark there means
-		// reinjected packets are re-queued forever.
-		return fmt.Errorf("--mark must be non-zero")
+	if o.QueueMaxLen == 0 {
+		o.QueueMaxLen = 65535
+	}
+	if o.ReinjectBypassUID < -1 || o.ReinjectBypassUID > int64(^uint32(0)) {
+		return fmt.Errorf("--reinject-bypass-uid must fit an unsigned 32-bit UID")
+	}
+	if o.NoNFT && o.ReinjectBypassUID == -1 {
+		return fmt.Errorf("--no-nft requires explicit --reinject-bypass-uid and external pre-queue meta-skuid exclusion")
+	}
+	if o.ReinjectBypassUID == -1 {
+		o.ReinjectBypassUID = int64(os.Geteuid())
+	}
+	if o.GenerationMarkNamespace == 0 {
+		o.GenerationMarkNamespace = markFlag(generation.Namespace)
+	}
+	if uint32(o.GenerationMarkNamespace) != generation.Namespace {
+		return fmt.Errorf("--generation-mark-namespace must equal the reserved Geneva namespace %#x (mask %#x)", generation.Namespace, generation.Mask)
+	}
+	if o.MaxGenerations == 0 {
+		o.MaxGenerations = 3
+	}
+	if o.MaxGenerations < 1 || o.MaxGenerations > adapter.MaxGenerations {
+		return fmt.Errorf("--max-generations must be between 1 and %d", adapter.MaxGenerations)
+	}
+	if o.MaxScopedGenerations == 0 {
+		o.MaxScopedGenerations = min(3, o.MaxGenerations)
+	}
+	if o.MaxScopedGenerations < 1 || o.MaxScopedGenerations > o.MaxGenerations {
+		return fmt.Errorf("--max-scoped-generations must be between 1 and --max-generations")
+	}
+	if o.MaxEveryPacketGenerations == 0 {
+		o.MaxEveryPacketGenerations = min(1, o.MaxGenerations)
+	}
+	if o.MaxEveryPacketGenerations < 1 || o.MaxEveryPacketGenerations > o.MaxGenerations {
+		return fmt.Errorf("--max-every-packet-generations must be between 1 and --max-generations")
 	}
 	return nil
 }

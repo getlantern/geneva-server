@@ -94,17 +94,15 @@ got=$("${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8092/strateg
   && pass "service still serves after the in-place swap" \
   || fail "service broke after strategy swap"
 
-step "3. An empty strategy takes the box off the data path entirely"
+step "3. Deactivation stops new assignments without resetting existing flows"
 "${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS -X PUT --data-binary "" http://server:8092/strategy' >/dev/null \
   && pass "PUT of an empty strategy accepted" \
   || fail "PUT of an empty strategy rejected"
-if "${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server >/dev/null 2>&1; then
-  fail "steering table still present with a strategy that can match nothing"
-else
-  pass "steering table removed: no packet takes the round trip"
-fi
-steering=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq -r .steering.steering)
-[[ "$steering" == "false" ]] && pass "health surface reports steering=false" || fail "health surface reports steering=$steering"
+active=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/v1/adapter/status | jq '.active_new_generation // 0')
+[[ "$active" -eq 0 ]] && pass "new SYN assignment is deactivated" || fail "active generation remains $active"
+"${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server >/dev/null 2>&1 \
+  && pass "draining generation rules remain installed" \
+  || fail "deactivation removed rules needed by existing flows"
 "${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8080/healthz' >/dev/null \
   && pass "service still serves with the sidecar idle" \
   || fail "service broke after the strategy was withdrawn"

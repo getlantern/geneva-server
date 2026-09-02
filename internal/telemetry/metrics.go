@@ -26,6 +26,7 @@ type Verdicts struct {
 	Modified    uint64
 	Reinjected  uint64
 	InjectFails uint64
+	Overruns    uint64
 }
 
 // Providers supplies the live objects the instruments read on each collection.
@@ -37,7 +38,7 @@ type Providers struct {
 	// series.
 	Market string
 	// Engine is required.
-	Engine *engine.Engine
+	Engine interface{ Snapshot() engine.Snapshot }
 	// Censor is where the inbound TCP counts come from — the kernel's
 	// classification counters on a box that has them, the userspace classifier
 	// otherwise. Nil disables the censor metric.
@@ -173,6 +174,12 @@ func Register(p Providers) error {
 	if err != nil {
 		return err
 	}
+	deliveryOverruns, err := meter.Int64ObservableCounter("geneva.runtime.delivery_overruns",
+		metric.WithUnit("{event}"),
+		metric.WithDescription("NFQUEUE userspace-delivery ENOBUFS events; packet outcomes are unknown"))
+	if err != nil {
+		return err
+	}
 	inboundTCP, err := meter.Int64ObservableCounter(semconv.GenevaMetricInboundTCP,
 		metric.WithUnit("{packet}"),
 		metric.WithDescription("inbound TCP packets on the steered port, by flags and payload"))
@@ -182,7 +189,7 @@ func Register(p Providers) error {
 
 	instruments := []metric.Observable{
 		packetsIn, packetsOut, bytesIn, bytesOut, outcomeCounter, errorCounter,
-		packetOverhead, byteOverhead, swaps, uptime, verdictCounter, reinjections,
+		packetOverhead, byteOverhead, swaps, uptime, verdictCounter, reinjections, deliveryOverruns,
 		inboundTCP,
 	}
 
@@ -213,6 +220,7 @@ func Register(p Providers) error {
 			}
 			o.ObserveInt64(reinjections, int64(v.Reinjected), reinjectOK)
 			o.ObserveInt64(reinjections, int64(v.InjectFails), reinjectFailed)
+			o.ObserveInt64(deliveryOverruns, int64(v.Overruns), baseSet)
 		}
 
 		if p.Censor != nil {

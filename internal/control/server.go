@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/getlantern/geneva-server/internal/adapter"
 	"github.com/getlantern/geneva-server/internal/canary"
 	"github.com/getlantern/geneva-server/internal/engine"
 )
@@ -34,7 +35,10 @@ type Providers struct {
 	Mode    string
 	Version string
 	Commit  string
-	Engine  *engine.Engine
+	Engine  interface {
+		DNA() string
+		Snapshot() engine.Snapshot
+	}
 	// Canary is the eval-mode capture pool; nil in prod mode.
 	Canary *canary.Pool
 	// Verdicts returns the runtime's verdict counters (JSON-marshalable). It may
@@ -53,6 +57,21 @@ type Providers struct {
 	// Steering returns what the box is currently steering (JSON-marshalable).
 	// It may be nil.
 	Steering func() any
+	Adapter  Adapter
+}
+
+// Adapter is the versioned local Geneva lifecycle. It deliberately contains no
+// cloud or transport types; the generic overlay agent can drive it over loopback.
+type Adapter interface {
+	Descriptor() adapter.Descriptor
+	VerifyArtifact(context.Context, adapter.Identity, string) (adapter.VerifyResult, error)
+	PrepareDeployment(context.Context, adapter.Deployment, string) error
+	ActivateDeployment(context.Context, adapter.Deployment, adapter.Deployment) error
+	DeactivateDeployment(context.Context, adapter.Deployment) error
+	Status(context.Context) (any, error)
+	DrainDeployment(context.Context, adapter.Deployment) (adapter.DrainResult, error)
+	GarbageCollectKeep(context.Context, []adapter.Deployment) (adapter.GCResult, error)
+	RollbackDeployment(context.Context, adapter.Deployment, adapter.Deployment) error
 }
 
 // Server is the HTTP control surface.
@@ -72,6 +91,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/strategy", s.handleStrategy)
 	mux.HandleFunc("/canary", s.handleCanary)
+	mux.HandleFunc("/v1/adapter/prepare", s.handlePrepare)
+	mux.HandleFunc("/v1/adapter/descriptor", s.handleDescriptor)
+	mux.HandleFunc("/v1/adapter/verify", s.handleVerify)
+	mux.HandleFunc("/v1/adapter/activate-new", s.handleActivateNew)
+	mux.HandleFunc("/v1/adapter/deactivate-new", s.handleDeactivateNew)
+	mux.HandleFunc("/v1/adapter/status", s.handleAdapterStatus)
+	mux.HandleFunc("/v1/adapter/drain", s.handleDrain)
+	mux.HandleFunc("/v1/adapter/gc", s.handleGC)
+	mux.HandleFunc("/v1/adapter/rollback", s.handleRollback)
 	return mux
 }
 
@@ -119,8 +147,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).
-// PUT validates the DNA before installing it, and the swap is atomic, so the new
-// strategy applies to the next packet with no restart. This works in both modes.
+// PUT validates the DNA before preparing and activating a new generation. New
+// connections use it without a restart; existing connections retain their
+// immutable generation. This works in both modes.
 //
 // The swap is not strategy-content-only: steering is scoped to what the strategy
 // can match, so installing one can widen, narrow, or remove the kernel's rules
@@ -152,7 +181,9 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 		// Tolerate a trailing newline or surrounding whitespace (common when the
 		// body is piped from a file), which would otherwise fail validation.
 		dna := strings.TrimSpace(string(body))
-		if err := s.p.Apply(r.Context(), dna); err != nil {
+		ctx, cancel := operationContext(r)
+		defer cancel()
+		if err := s.p.Apply(ctx, dna); err != nil {
 			// Only a strategy the client got wrong is the client's fault. A
 			// failure to program the kernel for a valid one is ours, and a 400
 			// there would send the caller off fixing a DNA that is fine.
@@ -167,6 +198,223 @@ func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+const (
+	maxArtifact = 256 << 10
+	// JSON escaping can expand one artifact byte to six serialized bytes. The
+	// artifact itself, not its transport envelope, is the protocol limit.
+	maxArtifactRequest = 6*maxArtifact + 4096
+)
+
+type lifecycleRequest struct {
+	Deployment     adapter.Deployment   `json:"deployment"`
+	ExpectedActive adapter.Deployment   `json:"expected_active"`
+	Artifact       string               `json:"artifact,omitempty"`
+	SchemaVersion  uint32               `json:"schema_version,omitempty"`
+	Keep           []adapter.Deployment `json:"keep,omitempty"`
+}
+
+func operationContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
+}
+
+func (s *Server) adapter(w http.ResponseWriter) Adapter {
+	if s.p.Adapter == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter lifecycle is not wired up")
+	}
+	return s.p.Adapter
+}
+
+func decodeLifecycleRequest(w http.ResponseWriter, r *http.Request) (lifecycleRequest, bool) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return lifecycleRequest{}, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRequest)
+	var req lifecycleRequest
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		err = json.Unmarshal(body, &req)
+	}
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "serialized adapter request exceeds its bounded envelope")
+		} else {
+			writeError(w, http.StatusBadRequest, "decode request: "+err.Error())
+		}
+		return lifecycleRequest{}, false
+	}
+	if len([]byte(req.Artifact)) > maxArtifact {
+		writeError(w, http.StatusRequestEntityTooLarge, "artifact exceeds 256 KiB")
+		return lifecycleRequest{}, false
+	}
+	return req, true
+}
+
+func lifecycleResult(w http.ResponseWriter, err error) {
+	if err == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	code := http.StatusConflict
+	if errors.Is(err, engine.ErrInvalidStrategy) {
+		code = http.StatusBadRequest
+	}
+	writeError(w, code, err.Error())
+}
+
+func (s *Server) handlePrepare(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	if req.SchemaVersion != adapter.SchemaVersionV1 || req.Deployment.Generation == 0 {
+		writeError(w, http.StatusBadRequest, "schema_version=1 and deployment.generation are required")
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.PrepareDeployment(ctx, req.Deployment, req.Artifact))
+}
+
+func (s *Server) handleDescriptor(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.Descriptor())
+}
+
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	if req.SchemaVersion != adapter.SchemaVersionV1 {
+		writeError(w, http.StatusBadRequest, "unsupported schema_version")
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	result, err := a.VerifyArtifact(ctx, req.Deployment.Identity, req.Artifact)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleActivateNew(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.ActivateDeployment(ctx, req.Deployment, req.ExpectedActive))
+}
+
+func (s *Server) handleDeactivateNew(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.DeactivateDeployment(ctx, req.ExpectedActive))
+}
+
+func (s *Server) handleAdapterStatus(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	status, err := a.Status(ctx)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	result, err := a.DrainDeployment(ctx, req.Deployment)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	result, err := a.GarbageCollectKeep(ctx, req.Keep)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	req, ok := decodeLifecycleRequest(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.RollbackDeployment(ctx, req.Deployment, req.ExpectedActive))
 }
 
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {

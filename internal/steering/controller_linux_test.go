@@ -77,7 +77,7 @@ func TestStartClearsStaleTableWhenIdle(t *testing.T) {
 
 	// Leave a table behind, exactly as a killed sidecar would.
 	stale := nftables.New(nftables.Config{
-		Table: table, Port: 18081, OutQueue: 300, InQueue: 301, Mark: 0x67656e,
+		Table: table, Port: 18081, OutQueue: 300, InQueue: 301,
 		Outbound: nftables.Selector{Any: true}, Inbound: nftables.Selector{Any: true},
 	})
 	if err := stale.Install(ctx); err != nil {
@@ -89,12 +89,9 @@ func TestStartClearsStaleTableWhenIdle(t *testing.T) {
 	}
 
 	// Start with no strategy. Iface is empty so the NIC is left alone.
-	eng, err := engine.New("")
-	if err != nil {
-		t.Fatalf("engine.New: %v", err)
-	}
-	ctrl := New(eng, Config{Mode: "eval", NFT: nftables.Config{Table: table, Port: 18081, OutQueue: 300, InQueue: 301, Mark: 0x67656e}}, nil)
-	if err := ctrl.Start(ctx); err != nil {
+	eng := engine.NewRegistry()
+	ctrl := New(eng, Config{Mode: "eval", NFT: nftables.Config{Table: table, Port: 18081, OutQueue: 300, InQueue: 301}}, nil)
+	if err := ctrl.Start(ctx, ""); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if testutil.TableExists(t, table) {

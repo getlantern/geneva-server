@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/getlantern/geneva-server/internal/generation"
 	"github.com/getlantern/geneva-server/internal/testutil"
 )
 
@@ -16,7 +17,7 @@ var anySel = Selector{Any: true}
 
 func TestRulesetScoping(t *testing.T) {
 	m := New(Config{
-		Table: "geneva_test", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		Table: "geneva_test", Port: 8080, OutQueue: 100, InQueue: 101,
 		Outbound: anySel, Inbound: anySel,
 	})
 	rs := m.Ruleset()
@@ -25,10 +26,10 @@ func TestRulesetScoping(t *testing.T) {
 	// direction — nothing else may be diverted into the queues.
 	wants := []string{
 		"table inet geneva_test {",
-		"meta nfproto ipv4 meta l4proto tcp tcp sport 8080 queue num 100 bypass", // egress
-		"meta nfproto ipv4 meta l4proto tcp tcp dport 8080 queue num 101 bypass", // ingress
-		"meta mark 0x67656e accept", // reinjection loop guard
-		"policy accept;",            // fail-open chain policy
+		"tcp sport 8080 ct mark & 0xfffff000 == 0x67001000 queue num 100 bypass", // egress
+		"tcp dport 8080 ct mark & 0xfffff000 == 0x67001000 queue num 101 bypass", // ingress
+		"meta skuid 0 accept", // dedicated reinjection socket owner bypass
+		"policy accept;",      // fail-open chain policy
 	}
 	for _, w := range wants {
 		if !strings.Contains(rs, w) {
@@ -62,7 +63,7 @@ func TestInstallRemoveLifecycle(t *testing.T) {
 	}
 	ctx := context.Background()
 	m := New(Config{
-		Table: "geneva_lifecycle_test", Port: 18080, OutQueue: 200, InQueue: 201, Mark: 0x67656e,
+		Table: "geneva_lifecycle_test", Port: 18080, OutQueue: 200, InQueue: 201,
 		Outbound: anySel, Inbound: anySel,
 	})
 	t.Cleanup(func() { _ = m.Remove(ctx) })
@@ -95,7 +96,7 @@ func TestInstallRemoveLifecycle(t *testing.T) {
 // trip for every one of them, which measured as a 76% throughput loss on a
 // 1-vCPU box.
 func TestIdleSelectorsProgramNothing(t *testing.T) {
-	m := New(Config{Table: "geneva_idle", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e})
+	m := New(Config{Table: "geneva_idle", Port: 8080, OutQueue: 100, InQueue: 101})
 	if !m.Idle() {
 		t.Error("manager with no selectors is not idle")
 	}
@@ -108,7 +109,7 @@ func TestIdleSelectorsProgramNothing(t *testing.T) {
 // triggers on handshake packets must leave bulk data in the kernel.
 func TestRulesetFlagScoping(t *testing.T) {
 	m := New(Config{
-		Table: "geneva_flags", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		Table: "geneva_flags", Port: 8080, OutQueue: 100, InQueue: 101,
 		// Exact SYN (the common handshake trigger) plus a wildcard RST.
 		Outbound: Selector{Flags: []FlagMatch{{Mask: 0xff, Value: 0x02}}},
 		Inbound:  Selector{Flags: []FlagMatch{{Mask: 0x04, Value: 0x04}}},
@@ -116,8 +117,8 @@ func TestRulesetFlagScoping(t *testing.T) {
 	rs := m.Ruleset()
 
 	wants := []string{
-		"tcp sport 8080 tcp flags & 0xff == syn queue num 100 bypass",
-		"tcp dport 8080 tcp flags & rst == rst queue num 101 bypass",
+		"tcp sport 8080 ct mark & 0xfffff000 == 0x67001000 tcp flags & 0xff == syn queue num 100 bypass",
+		"tcp dport 8080 ct mark & 0xfffff000 == 0x67001000 tcp flags & rst == rst queue num 101 bypass",
 	}
 	for _, w := range wants {
 		if !strings.Contains(rs, w) {
@@ -139,7 +140,7 @@ func TestRulesetFlagScoping(t *testing.T) {
 // match — a wildcard multi-flag trigger like SA* would silently mis-scope.
 func TestRulesetMultiFlagParenthesized(t *testing.T) {
 	m := New(Config{
-		Table: "geneva_multi", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		Table: "geneva_multi", Port: 8080, OutQueue: 100, InQueue: 101,
 		// A wildcard SYN+ACK trigger and an exact PSH+ACK one.
 		Outbound: Selector{Flags: []FlagMatch{{Mask: 0x12, Value: 0x12}}},
 		Inbound:  Selector{Flags: []FlagMatch{{Mask: 0xff, Value: 0x18}}},
@@ -161,14 +162,95 @@ func TestRulesetMultiFlagParenthesized(t *testing.T) {
 // queue rule.
 func TestRulesetOneDirection(t *testing.T) {
 	m := New(Config{
-		Table: "geneva_one", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		Table: "geneva_one", Port: 8080, OutQueue: 100, InQueue: 101,
 		Outbound: Selector{Any: true},
 	})
 	rs := m.Ruleset()
-	if strings.Contains(rs, "dport") {
-		t.Errorf("inbound queue rule emitted for an outbound-only strategy:\n%s", rs)
+	for _, line := range strings.Split(rs, "\n") {
+		if strings.Contains(line, "dport") && strings.Contains(line, "queue num") {
+			t.Errorf("inbound queue rule emitted for an outbound-only strategy:\n%s", rs)
+		}
 	}
 	if !strings.Contains(rs, "sport 8080") {
 		t.Errorf("outbound queue rule missing:\n%s", rs)
+	}
+}
+
+func TestGenerationAffinityRules(t *testing.T) {
+	m := New(Config{
+		Table: "geneva_generations", Port: 8080, OutQueue: 100, InQueue: 101,
+		ActiveGeneration: 9,
+		Generations: []Generation{
+			{ID: 8, Outbound: Selector{Any: true}},
+			{ID: 9, Inbound: Selector{Any: true}},
+		},
+	})
+	rs := m.Ruleset()
+	wants := []string{
+		// Preserve the low 12 bits owned by unrelated mark users.
+		"ct mark set (ct mark & 0xfff) | 0x67009000",
+		// Only original inbound SYNs get the current generation.
+		"ct state new tcp flags & (syn|ack) == syn",
+		// Both directions select an engine from the same conntrack field.
+		"ct mark & 0xfffff000 == 0x67008000",
+		"ct mark & 0xfffff000 == 0x67009000",
+		"ct mark & 0xfffff000 == 0x67009000",
+	}
+	for _, want := range wants {
+		if !strings.Contains(rs, want) {
+			t.Errorf("ruleset missing %q\n---\n%s", want, rs)
+		}
+	}
+	for _, line := range strings.Split(rs, "\n") {
+		if strings.Contains(line, "queue num") && !strings.Contains(line, "ct mark & 0xfffff000 == 0x67") {
+			t.Errorf("queue rule can capture an unmarked pre-existing flow: %s", line)
+		}
+	}
+}
+
+func TestQueueDispatchNeverMutatesPacketMark(t *testing.T) {
+	rs := New(Config{Port: 443, OutQueue: 100, InQueue: 101, ActiveGeneration: 2, Generations: []Generation{{ID: 2, Outbound: anySel, Inbound: anySel}}}).Ruleset()
+	if strings.Contains(rs, "meta mark set") || strings.Contains(rs, "output_cleanup") || strings.Contains(rs, "input_cleanup") {
+		t.Fatalf("NFQUEUE dispatch mutates or cleans skb marks instead of using CTA_MARK metadata:\n%s", rs)
+	}
+}
+
+func TestGenerationMarksPreserveLanternPacketRoutingBits(t *testing.T) {
+	m := New(Config{Port: 443, OutQueue: 100, InQueue: 101, ActiveGeneration: 2, Generations: []Generation{{ID: 2, Outbound: anySel, Inbound: anySel}}})
+	rs := m.Ruleset()
+	if !strings.Contains(rs, "ct mark set (ct mark & 0xfff) | 0x67002000") {
+		t.Fatalf("conntrack assignment does not preserve 0x438/phost bits:\n%s", rs)
+	}
+	if strings.Contains(rs, "meta mark set") {
+		t.Fatalf("packet dispatch mutates exact routing marks:\n%s", rs)
+	}
+	generationMark, err := generation.Mark(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, existing := range []uint32{0x438, 1088, 745, 746} {
+		if got := existing & ^uint32(0xfffff000); got != existing {
+			t.Errorf("routing mark %#x not outside reservation", existing)
+		}
+		assigned := (existing & ^generation.Mask) | generationMark
+		if got := assigned & ^generation.Mask; got != existing {
+			t.Errorf("conntrack assignment changed routing mark %#x to %#x", existing, got)
+		}
+	}
+}
+
+func TestTransactionFingerprintCoversAssignmentAndScope(t *testing.T) {
+	base := Config{Port: 443, OutQueue: 100, InQueue: 101, ActiveGeneration: 1, Generations: []Generation{{ID: 1, Outbound: anySel}}}
+	a := New(base)
+	bCfg := base
+	bCfg.ActiveGeneration = 2
+	bCfg.Generations = append([]Generation(nil), base.Generations...)
+	bCfg.Generations = append(bCfg.Generations, Generation{ID: 2, Inbound: anySel})
+	b := New(bCfg)
+	if a.revisionChain() == b.revisionChain() {
+		t.Fatal("different atomic steering transactions share a readback fingerprint")
+	}
+	if !strings.Contains(a.Ruleset(), "chain "+a.revisionChain()+" {}") {
+		t.Fatalf("ruleset lacks its readback fingerprint:\n%s", a.Ruleset())
 	}
 }

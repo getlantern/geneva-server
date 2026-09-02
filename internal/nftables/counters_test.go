@@ -42,7 +42,7 @@ func TestParseCountersRejectsGarbage(t *testing.T) {
 // every rule returns so a packet lands in exactly one bucket.
 func TestCensorRulesetShape(t *testing.T) {
 	m := New(Config{
-		Table: "geneva_censor", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e,
+		Table: "geneva_censor", Port: 8080, OutQueue: 100, InQueue: 101,
 		Outbound: Selector{Flags: []FlagMatch{{Mask: 0xff, Value: 0x02}}},
 		Censor:   true,
 	})
@@ -90,7 +90,7 @@ func TestCensorRulesetShape(t *testing.T) {
 // table that exists for steering and never keeps one alive on its own — a box
 // with no strategy has nothing of ours in the kernel.
 func TestCensorCountersNeverKeepATableAlive(t *testing.T) {
-	m := New(Config{Table: "geneva_idle_censor", Port: 8080, OutQueue: 100, InQueue: 101, Mark: 0x67656e, Censor: true})
+	m := New(Config{Table: "geneva_idle_censor", Port: 8080, OutQueue: 100, InQueue: 101, Censor: true})
 	if !m.Idle() {
 		t.Error("a censor-only manager is not idle")
 	}

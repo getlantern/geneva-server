@@ -1,0 +1,775 @@
+//go:build linux
+
+package steering
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/getlantern/geneva/strategy"
+
+	"github.com/getlantern/geneva-server/internal/adapter"
+	"github.com/getlantern/geneva-server/internal/engine"
+	"github.com/getlantern/geneva-server/internal/generation"
+	"github.com/getlantern/geneva-server/internal/netdev"
+	"github.com/getlantern/geneva-server/internal/nftables"
+	"github.com/getlantern/geneva-server/internal/testutil"
+)
+
+const (
+	genOneDNA      = `[TCP:flags:S]-drop-| \/`
+	genTwoDNA      = `[TCP:flags:S]-duplicate-| \/`
+	everyPacketDNA = `[TCP:load:GET]-duplicate-| \/`
+)
+
+type fakeConnections struct {
+	counts      map[uint32]int
+	namespace   int
+	gotID       uint32
+	gotPort     uint16
+	neutralized int
+}
+
+func (f *fakeConnections) Count(_ context.Context, id uint32, port uint16) (int, error) {
+	f.gotID, f.gotPort = id, port
+	return f.counts[id], nil
+}
+func (f *fakeConnections) Counts(context.Context, uint16) (map[uint32]int, error) {
+	counts := make(map[uint32]int, len(f.counts)+1)
+	for id, count := range f.counts {
+		counts[id] = count
+	}
+	if f.namespace != 0 {
+		counts[99] = f.namespace
+	}
+	return counts, nil
+}
+func (f *fakeConnections) Neutralize(context.Context, uint16) (int, error) {
+	f.neutralized++
+	return f.neutralized, nil
+}
+
+type blockingConnections struct{}
+
+func (blockingConnections) Count(context.Context, uint32, uint16) (int, error) { return 0, nil }
+func (blockingConnections) Counts(ctx context.Context, _ uint16) (map[uint32]int, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (blockingConnections) Neutralize(ctx context.Context, _ uint16) (int, error) {
+	<-ctx.Done()
+	return 0, ctx.Err()
+}
+
+type wedgedConnections struct{}
+
+func (wedgedConnections) Count(context.Context, uint32, uint16) (int, error) { select {} }
+func (wedgedConnections) Counts(context.Context, uint16) (map[uint32]int, error) {
+	select {}
+}
+func (wedgedConnections) Neutralize(context.Context, uint16) (int, error) { select {} }
+
+type orderingConnections struct{ events chan<- string }
+
+func (orderingConnections) Count(context.Context, uint32, uint16) (int, error) { return 0, nil }
+func (c orderingConnections) Counts(context.Context, uint16) (map[uint32]int, error) {
+	c.events <- "conntrack audit"
+	return map[uint32]int{}, nil
+}
+func (orderingConnections) Neutralize(context.Context, uint16) (int, error) { return 0, nil }
+
+func TestResourceClassOnlyTreatsEstablishmentAsScoped(t *testing.T) {
+	exact := func(value uint8) nftables.Selector {
+		return nftables.Selector{Flags: []nftables.FlagMatch{{Mask: 0xff, Value: value}}}
+	}
+	cases := []struct {
+		name  string
+		scope Scope
+		want  string
+	}{
+		{"SYN only", Scope{Outbound: exact(0x02)}, resourceHandshake},
+		{"SYN ACK", Scope{Inbound: exact(0x12)}, resourceHandshake},
+		{"ACK", Scope{Outbound: exact(0x10)}, resourceEvery},
+		{"PSH ACK", Scope{Outbound: exact(0x18)}, resourceEvery},
+		{"mixed", Scope{Outbound: nftables.Selector{Flags: []nftables.FlagMatch{{Mask: 0xff, Value: 0x02}, {Mask: 0xff, Value: 0x10}}}}, resourceEvery},
+		{"absent flags constraint", Scope{Outbound: nftables.Selector{Any: true}}, resourceEvery},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resourceClass(tc.scope); got != tc.want {
+				t.Fatalf("resource class = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestActivationStagesUnionBeforeFlippingNewSYNs(t *testing.T) {
+	ctx := context.Background()
+	reg := engine.NewRegistry()
+	var calls []nftables.Config
+	var verifies []bool
+	c := New(reg, Config{Mode: "prod", NFT: nftables.Config{Port: 443}, Program: func(_ context.Context, cfg nftables.Config, verify bool) error {
+		calls, verifies = append(calls, cfg), append(verifies, verify)
+		return nil
+	}}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	calls, verifies = nil, nil
+	if err := c.ActivateNew(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("program calls = %d, want 2", len(calls))
+	}
+	if !verifies[0] || verifies[1] {
+		t.Fatalf("verify sequence = %v, want [true false]", verifies)
+	}
+	for i, cfg := range calls {
+		if len(cfg.Generations) != 2 {
+			t.Fatalf("call %d live generations = %d", i, len(cfg.Generations))
+		}
+	}
+	if calls[0].ActiveGeneration != 1 {
+		t.Fatalf("staging assigned %d, want old 1", calls[0].ActiveGeneration)
+	}
+	if calls[1].ActiveGeneration != 2 {
+		t.Fatalf("flip assigned %d, want new 2", calls[1].ActiveGeneration)
+	}
+	// The candidate engine was live before either transaction could reference it.
+	raw := testutil.BuildTCP(t, 443, testutil.TCPFlags{SYN: true}, nil)
+	if _, err := reg.ProcessGeneration(2, raw, strategy.DirectionOutbound, nil); err != nil {
+		t.Fatalf("candidate engine absent: %v", err)
+	}
+}
+
+func TestFirstActivationNeutralizesExactBoundaryBeforeAssignment(t *testing.T) {
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	var calls []nftables.Config
+	c := New(engine.NewRegistry(), Config{NFT: nftables.Config{Port: 443}, Connections: flows, Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+		calls = append(calls, cfg)
+		return nil
+	}}, nil)
+	if err := c.Start(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	if err := c.ActivateNew(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 || !calls[0].NeutralizeNew || calls[0].ActiveGeneration != 0 || calls[1].NeutralizeNew || calls[1].ActiveGeneration != 1 {
+		t.Fatalf("activation boundary calls = %+v", calls)
+	}
+	if flows.neutralized != 1 {
+		t.Fatalf("neutralization sweeps = %d", flows.neutralized)
+	}
+}
+
+func TestDrainScopesCountAndGuardsReuse(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	reg := engine.NewRegistry()
+	c := New(reg, Config{Mode: "prod", NFT: nftables.Config{Port: 8443}, NoNFT: true, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 7, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeactivateNew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	flows.counts[7] = 2
+	n, err := c.Drain(ctx, 7)
+	if err != nil || n != 2 {
+		t.Fatalf("Drain = %d, %v", n, err)
+	}
+	if flows.gotID != 7 || flows.gotPort != 8443 {
+		t.Fatalf("count scope = generation %d port %d", flows.gotID, flows.gotPort)
+	}
+	if err := c.GarbageCollect(ctx, 7); err == nil {
+		t.Fatal("collected generation with live flows")
+	}
+	flows.counts[7] = 0
+	if err := c.GarbageCollect(ctx, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 7, genTwoDNA); err != nil {
+		t.Fatalf("safe ID reuse after zero-flow GC: %v", err)
+	}
+}
+
+func TestGenerationIDBoundsPreventWraparound(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{}, nil)
+	if err := c.Prepare(context.Background(), generation.MaxID, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(context.Background(), generation.MaxID+1, genOneDNA); !errors.Is(err, engine.ErrInvalidStrategy) {
+		t.Fatalf("overflow error = %v", err)
+	}
+}
+
+func TestPrepareEnforcesDefaultLiveGenerationBudget(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{}, nil)
+	for id := uint32(1); id <= 3; id++ {
+		if err := c.Prepare(context.Background(), id, genOneDNA); err != nil {
+			t.Fatalf("prepare %d: %v", id, err)
+		}
+	}
+	if err := c.Prepare(context.Background(), 4, genOneDNA); err == nil || !strings.Contains(err.Error(), "budget is full") {
+		t.Fatalf("fourth prepare error = %v", err)
+	}
+}
+
+func TestPrepareEnforcesSeparateResourceBudgets(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{
+		MaxGenerations:            3,
+		MaxScopedGenerations:      1,
+		MaxEveryPacketGenerations: 1,
+	}, nil)
+	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(context.Background(), 2, genTwoDNA); err == nil || !strings.Contains(err.Error(), "handshake-scoped") {
+		t.Fatalf("second scoped prepare error = %v", err)
+	}
+	if err := c.Prepare(context.Background(), 2, everyPacketDNA); err != nil {
+		t.Fatalf("first every-packet prepare: %v", err)
+	}
+	if err := c.Prepare(context.Background(), 3, everyPacketDNA); err == nil || !strings.Contains(err.Error(), "every-packet") {
+		t.Fatalf("second every-packet prepare error = %v", err)
+	}
+	st := c.State()
+	if len(st.Generations) != 2 || st.Generations[0].ResourceClass != resourceHandshake || st.Generations[1].ResourceClass != resourceEvery {
+		t.Fatalf("resource classes = %+v", st.Generations)
+	}
+}
+
+func TestStatusReportsAuthoritativeCountsAndHonorsContext(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, NFT: nftables.Config{Port: 443}, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	flows.counts[1] = 7
+	value, err := c.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := value.(State)
+	if len(st.Generations) != 1 || st.Generations[0].Connections != 7 {
+		t.Fatalf("status = %+v", st)
+	}
+
+	c.cfg.Connections = blockingConnections{}
+	deadline, cancel := context.WithTimeout(ctx, 10*time.Millisecond)
+	defer cancel()
+	if _, err := c.Status(deadline); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded status error = %v", err)
+	}
+}
+
+func TestPersistenceSyncsDirectoryAndRejectsTrailingState(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	syncs := 0
+	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}}, SyncDirectory: func(path string) error {
+		syncs++
+		if path != filepath.Dir(state) {
+			t.Errorf("sync path = %s", path)
+		}
+		return nil
+	}}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if syncs < 2 {
+		t.Fatalf("directory sync calls = %d", syncs)
+	}
+	b, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(state, append(b, []byte(`{"extra":true}`)...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, Connections: &fakeConnections{counts: map[uint32]int{}}}, nil)
+	if err := c2.Start(ctx, ""); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("trailing state error = %v", err)
+	}
+}
+
+func TestCanonicalDigestIsBareLowerHex(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{}, nil)
+	if err := c.Prepare(context.Background(), 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	d := c.State().Generations[0].Digest
+	if len(d) != 64 || strings.ToLower(d) != d || strings.Contains(d, ":") {
+		t.Fatalf("non-canonical digest %q", d)
+	}
+}
+
+func TestRestartReconstructsEveryLiveEngineBeforeSteering(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c1 := New(engine.NewRegistry(), Config{Mode: "prod", NFT: nftables.Config{Port: 443}, NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, 2, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	reg2 := engine.NewRegistry()
+	c2 := New(reg2, Config{Mode: "prod", NFT: nftables.Config{Port: 443}, NoNFT: true, StateFile: state, Connections: flows}, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := c2.State().ActiveNew; got != 2 {
+		t.Fatalf("active after restart = %d", got)
+	}
+	raw := testutil.BuildTCP(t, 443, testutil.TCPFlags{RST: true}, nil)
+	for _, id := range []uint32{1, 2} {
+		if _, err := reg2.ProcessGeneration(id, raw, strategy.DirectionOutbound, nil); err != nil {
+			t.Fatalf("generation %d not reconstructed: %v", id, err)
+		}
+	}
+}
+
+func TestOrphanedMarksDisableNewSteering(t *testing.T) {
+	flows := &fakeConnections{counts: map[uint32]int{}, namespace: 3}
+	c := New(engine.NewRegistry(), Config{Mode: "prod", NFT: nftables.Config{Port: 443}, NoNFT: true, Connections: flows}, nil)
+	if err := c.Start(context.Background(), genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	st := c.State()
+	if !st.Unsafe || st.ActiveNew != 0 {
+		t.Fatalf("orphan audit state = %+v", st)
+	}
+	if err := c.ActivateNew(context.Background(), 1); err == nil {
+		t.Fatal("activated while orphan audit unsafe")
+	}
+}
+
+func deployment(id uint32, dna, revision string) adapter.Deployment {
+	identity := legacyIdentity(id, dna)
+	identity.Revision = revision
+	return adapter.Deployment{Generation: id, Identity: identity}
+}
+
+func TestIdentityCheckedMutationsAreRetryStable(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: flows}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	one, two := deployment(1, genOneDNA, "r1"), deployment(2, genTwoDNA, "r2")
+	if err := c.PrepareDeployment(ctx, one, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateDeployment(ctx, one, adapter.Deployment{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareDeployment(ctx, two, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateDeployment(ctx, two, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeactivateDeployment(ctx, one); err == nil {
+		t.Fatal("stale deactivation changed a later active generation")
+	}
+	if got := c.State().ActiveNew; got != 2 {
+		t.Fatalf("active after stale deactivate = %d", got)
+	}
+	if err := c.RollbackDeployment(ctx, one, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RollbackDeployment(ctx, one, two); err != nil {
+		t.Fatalf("rollback retry was not stable: %v", err)
+	}
+	if err := c.DeactivateDeployment(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeactivateDeployment(ctx, one); err != nil {
+		t.Fatalf("deactivate retry was not stable: %v", err)
+	}
+}
+
+func TestRetainedDrainedPreviousKnownGoodCanReactivate(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: flows}, nil)
+	_ = c.Start(ctx, "")
+	one, two := deployment(1, genOneDNA, "r1"), deployment(2, genTwoDNA, "r2")
+	if err := c.PrepareDeployment(ctx, one, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateDeployment(ctx, one, adapter.Deployment{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.PrepareDeployment(ctx, two, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateDeployment(ctx, two, one); err != nil {
+		t.Fatal(err)
+	}
+	if result, err := c.DrainDeployment(ctx, one); err != nil || !result.Drained {
+		t.Fatalf("drain = %+v, %v", result, err)
+	}
+	if err := c.RollbackDeployment(ctx, one, two); err != nil {
+		t.Fatalf("reactivate retained drained PBG: %v", err)
+	}
+}
+
+func TestDirectorySyncFailureReconcilesCommittedTransition(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	syncErr := errors.New("injected directory sync failure")
+	c := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state, SyncDirectory: func(string) error { return syncErr }}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatalf("rename-committed prepare reported inverse-safe failure: %v", err)
+	}
+	c2 := New(engine.NewRegistry(), Config{NoNFT: true, StateFile: state}, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(c2.State().Generations) != 1 {
+		t.Fatalf("committed transition not reconstructed: %+v", c2.State())
+	}
+}
+
+func TestOffloadOwnershipSurvivesCrashAndNeverClaimsPreDisabled(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	captures, disables, restores := 0, 0, 0
+	cfg := Config{NoNFT: true, StateFile: state, Iface: "eth-test", Connections: &fakeConnections{counts: map[uint32]int{}},
+		CaptureOffloads: func(context.Context, string, string) (*netdev.Original, error) {
+			captures++
+			return &netdev.Original{Interface: "eth-test", Features: []string{"gso", "tso"}}, nil
+		},
+		DisableOffloads: func(_ context.Context, _ string, original *netdev.Original) error { disables++; return nil },
+		RestoreOffloads: func(_ context.Context, _ string, original *netdev.Original) error {
+			restores++
+			original.Features = nil
+			return nil
+		},
+	}
+	c1 := New(engine.NewRegistry(), cfg, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if captures != 1 || disables != 1 {
+		t.Fatalf("capture/disable = %d/%d", captures, disables)
+	}
+
+	c2 := New(engine.NewRegistry(), cfg, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if captures != 1 || disables != 2 {
+		t.Fatalf("restart recaptured ownership: capture/disable = %d/%d", captures, disables)
+	}
+	if err := c2.DeactivateNew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c2.Drain(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.GarbageCollect(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if restores != 1 {
+		t.Fatalf("restore calls = %d", restores)
+	}
+
+	preDisabled := cfg
+	preDisabled.StateFile = filepath.Join(t.TempDir(), "adapter.json")
+	preDisabled.CaptureOffloads = func(context.Context, string, string) (*netdev.Original, error) {
+		return &netdev.Original{Interface: "eth-test"}, nil
+	}
+	preDisabled.DisableOffloads = func(context.Context, string, *netdev.Original) error { return fmt.Errorf("must not disable") }
+	c3 := New(engine.NewRegistry(), preDisabled, nil)
+	if err := c3.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c3.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c3.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if c3.State().OffloadsDisabled {
+		t.Fatal("claimed ownership of pre-disabled features")
+	}
+}
+
+func TestPartialOffloadRestoreRetainsRetryableOwnership(t *testing.T) {
+	ctx := context.Background()
+	state := filepath.Join(t.TempDir(), "adapter.json")
+	firstRestore := true
+	cfg := Config{
+		NoNFT: true, StateFile: state, Iface: "eth-test", Connections: &fakeConnections{counts: map[uint32]int{}},
+		CaptureOffloads: func(context.Context, string, string) (*netdev.Original, error) {
+			return &netdev.Original{Interface: "eth-test", Features: []string{"gso", "tso"}}, nil
+		},
+		DisableOffloads: func(context.Context, string, *netdev.Original) error { return nil },
+		RestoreOffloads: func(_ context.Context, _ string, original *netdev.Original) error {
+			if firstRestore {
+				firstRestore = false
+				original.Features = []string{"tso"} // gso was restored; tso remains owned
+				return errors.New("tso restore failed")
+			}
+			original.Features = nil
+			return nil
+		},
+	}
+	c1 := New(engine.NewRegistry(), cfg, nil)
+	if err := c1.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.DeactivateNew(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c1.Drain(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.GarbageCollect(ctx, 1); err == nil {
+		t.Fatal("partial offload restoration reported success")
+	}
+	if !c1.State().OffloadsDisabled {
+		t.Fatal("partial restoration dropped controller ownership")
+	}
+
+	c2 := New(engine.NewRegistry(), cfg, nil)
+	if err := c2.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if c2.State().OffloadsDisabled {
+		t.Fatal("restart did not finish restoring the retained feature")
+	}
+}
+
+func TestStartConntrackAuditHasControllerDeadline(t *testing.T) {
+	c := New(engine.NewRegistry(), Config{NoNFT: true, Connections: wedgedConnections{}, ConntrackTimeout: 10 * time.Millisecond}, nil)
+	start := time.Now()
+	if err := c.Start(context.Background(), genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Start blocked for %s", elapsed)
+	}
+	if st := c.State(); !st.Unsafe || st.ActiveNew != 0 {
+		t.Fatalf("bounded startup state = %+v", st)
+	}
+}
+
+func TestStartRemovesStaleAssignmentBeforeConntrackAudit(t *testing.T) {
+	events := make(chan string, 4)
+	c := New(engine.NewRegistry(), Config{
+		Connections: orderingConnections{events: events},
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			if cfg.ActiveGeneration == 0 && len(cfg.Generations) == 0 {
+				events <- "inactive rules"
+				return nil
+			}
+			return fmt.Errorf("unexpected startup steering: active=%d generations=%d", cfg.ActiveGeneration, len(cfg.Generations))
+		},
+	}, nil)
+	if err := c.Start(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	if first := <-events; first != "inactive rules" {
+		t.Fatalf("first startup kernel operation = %q, want stale assignment removal", first)
+	}
+	if second := <-events; second != "conntrack audit" {
+		t.Fatalf("second startup operation = %q, want conntrack audit", second)
+	}
+}
+
+func TestIntegritySignalDoesNotWaitForStatusConntrackDump(t *testing.T) {
+	flows := blockingConnections{}
+	programmed := make(chan uint32, 4)
+	c := New(engine.NewRegistry(), Config{NFT: nftables.Config{Port: 443}, Connections: flows, ConntrackTimeout: 100 * time.Millisecond, Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+		programmed <- cfg.ActiveGeneration
+		return nil
+	}}, nil)
+	c.mu.Lock()
+	c.generations[1] = &generationState{ID: 1, DNA: genOneDNA, Digest: legacyIdentity(1, genOneDNA).Digest, Identity: legacyIdentity(1, genOneDNA), Phase: PhaseActive, Scope: mustScope(t, genOneDNA)}
+	c.activeNew = 1
+	_ = c.eng.Prepare(1, genOneDNA)
+	_ = c.eng.Activate(1)
+	c.mu.Unlock()
+
+	statusDone := make(chan struct{})
+	go func() { _, _ = c.Status(context.Background()); close(statusDone) }()
+	time.Sleep(5 * time.Millisecond)
+	start := time.Now()
+	c.IntegrityFailure(errors.New("missing generation"))
+	if elapsed := time.Since(start); elapsed > 10*time.Millisecond {
+		t.Fatalf("hot-path signal blocked for %s", elapsed)
+	}
+	if err := c.ActivateNew(context.Background(), 1); err == nil {
+		t.Fatal("mutator did not observe atomic fault latch")
+	}
+	select {
+	case active := <-programmed:
+		if active != 0 {
+			t.Fatalf("integrity reconciliation active = %d", active)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("new-SYN assignment was not asynchronously disabled")
+	}
+	<-statusDone
+}
+
+func sameProgram(a, b nftables.Config) bool {
+	return nftables.New(a).Ruleset() == nftables.New(b).Ruleset()
+}
+
+func TestAmbiguousKernelCommitIsResolvedByExactReadback(t *testing.T) {
+	ctx := context.Background()
+	var installed nftables.Config
+	ambiguous := false
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true,
+		NFT:   nftables.Config{Port: 443},
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			installed = cfg
+			if ambiguous && cfg.ActiveGeneration == 2 {
+				return context.DeadlineExceeded // kernel committed before client timeout
+			}
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("kernel does not contain desired transaction")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	ambiguous = true
+	if err := c.ActivateNew(ctx, 2); err != nil {
+		t.Fatalf("verified committed timeout was not reconciled: %v", err)
+	}
+	if got := c.State().ActiveNew; got != 2 {
+		t.Fatalf("active generation = %d, want 2", got)
+	}
+}
+
+func TestUnconfirmedKernelCompensationLatchesUnsafe(t *testing.T) {
+	ctx := context.Background()
+	var installed nftables.Config
+	fail := false
+	c := New(engine.NewRegistry(), Config{
+		NoNFT: true,
+		NFT:   nftables.Config{Port: 443},
+		Program: func(_ context.Context, cfg nftables.Config, _ bool) error {
+			if fail {
+				installed = nftables.Config{Port: 443}
+				return context.DeadlineExceeded
+			}
+			installed = cfg
+			return nil
+		},
+		VerifyProgram: func(_ context.Context, want nftables.Config) error {
+			if !sameProgram(installed, want) {
+				return errors.New("unconfirmed kernel state")
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 1, genOneDNA); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateNew(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Prepare(ctx, 2, genTwoDNA); err != nil {
+		t.Fatal(err)
+	}
+	fail = true
+	if err := c.ActivateNew(ctx, 2); err == nil {
+		t.Fatal("unconfirmed install and compensation succeeded")
+	}
+	st := c.State()
+	if !st.Unsafe || st.ActiveNew != 0 {
+		t.Fatalf("unconfirmed compensation state = %+v", st)
+	}
+	if err := c.Prepare(ctx, 3, genOneDNA); err == nil {
+		t.Fatal("unsafe latch allowed a new mutation")
+	}
+}
