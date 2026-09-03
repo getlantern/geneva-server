@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,15 +26,39 @@ func TestCountIsBoundedWhileConntrackDumpIsBusy(t *testing.T) {
 	}
 }
 
-func TestNeutralizeDeadlineRetainsDumpSlotUntilTransactionReturns(t *testing.T) {
-	original := neutralizeNetlink
-	t.Cleanup(func() { neutralizeNetlink = original })
+type blockedNeutralConntrack struct {
+	started chan struct{}
+	release chan struct{}
+	updates atomic.Int32
+}
+
+func (*blockedNeutralConntrack) Close() error { return nil }
+
+func (c *blockedNeutralConntrack) DumpFilter(ct.Filter) ([]ct.Flow, error) {
+	close(c.started)
+	<-c.release
+	return []ct.Flow{{TupleOrig: ct.Tuple{
+		IP: ct.IPTuple{
+			SourceAddress:      net.ParseIP("192.0.2.1"),
+			DestinationAddress: net.ParseIP("192.0.2.2"),
+		},
+		Proto: ct.ProtoTuple{Protocol: unix.IPPROTO_TCP, DestinationPort: 443},
+	}}}, nil
+}
+
+func (c *blockedNeutralConntrack) Update(ct.Flow) error {
+	c.updates.Add(1)
+	return nil
+}
+
+func TestNeutralizeDumpReleasedAfterDeadlinePerformsNoUpdates(t *testing.T) {
+	original := dialNeutralConntrack
+	t.Cleanup(func() { dialNeutralConntrack = original })
 	started := make(chan struct{})
 	release := make(chan struct{})
-	neutralizeNetlink = func(uint16) (int, error) {
-		close(started)
-		<-release
-		return 1, nil
+	conn := &blockedNeutralConntrack{started: started, release: release}
+	dialNeutralConntrack = func() (neutralConntrack, error) {
+		return conn, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -60,6 +85,9 @@ func TestNeutralizeDeadlineRetainsDumpSlotUntilTransactionReturns(t *testing.T) 
 		select {
 		case dumpSlot <- struct{}{}:
 			<-dumpSlot
+			if got := conn.updates.Load(); got != 0 {
+				t.Fatalf("conntrack updates after neutralization deadline = %d, want 0", got)
+			}
 			return
 		case <-deadline:
 			t.Fatal("neutralization did not release the dump slot after its transaction returned")

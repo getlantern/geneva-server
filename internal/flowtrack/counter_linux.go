@@ -136,7 +136,7 @@ func updateNeutral(ctx context.Context, port uint16) (int, error) {
 	done := make(chan result, 1)
 	go func() {
 		defer func() { <-dumpSlot }()
-		updated, err := neutralizeNetlink(port)
+		updated, err := neutralizeNetlinkTransaction(ctx, port)
 		done <- result{updated: updated, err: err}
 	}()
 	select {
@@ -147,29 +147,64 @@ func updateNeutral(ctx context.Context, port uint16) (int, error) {
 	}
 }
 
-// neutralizeNetlink is a test seam around the library's synchronous dump and
-// update transaction. The caller keeps dumpSlot owned until this returns even
-// when its context has already expired, so a wedged kernel cannot accumulate
-// goroutines or overlapping namespace mutations.
-var neutralizeNetlink = neutralizeNetlinkTransaction
+type neutralConntrack interface {
+	Close() error
+	DumpFilter(ct.Filter) ([]ct.Flow, error)
+	Update(ct.Flow) error
+}
 
-func neutralizeNetlinkTransaction(port uint16) (int, error) {
-	c, err := ct.Dial(nil)
+// dialNeutralConntrack is a test seam around the context-free conntrack
+// library. Production cancellation closes the connection to interrupt a
+// pending dump; the post-dump context check is still authoritative because a
+// socket implementation may not unblock immediately.
+var dialNeutralConntrack = func() (neutralConntrack, error) { return ct.Dial(nil) }
+
+func neutralizeNetlinkTransaction(ctx context.Context, port uint16) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	c, err := dialNeutralConntrack()
 	if err != nil {
 		return 0, fmt.Errorf("dial conntrack netlink: %w", err)
 	}
-	defer func() { _ = c.Close() }()
+	interruptDone := make(chan struct{})
+	stopInterrupt := context.AfterFunc(ctx, func() {
+		_ = c.Close()
+		close(interruptDone)
+	})
+	defer func() {
+		if stopInterrupt() {
+			_ = c.Close()
+			return
+		}
+		<-interruptDone
+	}()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	flows, err := c.DumpFilter(ct.Filter{})
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return 0, contextErr
+		}
 		return 0, fmt.Errorf("dump conntrack for neutral boundary: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
 	}
 	updated := 0
 	for _, flow := range flows {
 		if !adapterFlow(flow, port) || flow.Mark&generation.Mask != 0 {
 			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return updated, err
+		}
 		flow.Mark = neutralMark(flow.Mark)
 		if err := c.Update(flow); err != nil {
+			if contextErr := ctx.Err(); contextErr != nil {
+				return updated, contextErr
+			}
 			return updated, fmt.Errorf("neutralize conntrack: %w", err)
 		}
 		updated++
