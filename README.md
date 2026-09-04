@@ -17,7 +17,8 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
 ```text
         proxy egress (sport=PORT)                     proxy ingress (dport=PORT)
                   │                                              │
-      nftables: queue → OUT_Q (bypass)          nftables: queue → IN_Q (bypass)
+      ct generation → OUT_Q (bypass)            SYN assigns ct generation
+                  │                              ct generation → IN_Q (bypass)
                   │                                              │
                   ▼                                              ▼
         ┌───────────────────┐                        ┌───────────────────┐
@@ -28,25 +29,34 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
     unchanged → ACCEPT                         unchanged → ACCEPT
     otherwise → DROP original                  dropped   → DROP
                 + reinject 0..N packets         tampered  → overwrite-and-ACCEPT
-                  via raw socket (SO_MARK)
+                  via dedicated-UID raw socket
 ```
 
+- **Connection generations.** An original inbound SYN is assigned the active
+  immutable engine generation in kernel conntrack state. Every queue rule
+  requires that mark, and NFQUEUE conntrack metadata supplies it to both
+  directions without changing the packet's routing mark, so a connection cannot
+  switch strategy halfway through. Unmarked flows which predate activation
+  never match even when a new strategy widens its scope.
 - **Two queues, one per direction.** The nftables rules send egress to the
   out-queue and ingress to the in-queue, so each callback knows its direction
   unambiguously — no per-packet inference.
 - **Outbound** packets can fan out (`duplicate`/`fragment`) or change size
   (`tamper`), which an in-queue verdict cannot express, so a matched outbound
   packet is **dropped and its replacements reinjected** through a raw socket. The
-  socket carries a firewall mark; an nftables rule accepts marked packets before
-  the queue rule, breaking the reinjection loop.
+  socket retains the packet's exact routing `SO_MARK`; an nftables `meta skuid`
+  exclusion for the dedicated sidecar UID breaks the reinjection loop without
+  changing the initial policy-route lookup.
 - **Inbound** is single-in/single-out (branching is rejected at parse time), so
   it is handled with the in-queue verdict alone: accept, drop, or
   overwrite-and-accept.
 - **Checksums / sequence fields** are recomputed by the library (its centralized
   checksum helpers), which also preserves fields a strategy *intentionally*
   corrupts. The runtime reinjects those bytes verbatim and never clobbers them.
-- **Fail-open.** The queue rules use `bypass`: if the sidecar dies, the kernel
-  accepts the proxy's packets instead of dropping them.
+- **Fail-open.** The queue rules use `bypass` when no listener is bound, and
+  queue startup requires a kernel-acknowledged `NFQA_CFG_F_FAIL_OPEN` setting
+  so a bound but full queue accepts new arrivals. Userspace ENOBUFS events are
+  reported as unknown outcomes, never mislabeled as accepted.
 - **No stale rules.** All rules live in one dedicated table that is created on
   start and deleted on stop; deleting the table removes everything atomically.
 
@@ -58,11 +68,10 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
   so the brain can mutate against values that actually occur. Seeded with a small
   static cold-start corpus.
 
-The only difference is the canary (eval-only). Both modes accept a strategy
-update in place: `PUT /strategy` validates the DNA and swaps it atomically, so it
-takes effect on the next packet with no restart (the swap touches only the
-strategy — the queues, nftables rules, and reinjector are untouched). Restarting
-also works and is how a strategy is delivered at boot via the config path.
+The only difference is the canary (eval-only). Both modes support the versioned
+adapter lifecycle below. A strategy update is prepared as a new immutable
+generation and activated only for new TCP connections; existing connections
+remain on their original generation through rollback and drain.
 
 ## Usage
 
@@ -70,15 +79,15 @@ also works and is how a strategy is delivered at boot via the config path.
 # Validate a strategy (no privileges; used by the GA pre-screen and CI):
 geneva-server validate '[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/'
 
-# Run in prod mode, steering the proxy on :443:
+# Run in prod mode. It starts inactive; the v1 adapter activates desired state:
 sudo geneva-server run \
   --mode=prod \
-  --strategy-file=/etc/geneva-server/strategy.dna \
   --port=443 --iface=eth0 \
   --control-addr=127.0.0.1:8092
 ```
 
-Requires `CAP_NET_ADMIN` + `CAP_NET_RAW`, `nft`, and (for `--iface`) `ethtool`.
+Requires `CAP_NET_ADMIN` + `CAP_NET_RAW`, `nft`, and `ethtool`. Production
+requires `--iface` so controller-owned offload changes remain restorable.
 See [`deploy/`](deploy/) for the systemd unit and provisioning notes, and
 `--help` for the full flag set.
 
@@ -89,13 +98,80 @@ box. Everything else is exported as metrics (below).
 
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
-| `GET /strategy` | both      | current strategy DNA                                        |
-| `PUT /strategy` | both      | assign/replace the strategy in place (validated)            |
+| `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
+| `GET /v1/adapter/descriptor` | both | numeric protocol/schema versions and bounded capabilities |
+| `POST /v1/adapter/verify` | both | validate an artifact and immutable identity without mutation |
+| `POST /v1/adapter/prepare` | both | persist an identity-bound deployment (256 KiB decoded artifact limit) |
+| `POST /v1/adapter/activate-for-new-connections` | both | assign future SYNs to a prepared artifact after union staging |
+| `POST /v1/adapter/deactivate-for-new-connections` | both | identity-fenced stop of new-SYN assignment |
+| `GET /v1/adapter/status` | both | generic active/prepared/draining identities and bounded drain counts |
+| `POST /v1/adapter/drain` | both | bounded conntrack count for an artifact identity |
+| `POST /v1/adapter/garbage-collect` | both | identity keep-set GC of zero-flow generations |
+| `POST /v1/adapter/rollback` | both | restage/reactivate a complete previous-known-good artifact |
 
-`PUT /strategy` is unauthenticated, so keep `--control-addr` on a private
-interface (see [`deploy/`](deploy/)).
+All control operations are unauthenticated, so keep `--control-addr` on a
+private interface (see [`deploy/`](deploy/)).
+
+The exact numeric v1 wire schema, identity preconditions, and retry semantics
+are in [`docs/adapter-v1.md`](docs/adapter-v1.md).
+
+### Generation and mark invariants
+
+Geneva formally reserves conntrack bits `0xfffff000` as `0x67GGGxxx`, where
+`GGG` is generation 1..4095 and the low 12 bits are preserved. The repository
+audit found Lantern's `0x438`/1088 TPROXY marks and phost policy-routing marks
+(745 and following) are packet marks today, with no `CONNMARK` save/restore;
+coexistence is nevertheless intentional. SYN assignment preserves every bit
+outside Geneva's mask. NFQUEUE supplies the
+generation directly as conntrack metadata, so dispatch never mutates the skb
+mark and downstream exact `fwmark 0x438`/`0x440` rules still match. Raw
+reinjection uses NFQUEUE's original packet mark exactly. A foreign connmark with nonzero
+reserved bits is never overwritten or steered. IDs are not reused while
+present; reuse is allowed only after authoritative zero-flow GC.
+
+Activation uses two complete nft transactions. The first verifies and installs
+the union of old and candidate generation scopes while SYN assignment still
+names the old generation. The second changes only the new-SYN assignment. Thus
+no packet can be assigned before its immutable engine and rules are live. The
+state needed to reconstruct every live engine is atomically persisted and
+file/directory-synced at `--adapter-state-file` before either transaction. Every
+restart which sees active intent first reinstalls the neutral boundary and
+sweeps unowned conntracks before restoring assignment, then flips directly from
+neutral+full-union to active+full-union without an unassigned gap. Unknown orphaned
+namespace marks disable new assignment and fail open rather than being applied
+to the wrong DNA. First activation temporarily neutral-marks both existing
+relevant conntracks and SYNs arriving during the sweep before flipping
+assignment, so a pre-activation half-open SYN retransmission cannot cross the
+boundary.
+
+State v2 retains the artifact's exact protocol, schema, and required runtime
+metadata and revalidates it against the installed descriptor before restart
+activation. Corrupt, incompatible, or metadata-less v1 state is durably
+quarantined; the sidecar stays inactive/unsafe and reports unhealthy while the
+loopback lifecycle remains available. A newer t8 desired snapshot remediates via
+the ordinary `Prepare` → `Verify` → `ActivateForNewConnections` sequence after
+Geneva freshly verifies neutral kernel state and snapshots conntrack. The proof
+is never persisted; Prepare can repeat it in the same process after a transient
+startup proof failure or completed integrity reconciliation. Prepare and Verify
+keep health unsafe, and only successful safe activation clears it. Orphan
+generation IDs remain reserved and never enter union rules. Every integrity
+signal advances a process-local fault epoch, including signals received before a
+recovery guard is armed. Recovery reconstructs and verifies every retained live
+engine against durable DNA before the epoch can be cleared. An absent-artifact
+rollback likewise allocates only an ID proven zero-flow by a fresh authoritative
+snapshot. Production authoritative mode requires a nonempty
+`--adapter-state-file`.
+
+The lifecycle status exposes only the canonical artifact digest: bare lowercase
+64-character SHA-256 hex. Raw DNA is retained only in the mode-0600 reconstruction file; it is never added to lifecycle status, logs, or
+telemetry. The default
+live-generation budget is three (`--max-generations`); preparation refuses a
+fourth until one is drained and collected. The independently configurable
+`--max-scoped-generations` (default three) and
+`--max-every-packet-generations` (default two) admission budgets reflect their
+very different packet-processing costs; the operator-only steering snapshot in
+`/healthz` reports each private generation's `resource_class`.
 
 ## Metrics
 
@@ -159,6 +235,12 @@ make test        # unit + packet-level tests (root-gated nftables test self-skip
 make test-race   # with the race detector
 make e2e         # full docker-networking end-to-end (see e2e/)
 make docker      # build the deployable image
+```
+
+Run the root/network-namespace release gate explicitly before staging:
+
+```console
+sudo GENEVA_KERNEL_INTEGRATION=1 go test ./e2e -run TestKernelGenerationLifecycle -v
 ```
 
 The [`e2e/`](e2e/) suite stands up a proxy + sidecar + client over real Docker

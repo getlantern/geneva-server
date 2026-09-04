@@ -1,0 +1,14 @@
+services:
+  sidecar:
+    volumes: []
+    command:
+      - "run"
+      - "--mode=prod"
+      - "--port=8080"
+      - "--iface=eth0"
+      - "--control-addr=0.0.0.0:8092"
+      - "--adapter-state-file=/tmp/kernel-adapter-state.json"
+      - "--reinject-bypass-uid=65534"
+      - "--max-generations=3"
+      - "--max-every-packet-generations=3"
+      - "--queue-max-len=1"

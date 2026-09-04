@@ -46,14 +46,13 @@ back up when it stops — a sidecar with no strategy leaves the NIC alone.
   ```sh
   geneva-server run \
     --mode=prod \
-    --strategy-file=/etc/geneva-server/strategy.dna \
     --port=443 --iface=eth0 \
     --control-addr=127.0.0.1:8092
   ```
 
-- **eval** — a candidate on a dedicated test box, with canary capture. The GA
-  brain assigns candidates via `PUT /strategy` and reads the per-market canary
-  pool from `GET /canary`:
+- **eval** — a candidate on a dedicated test box, with canary capture. The
+  overlay agent assigns candidates through v1 and the GA reads the per-market
+  canary pool from `GET /canary`:
 
   ```sh
   geneva-server run \
@@ -62,14 +61,12 @@ back up when it stops — a sidecar with no strategy leaves the NIC alone.
     --control-addr=127.0.0.1:8092
   ```
 
-Both modes support updating the strategy **in place**: `PUT /strategy` validates
-the DNA and swaps it atomically, taking effect on the next packet with no
-restart. Delivering a strategy at boot (via `--strategy-file` + the config path)
-and restarting also works.
+Both modes use immutable per-connection generations. Existing flows retain
+their conntrack generation through drain and rollback. Normal production startup
+is inactive and accepts desired state through v1.
 
-The control API is unauthenticated, so it must not listen on `0.0.0.0`:
-`PUT /strategy` lets any reachable client replace the active strategy on either a
-prod or an eval box. If the GA brain needs to reach it remotely, bind only a
+The control API is unauthenticated, so it must not listen on `0.0.0.0`. If an
+overlay agent needs to reach it remotely, bind only a
 dedicated management interface (e.g. a WireGuard/VPC address) and gate it with
 network ACLs — never the public interface.
 
@@ -79,10 +76,15 @@ Bind `--control-addr` to a private address (localhost or a management network).
 
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
-| `GET /healthz`  | both      | liveness + mode, strategy, engine/verdict/inbound-TCP stats |
-| `GET /strategy` | both      | current strategy DNA                                        |
-| `PUT /strategy` | both      | assign/replace the strategy in place (validated)            |
+| `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
+| `GET /v1/adapter/descriptor` / `POST /v1/adapter/verify` | both | generic numeric v1 capabilities / artifact validation |
+| `POST /v1/adapter/prepare` | both | validate and persist an immutable identity-bound deployment |
+| `POST /v1/adapter/activate-for-new-connections` | both | stage union scopes, then flip new SYNs |
+| `POST /v1/adapter/deactivate-for-new-connections` | both | identity-fenced stop of new assignments |
+| `GET /v1/adapter/status` | both | generic active/prepared/draining identity state |
+| `POST /v1/adapter/drain` / `POST /v1/adapter/garbage-collect` | both | bounded count, then keep-set collection |
+| `POST /v1/adapter/rollback` | both | restage a complete previous-known-good artifact |
 
 There is no scrape endpoint. Counters are exported as OTLP metrics to the box's
 local collector and read from the fleet's backend (see "Metric export" below);
@@ -90,6 +92,12 @@ the surface here is only what a caller needs synchronously against one named
 box. `/healthz` keeps the engine snapshot because the GA pre-screen decides
 whether to keep a candidate within seconds of self-dialling it, which is shorter
 than an export interval plus query lag.
+
+The versioned lifecycle responses expose only a bare lowercase SHA-256 artifact
+digest. Raw DNA remains solely in the mode-0600 reconstruction file. Keep this
+surface loopback-only unless an authenticated management network protects it.
+See [`../docs/adapter-v1.md`](../docs/adapter-v1.md) for exact request bodies,
+numeric fields, keep-set GC, and retry semantics.
 
 ## Metric export
 
@@ -129,7 +137,7 @@ system account the unit runs as — without it systemd cannot deliver the two
 ambient capabilities.
 
 The unit ships **disabled**: it cannot start until the deployment has written
-`/etc/geneva-server/geneva.env`, and in prod mode the strategy file it names. So
+`/etc/geneva-server/geneva.env`. So
 install, write the config, then `systemctl enable --now geneva-server`.
 
 `main` auto-tags a patch release on any change to the binary or its packaging
@@ -149,21 +157,78 @@ Mirror the `lantern-box` provisioning flow:
    dependencies, so cloud-init does not install them separately (the
    `Dockerfile` bakes them into the image path instead).
 2. Write `/etc/geneva-server/geneva.env` with `GENEVA_ARGS=...` and the
-   `OTEL_EXPORTER_OTLP_*` endpoint, plus — in prod mode — the strategy file
-   `GENEVA_ARGS` names. Both must be readable by the `geneva-server` account
+   `OTEL_EXPORTER_OTLP_*` endpoint. It must be readable by the `geneva-server` account
    (`root:geneva-server`, mode `0640`); the unit's `ProtectSystem=strict` makes
    all of `/etc` read-only to the process, so nothing else is needed to protect
    them.
 3. `systemctl enable --now geneva-server.service`. `enable` alone would leave
    the sidecar stopped until the next boot.
 
-In eval mode the strategy file is optional: the sidecar starts with no strategy,
-steering nothing at all, until the GA brain assigns a candidate over
-`PUT /strategy`.
+In eval mode the sidecar starts with no strategy, steering nothing at all, until
+the overlay agent prepares and activates an artifact through v1. A strategy
+file is populated by the versioned lifecycle.
 
 The nftables rules are runtime-owned: the sidecar programs its table from the
 loaded strategy and deletes it on stop, so provisioning must **not** install
 steering rules itself.
+
+The systemd unit creates `/var/lib/geneva-server` for the default
+`--adapter-state-file`; authoritative production rejects an empty path. This
+0600 v2 file contains the DNA, phase, identity, and exact adapter protocol,
+schema, and required runtime metadata of every live generation. Restart rebuilds
+and validates all artifacts against the installed descriptor before loading any
+assignment. Incompatible, metadata-less v1, or corrupt state is durably renamed
+to a quarantine file. The local lifecycle remains reachable for remediation but
+reports `unsafe`, `/healthz` returns unhealthy, no new generation is assigned,
+and unknown flows bypass userspace. The overlay manager can repair with its
+normal newer-snapshot `Prepare` → `Verify` → `ActivateForNewConnections`
+sequence after Geneva freshly proves exact neutral kernel state and snapshots
+conntrack; rollback remains available for a full known-good fallback. This proof
+is process-local, repeated after every restart, and retryable in the same process
+after transient startup proof failure or completed integrity reconciliation. Do
+not edit or delete conntrack marks. Missing-engine signals are never coalesced
+away merely because the adapter is already unsafe: a monotonic fault epoch
+invalidates startup and recovery proofs, and retained live engines are rebuilt
+and checked against durable DNA before activation can clear unhealthy state.
+
+### Conntrack mark reservation and drain
+
+The adapter reserves conntrack mask `0xfffff000` as `0x67GGGxxx`. `GGG` is a
+12-bit generation ID and all low 12 bits are preserved. The audit found these
+current Lantern users: `docker/src/socks-proxy/start.sh` uses packet marks
+`0x438`/1088 for TPROXY, while phost's iptables/gateway updater uses low-valued
+packet marks (route tables start at 745). No current Lantern rule saves those
+marks to conntrack. Geneva still preserves them deliberately: SYN assignment is
+`(ct mark & ~0xfffff000) | 0x67GGG000`, guarded so a foreign nonzero value in
+the reserved mask is never replaced, while NFQUEUE conntrack metadata supplies
+the generation without changing the skb mark. Ordinary verdicts, no-listener bypass
+and queue-full fail-open therefore retain exact external marks, and coincidental
+foreign `0x67...` packet marks are untouched. Raw reinjection keeps NFQUEUE's
+exact original routing `SO_MARK` (`0x438`, `0x440`, or phost value) and avoids
+requeue through the dedicated service socket UID.
+A foreign nonzero value inside the reserved
+high 20 bits is left alone and the connection is not steered.
+
+Drain/status read conntrack over netlink, filter by the full Geneva generation
+mask, then by original IPv4/TCP destination port. GC refuses an active
+generation or any nonzero result. IDs are bounded to 1..4095 and cannot be
+changed in place; an ID becomes reusable only after zero-flow GC, so wraparound
+cannot bind an old conntrack entry to new DNA. Startup also reserves every live
+orphan ID found in the namespace. Restaging an absent rollback artifact takes a
+fresh bounded full dump and allocates only an ID proven to have zero flows;
+unknown orphan IDs never enter the union rules or engine registry.
+
+At most three generations are retained by default; change this deliberately
+with `--max-generations` (1..32). The handshake-scoped and every-packet subsets
+also have separate `--max-scoped-generations` (default three) and
+`--max-every-packet-generations` (default two) limits. Prepare rejects when any
+applicable budget is full, and status exposes the generation resource class.
+Lifecycle status reports authoritative connection counts and bare lowercase
+SHA-256 hex digests, never raw DNA. `/healthz` uses the cached lifecycle view and
+does not dump conntrack, keeping routine probes bounded; an integrity latch
+returns HTTP 503 while the local rollback endpoints remain available.
+Generic recovery Prepare/Verify endpoints also remain available, but health
+stays 503 until a safely staged activation succeeds.
 
 ## What gets steered
 
@@ -205,10 +270,13 @@ manipulating them:
 
 | Counter | Meaning |
 | --- | --- |
-| `verdicts.overruns` | the netlink socket buffer overflowed; those packets bypassed the strategy (the rules' `bypass` flag accepted them, so the proxy kept serving) |
+| `verdicts.overruns` | userspace netlink delivery reported ENOBUFS; affected packet count/outcomes are unknown and are not included in accepted/dropped |
 | `verdicts.truncated` | the kernel copied only part of a packet, so it was accepted unmodified rather than manipulated as a fragment |
 
-Both should be zero. A nonzero `overruns` means the strategy cannot keep up with
+Both should be zero. Queue startup requires the kernel to acknowledge
+`NFQA_CFG_F_FAIL_OPEN`, which accepts new arrivals after a bound kernel queue
+fills; nft `bypass` separately protects the no-listener case. A nonzero
+`overruns` means userspace delivery could not keep up with
 the packet rate on this box; a nonzero `truncated` means the copy length is too
 small for its traffic.
 

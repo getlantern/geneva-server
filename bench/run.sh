@@ -24,6 +24,8 @@ cd "$(dirname "$0")"
 : > strategy.dna
 COMPOSE=(docker compose -f docker-compose.yml)
 source ../scripts/harness-lib.sh
+
+active_identity=''
 GIB="${1:-2}"
 STREAMS="${2:-1}"
 BYTES=$(( GIB * (1 << 30) / STREAMS ))
@@ -89,21 +91,31 @@ measure() {
   results+=("$(printf '%-26s|%8s|%7s|%9s|%6s' "$label" "$mbps" "$per_gb" "$pkts" "$ns_pkt")")
 }
 
-# put installs a strategy over the control API on a running sidecar.
+# put installs a strategy through the versioned adapter lifecycle on a running sidecar.
 put() {
-  "${COMPOSE[@]}" exec -T client sh -c \
-    "curl -fsS -X PUT --data-binary '$1' http://server:8092/strategy >/dev/null"
+  local dna="$1" digest payload body
+  if [[ -z "$dna" ]]; then
+    printf '%s' "$active_identity" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/deactivate-for-new-connections >/dev/null
+    active_identity=''
+    return
+  fi
+  digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
+  payload=$(printf '%s' "$dna" | base64 -w0)
+  body=$(printf '{"metadata":{"technique":"geneva","revision":"bench-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"dev","schema_version":1},"payload":"%s"}' "$digest" "$digest" "${#dna}" "$payload")
+  printf '%s' "$body" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/prepare >/dev/null
+  printf '%s' "$body" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/activate-for-new-connections >/dev/null
+  active_identity=$(printf '%s' "$body" | jq -c '.metadata | {technique, revision, digest: .content_sha256}')
 }
 
 start_sidecar() {
-  local mode="$1" dna="$2"
-  printf '%s' "$dna" > strategy.dna
+	local mode="$1" dna="$2"
   GENEVA_MODE="$mode" "${COMPOSE[@]}" up -d --no-deps sidecar >/dev/null
   if ! wait_healthy client; then
     echo "sidecar control surface never came up" >&2
     "${COMPOSE[@]}" logs sidecar | tail -20 >&2
     exit 1
   fi
+  [[ -n "$dna" ]] && put "$dna"
   SIDECAR_EXPECTED=1
 }
 
@@ -144,8 +156,8 @@ put "$TAMPER_ALL"; measure "eval/tamper-every-packet"
 put "$DUP_ALL"; measure "eval/duplicate-every-packet"
 stop_sidecar
 
-# prod refuses to boot without a strategy, so it starts on the handshake one.
-# The last row is the rollback path: PUT "" must take the box back off the data
+# Prod starts inactive and is activated through the same lifecycle.
+# The last row is the rollback path: deactivation takes the box back off the data
 # path rather than leaving it steering packets it no longer manipulates.
 step "mode=prod"
 start_sidecar prod "$HANDSHAKE"

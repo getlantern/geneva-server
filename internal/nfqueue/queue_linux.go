@@ -57,9 +57,12 @@ const (
 
 	// Packet attributes.
 	nfqaPacketHdr  = 1
+	nfqaMark       = 3
 	nfqaVerdictHdr = 2
 	nfqaPayload    = 10
+	nfqaCt         = 11
 	nfqaCapLen     = 13
+	ctaMark        = 8
 
 	// Config attributes and commands.
 	nfqaCfgCmd         = 1
@@ -67,6 +70,14 @@ const (
 	nfqaCfgQueueMaxLen = 3
 	nfqaCfgMask        = 4
 	nfqaCfgFlags       = 5
+
+	// NFQA_CFG_F_FAIL_OPEN makes a bound queue accept rather than drop new
+	// packets when its kernel queue is full. This is distinct from nft's queue
+	// bypass flag, which only handles the absence of a bound listener.
+	nfqaCfgFFailOpen = 1 << 0
+	// NFQA_CFG_F_CONNTRACK supplies the private generation directly as nested
+	// CTA_MARK metadata. Dispatch therefore never mutates the packet mark.
+	nfqaCfgFConntrack = 1 << 1
 
 	nfqnlCfgCmdBind     = 1
 	nfqnlCfgCmdUnbind   = 2
@@ -89,13 +100,13 @@ const (
 	// interface whose offloads are still on, in a single read.
 	readBufSize = 256 << 10
 
-	// maxQueueLen is how many packets the kernel will hold for this queue
-	// before dropping (and, with the bypass flag on the rules, accepting) them.
+	// maxQueueLen is how many packets the kernel will hold for this queue. Once
+	// full, NFQA_CFG_F_FAIL_OPEN accepts arrivals without queueing them.
 	maxQueueLen = 0xffff
 
-	// rcvBufSize is the socket buffer. NFQUEUE reports ENOBUFS and drops
-	// packets when this fills, and a burst plus a slow strategy is exactly how
-	// that happens.
+	// rcvBufSize is the socket buffer. NFQUEUE reports ENOBUFS when userspace
+	// delivery overruns. The outcome of messages lost to that signal is not
+	// observable, so telemetry reports it as unknown rather than accepted.
 	rcvBufSize = 4 << 20
 )
 
@@ -107,6 +118,7 @@ var ErrTruncated = errors.New("kernel truncated the captured packet")
 // queue is one bound NFQUEUE and its verdict channel.
 type queue struct {
 	con    *netlink.Conn
+	cfg    configExecutor
 	rc     syscall.RawConn
 	num    uint16
 	family uint8
@@ -124,6 +136,16 @@ type queue struct {
 	send func([]byte) error
 }
 
+type configExecutor interface {
+	Execute(netlink.Message) ([]netlink.Message, error)
+}
+
+type configStep struct {
+	what  string
+	resid uint16
+	attrs []netlink.Attribute
+}
+
 // openQueue dials netlink, binds queue num, and configures copy mode.
 func openQueue(num uint16, maxPacketLen uint32, maxQueueLen uint32) (*queue, error) {
 	con, err := netlink.Dial(unix.NETLINK_NETFILTER, nil)
@@ -132,6 +154,7 @@ func openQueue(num uint16, maxPacketLen uint32, maxQueueLen uint32) (*queue, err
 	}
 	q := &queue{
 		con: con,
+		cfg: con,
 		num: num,
 		// AF_INET, matching an engine and reinjector that are IPv4-only. The
 		// kernel does not read this field for the messages it is sent with here
@@ -143,8 +166,8 @@ func openQueue(num uint16, maxPacketLen uint32, maxQueueLen uint32) (*queue, err
 		vbuf:   make([]byte, 0, 4096),
 	}
 	if err := con.SetReadBuffer(rcvBufSize); err != nil {
-		// Not fatal: a smaller buffer means ENOBUFS under burst, which is
-		// counted and logged, not a failure to run.
+		// Not fatal: a smaller buffer makes userspace delivery overruns more
+		// likely. They are counted as unknown-outcome events.
 		_ = err
 	}
 	rc, err := con.SyscallConn()
@@ -157,24 +180,27 @@ func openQueue(num uint16, maxPacketLen uint32, maxQueueLen uint32) (*queue, err
 
 	// The same sequence libnetfilter_queue performs: drop any stale handler for
 	// the family, bind the family, bind the queue, then set copy mode and depth.
-	steps := []struct {
-		what  string
-		resid uint16
-		attrs []netlink.Attribute
-	}{
-		{"unbind family", 0, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdPfUnbind, q.family)}}},
-		{"bind family", 0, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdPfBind, q.family)}}},
-		{"bind queue", num, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdBind, q.family)}}},
-		{"set copy mode", num, []netlink.Attribute{{Type: nfqaCfgParams, Data: cfgParams(maxPacketLen)}}},
-		{"set queue length", num, []netlink.Attribute{{Type: nfqaCfgQueueMaxLen, Data: be32(maxQueueLen)}}},
-	}
-	for _, s := range steps {
+	for _, s := range queueConfigSteps(q.family, num, maxPacketLen, maxQueueLen) {
 		if err := q.config(s.resid, s.attrs); err != nil {
 			_ = con.Close()
 			return nil, fmt.Errorf("%s: %w", s.what, err)
 		}
 	}
 	return q, nil
+}
+
+func queueConfigSteps(family uint8, num uint16, maxPacketLen, maxQueueLen uint32) []configStep {
+	return []configStep{
+		{"unbind family", 0, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdPfUnbind, family)}}},
+		{"bind family", 0, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdPfBind, family)}}},
+		{"bind queue", num, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdBind, family)}}},
+		{"enable required fail-open and conntrack metadata", num, []netlink.Attribute{
+			{Type: nfqaCfgMask, Data: be32(nfqaCfgFFailOpen | nfqaCfgFConntrack)},
+			{Type: nfqaCfgFlags, Data: be32(nfqaCfgFFailOpen | nfqaCfgFConntrack)},
+		}},
+		{"set copy mode", num, []netlink.Attribute{{Type: nfqaCfgParams, Data: cfgParams(maxPacketLen)}}},
+		{"set queue length", num, []netlink.Attribute{{Type: nfqaCfgQueueMaxLen, Data: be32(maxQueueLen)}}},
+	}
 }
 
 // config sends one NFQNL_MSG_CONFIG message. Setup only — this is the path that
@@ -189,18 +215,17 @@ func (q *queue) config(resid uint16, attrs []netlink.Attribute) error {
 	binary.BigEndian.PutUint16(body[2:4], resid)
 	body = append(body, data...)
 
-	_, err = q.con.Send(netlink.Message{
+	request := netlink.Message{
 		Header: netlink.Header{
 			Type:  netlink.HeaderType((nfnlSubsysQueue << 8) | nfqnlMsgConfig),
 			Flags: netlink.Request | netlink.Acknowledge,
 		},
 		Data: body,
-	})
-	if err != nil {
-		return err
 	}
-	// Read the ack so a failure surfaces here rather than as a mystery later.
-	if _, err := q.con.Receive(); err != nil {
+	// Execute correlates and validates the kernel ACK. In particular, startup
+	// fails if this kernel cannot accept NFQA_CFG_F_FAIL_OPEN; silently running
+	// without overload fail-open is unsafe.
+	if _, err := q.cfg.Execute(request); err != nil {
 		return err
 	}
 	return nil
@@ -224,8 +249,10 @@ func (q *queue) interrupt() {
 // packet is one queued packet: its id and its bytes. The payload aliases the
 // queue's read buffer and is only valid until the next read.
 type packet struct {
-	id      uint32
-	payload []byte
+	id             uint32
+	generationMark uint32
+	routingMark    uint32
+	payload        []byte
 	// truncated is set when the kernel copied less than the packet's real
 	// length, which makes the payload unsafe to manipulate or reinject.
 	truncated bool
@@ -322,6 +349,18 @@ func parsePacket(body []byte) (packet, error) {
 				return packet{}, errors.New("short nfqnl_msg_packet_hdr")
 			}
 			p.id = binary.BigEndian.Uint32(data[0:4])
+		case nfqaMark:
+			if len(data) >= 4 {
+				p.routingMark = binary.BigEndian.Uint32(data[0:4])
+			}
+		case nfqaCt:
+			mark, ok, err := conntrackMark(data)
+			if err != nil {
+				return packet{}, err
+			}
+			if ok {
+				p.generationMark = mark
+			}
 		case nfqaPayload:
 			p.payload = data
 		case nfqaCapLen:
@@ -342,6 +381,24 @@ func parsePacket(body []byte) (packet, error) {
 		p.truncated = true
 	}
 	return p, nil
+}
+
+func conntrackMark(attrs []byte) (uint32, bool, error) {
+	for len(attrs) >= nlaHdrLen {
+		alen := int(binary.LittleEndian.Uint16(attrs[0:2]))
+		atype := binary.LittleEndian.Uint16(attrs[2:4]) & 0x3fff
+		if alen < nlaHdrLen || alen > len(attrs) {
+			return 0, false, fmt.Errorf("malformed conntrack attribute: len %d in %d bytes", alen, len(attrs))
+		}
+		if atype == ctaMark {
+			if alen < nlaHdrLen+4 {
+				return 0, false, errors.New("short CTA_MARK")
+			}
+			return binary.BigEndian.Uint32(attrs[nlaHdrLen : nlaHdrLen+4]), true, nil
+		}
+		attrs = attrs[min(nlmsgAlign(alen), len(attrs)):]
+	}
+	return 0, false, nil
 }
 
 // accept defers an accept verdict into the current batch.

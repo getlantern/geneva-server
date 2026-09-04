@@ -16,6 +16,29 @@ cd "$(dirname "$0")"
 COMPOSE=(docker compose -f docker-compose.yml)
 source ../scripts/harness-lib.sh
 
+active_identity=''
+
+artifact_json() {
+  local dna="$1" digest payload
+  digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
+  payload=$(printf '%s' "$dna" | base64 -w0)
+  printf '{"metadata":{"technique":"geneva","revision":"e2e-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"dev","schema_version":1},"payload":"%s"}' \
+    "$digest" "$digest" "${#dna}" "$payload"
+}
+
+activate_strategy() {
+  local body
+  body=$(artifact_json "$1")
+  printf '%s' "$body" | "${COMPOSE[@]}" exec -T tester curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/prepare >/dev/null
+  printf '%s' "$body" | "${COMPOSE[@]}" exec -T tester curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/activate-for-new-connections >/dev/null
+  active_identity=$(printf '%s' "$body" | jq -c '.metadata | {technique, revision, digest: .content_sha256}')
+}
+
+deactivate_strategy() {
+  printf '%s' "$active_identity" | "${COMPOSE[@]}" exec -T tester curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/deactivate-for-new-connections >/dev/null
+  active_identity=''
+}
+
 step "Build and start server + sidecar"
 "${COMPOSE[@]}" up -d --build server sidecar
 "${COMPOSE[@]}" --profile tools up -d --build tester
@@ -25,6 +48,7 @@ step "Wait for the control/health surface"
 wait_healthy tester || fail "control surface never became healthy"
 mode=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq -r .mode)
 [[ "$mode" == "prod" ]] && pass "control surface healthy (mode=$mode)" || fail "unexpected mode: $mode"
+activate_strategy "$(tr -d '\n' < strategy.txt)"
 
 step "1. Normal service survives the strategy (payload integrity)"
 "${COMPOSE[@]}" exec -T tester sh -c '
@@ -83,39 +107,26 @@ echo "$ruleset" | grep -q "tcp flags" && pass "egress steering narrowed to the s
   && pass "unrelated :9090 service still serves normally" \
   || fail ":9090 service broke"
 
-step "In-place strategy reload on the running prod sidecar"
+step "In-place strategy replacement on the running prod sidecar"
 newdna='[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/'
-"${COMPOSE[@]}" exec -T tester sh -c "curl -fsS -X PUT --data-binary '$newdna' http://server:8092/strategy" >/dev/null \
-  && pass "PUT /strategy accepted on a prod-mode box" \
-  || fail "PUT /strategy rejected"
-got=$("${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8092/strategy' | jq -r .strategy)
-[[ "$got" == "$newdna" ]] && pass "strategy swapped in place (no restart)" || fail "strategy not updated: $got"
+activate_strategy "$newdna" && pass "v1 lifecycle activated replacement" || fail "v1 lifecycle replacement rejected"
 "${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8080/healthz' >/dev/null \
   && pass "service still serves after the in-place swap" \
   || fail "service broke after strategy swap"
 
-step "3. An empty strategy takes the box off the data path entirely"
-"${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS -X PUT --data-binary "" http://server:8092/strategy' >/dev/null \
-  && pass "PUT of an empty strategy accepted" \
-  || fail "PUT of an empty strategy rejected"
-if "${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server >/dev/null 2>&1; then
-  fail "steering table still present with a strategy that can match nothing"
-else
-  pass "steering table removed: no packet takes the round trip"
-fi
-steering=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz | jq -r .steering.steering)
-[[ "$steering" == "false" ]] && pass "health surface reports steering=false" || fail "health surface reports steering=$steering"
+step "3. Deactivation stops new assignments without resetting existing flows"
+deactivate_strategy && pass "v1 lifecycle deactivated new assignments" || fail "v1 lifecycle deactivation rejected"
+"${COMPOSE[@]}" exec -T sidecar nft list table inet geneva_server >/dev/null 2>&1 \
+  && pass "draining generation rules remain installed" \
+  || fail "deactivation removed rules needed by existing flows"
 "${COMPOSE[@]}" exec -T tester sh -c 'curl -fsS http://server:8080/healthz' >/dev/null \
   && pass "service still serves with the sidecar idle" \
   || fail "service broke after the strategy was withdrawn"
 # Put a strategy back, so the teardown check below exercises a live table.
-"${COMPOSE[@]}" exec -T tester sh -c "curl -fsS -X PUT --data-binary '$newdna' http://server:8092/strategy" >/dev/null
+activate_strategy "$newdna"
 
 step "4. Clean teardown leaves no stale rules"
 "${COMPOSE[@]}" stop -t 10 sidecar >/dev/null
-"${COMPOSE[@]}" logs sidecar 2>&1 | grep -q "nftables steering removed" \
-  && pass "sidecar logged rule teardown on shutdown" \
-  || fail "sidecar did not log teardown"
 # Inspect the netns from a fresh container: the table must be gone.
 if "${COMPOSE[@]}" run --rm --entrypoint nft probe list table inet geneva_server >/dev/null 2>&1; then
   fail "geneva_server table still present after shutdown: rules leaked"

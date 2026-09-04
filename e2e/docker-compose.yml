@@ -17,6 +17,8 @@ services:
       dockerfile: e2e/Dockerfile.echo
     image: geneva-e2e/echo:latest
     entrypoint: ["/usr/local/bin/entrypoint-server.sh"]
+    cap_add:
+      - NET_ADMIN
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/healthz"]
       interval: "1s"
@@ -28,6 +30,16 @@ services:
       context: ..
       dockerfile: Dockerfile
     image: geneva-e2e/server:latest
+    # Mirror systemd's dedicated non-root UID plus ambient capabilities. The
+    # UID is also the raw-socket nft exclusion; the root-owned proxy is distinct.
+    entrypoint:
+      - "/usr/bin/setpriv"
+      - "--reuid=65534"
+      - "--regid=65534"
+      - "--clear-groups"
+      - "--inh-caps=+net_admin,+net_raw"
+      - "--ambient-caps=+net_admin,+net_raw"
+      - "/usr/local/bin/geneva-server"
     network_mode: "service:server"
     cap_add:
       - NET_ADMIN
@@ -35,15 +47,14 @@ services:
     depends_on:
       server:
         condition: service_healthy
-    volumes:
-      - ./strategy.txt:/strategy.txt:ro
     command:
       - "run"
       - "--mode=prod"
-      - "--strategy-file=/strategy.txt"
       - "--port=8080"
       - "--iface=eth0"
       - "--control-addr=0.0.0.0:8092"
+      - "--adapter-state-file=/tmp/adapter-state.json"
+      - "--reinject-bypass-uid=65534"
 
   tester:
     image: geneva-e2e/echo:latest
@@ -51,10 +62,14 @@ services:
       server:
         condition: service_healthy
     profiles: ["tools"]
+    cap_add:
+      - NET_ADMIN
     entrypoint: ["sleep", "infinity"]
 
   probe:
-    image: geneva-e2e/server:latest
+    image: geneva-e2e/echo:latest
     network_mode: "service:server"
     profiles: ["tools"]
+    cap_add:
+      - NET_ADMIN
     entrypoint: ["sleep", "infinity"]

@@ -18,6 +18,7 @@ import (
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/control"
 	"github.com/getlantern/geneva-server/internal/engine"
+	"github.com/getlantern/geneva-server/internal/flowtrack"
 	"github.com/getlantern/geneva-server/internal/nfqueue"
 	"github.com/getlantern/geneva-server/internal/nftables"
 	"github.com/getlantern/geneva-server/internal/steering"
@@ -49,20 +50,13 @@ func (s slogLogger) Errorf(f string, a ...any) { s.l.Error(fmt.Sprintf(f, a...))
 // calls do not return the same numbers.
 const censorReadInterval = 2 * time.Second
 
-func runServer(o *runCmd) error {
+func runServer(o *runCmd) (runResult error) {
 	ctx := context.Background()
 	started := time.Now()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	dna, err := o.resolveStrategy()
-	if err != nil {
-		return err
-	}
-	eng, err := engine.New(dna)
-	if err != nil {
-		return err
-	}
-	log.Info("engine ready", "mode", o.Mode, "strategy", eng.DNA())
+	eng := engine.NewRegistry()
+	log.Info("engine registry ready", "mode", o.Mode)
 
 	// eval mode captures a per-market canary pool from live traffic.
 	var pool *canary.Pool
@@ -75,6 +69,14 @@ func runServer(o *runCmd) error {
 	// Signals cancel the root context so cleanup (nft teardown) always runs.
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	fatalCause := make(chan error, 1)
+	reportFatal := func(err error) {
+		select {
+		case fatalCause <- err:
+		default:
+		}
+		stop()
+	}
 
 	// The controller owns both halves of "what reaches userspace": the NIC's
 	// offload state and the steering rules. It installs rules only for the
@@ -84,32 +86,29 @@ func runServer(o *runCmd) error {
 	ctrl := steering.New(eng, steering.Config{
 		Mode: o.Mode,
 		NFT: nftables.Config{
-			Table:    o.Table,
-			Port:     o.Port,
-			OutQueue: o.OutQueue,
-			InQueue:  o.InQueue,
-			Mark:     uint32(o.Mark),
-			NFTPath:  o.NFTPath,
-			Censor:   o.CensorCounters,
+			Table:     o.Table,
+			Port:      o.Port,
+			OutQueue:  o.OutQueue,
+			InQueue:   o.InQueue,
+			BypassUID: uint32(o.ReinjectBypassUID),
+			NFTPath:   o.NFTPath,
+			Censor:    o.CensorCounters,
 		},
 		EthtoolPath: o.EthtoolPath,
 		Iface:       o.Iface,
-		NoNFT:       o.NoNFT,
 
-		ObserveInbound: o.ObserveInbound,
+		ObserveInbound:            o.ObserveInbound,
+		StateFile:                 o.AdapterStateFile,
+		Connections:               flowtrack.Counter{},
+		MaxGenerations:            o.MaxGenerations,
+		MaxScopedGenerations:      o.MaxScopedGenerations,
+		MaxEveryPacketGenerations: o.MaxEveryPacketGenerations,
+		RuntimeVersion:            version,
+		Fatal: func(err error) {
+			log.Error("fatal steering integrity failure", "err", err)
+			reportFatal(err)
+		},
 	}, slogLogger{l: log})
-	if err := ctrl.Start(ctx); err != nil {
-		return err
-	}
-	defer func() {
-		// Use a fresh context: the root one is already cancelled at shutdown.
-		rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := ctrl.Close(rmCtx); err != nil {
-			log.Error("steering teardown failed", "err", err)
-		}
-	}()
-
 	// The inbound censor classifier runs in both modes: a prod box's IP gets
 	// burned the same way a test box's does, and the fleet-wide burn rate is
 	// what sizes the clean-IP budget for exploration.
@@ -133,15 +132,67 @@ func runServer(o *runCmd) error {
 
 	// NFQUEUE runtime.
 	rt, err := nfqueue.New(eng, nfqueue.Config{
-		OutQueue: o.OutQueue,
-		InQueue:  o.InQueue,
-		Mark:     uint32(o.Mark),
-		Observer: observer,
-		Logger:   slogLogger{l: log},
+		OutQueue:         o.OutQueue,
+		InQueue:          o.InQueue,
+		MaxQueueLen:      o.QueueMaxLen,
+		Observer:         observer,
+		Logger:           slogLogger{l: log},
+		IntegrityFailure: ctrl.IntegrityFailure,
 	})
 	if err != nil {
 		return err
 	}
+	// Queue ownership and required kernel fail-open configuration must be
+	// acknowledged before any active steering can exist.
+	if err := rt.Open(); err != nil {
+		_ = rt.Close()
+		return err
+	}
+	if err := ctrl.Start(ctx); err != nil {
+		startErr := err
+		var teardownErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			teardownErr = ctrl.Close(rmCtx)
+			cancel()
+			if teardownErr == nil {
+				return errors.Join(startErr, rt.Close())
+			}
+			if attempt < 3 {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		// Do not explicitly release the queues while kernel steering might remain.
+		// The command is terminating, so process teardown becomes the last-resort
+		// fail-open boundary after reporting the unconfirmed cleanup.
+		return errors.Join(startErr, fmt.Errorf("startup steering cleanup could not be confirmed: %w", teardownErr))
+	}
+	// Queue descriptors stay owned until teardown has read back the absence of
+	// steering. On a failed removal, retry while the queues remain bound; never
+	// deliberately create a foreign-listener/no-listener window.
+	defer func() {
+		var teardownErr error
+		for attempt := 1; attempt <= 3; attempt++ {
+			rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			teardownErr = ctrl.Close(rmCtx)
+			cancel()
+			if teardownErr == nil {
+				if err := rt.Close(); err != nil {
+					log.Error("NFQUEUE close failed", "err", err)
+				}
+				return
+			}
+			log.Error("steering teardown failed while queues remain bound", "attempt", attempt, "err", teardownErr)
+			if attempt < 3 {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		// The process is already terminating. Leave the descriptors open until
+		// kernel process cleanup rather than releasing them ahead of live rules.
+		log.Error("unable to confirm steering removal; retaining NFQUEUE ownership until process exit", "err", teardownErr)
+		runResult = errors.Join(runResult,
+			fmt.Errorf("shutdown steering cleanup could not be confirmed: %w", teardownErr))
+	}()
 
 	// Profiling is opt-in and separate from the control surface: it is a
 	// benchmarking tool, and the control surface is unauthenticated on a box
@@ -191,6 +242,7 @@ func runServer(o *runCmd) error {
 					Modified:    s.Modified,
 					Reinjected:  s.Reinjected,
 					InjectFails: s.InjectFails,
+					Overruns:    s.Overruns,
 				}
 			},
 		}); err != nil {
@@ -210,10 +262,15 @@ func runServer(o *runCmd) error {
 		Canary:     pool,
 		Verdicts:   func() any { return rt.Snapshot() },
 		InboundTCP: func() any { return censorSrc.Snapshot() },
-		// A strategy change is not just an engine swap: it can put the box on
-		// or take it off the data path, so it has to go through the controller.
-		Apply:    ctrl.Apply,
-		Steering: func() any { return ctrl.State() },
+		Steering:   func() any { return ctrl.State() },
+		Health: func() error {
+			state := ctrl.State()
+			if state.Unsafe {
+				return errors.New(state.IntegrityFailure)
+			}
+			return nil
+		},
+		Adapter: ctrl,
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,
@@ -240,6 +297,21 @@ func runServer(o *runCmd) error {
 
 	log.Info("nfqueue runtime starting", "out_queue", o.OutQueue, "in_queue", o.InQueue)
 	err = rt.Run(ctx)
+	runResult = runtimeExitError(err, fatalCause, serveErr)
+	if runResult == nil {
+		log.Info("shutting down")
+	}
+	return runResult
+}
+
+// runtimeExitError preserves the difference systemd needs: operator shutdown
+// is clean, while an integrity fatal or failed control listener exits nonzero.
+func runtimeExitError(runErr error, fatalCause <-chan error, serveErr <-chan error) error {
+	select {
+	case fatalErr := <-fatalCause:
+		return fmt.Errorf("fatal steering integrity failure: %w", fatalErr)
+	default:
+	}
 
 	// If the control listener failed, surface that as the exit error rather than
 	// reporting a clean shutdown: the process must not exit 0 when the control
@@ -250,9 +322,8 @@ func runServer(o *runCmd) error {
 	default:
 	}
 
-	if errors.Is(err, context.Canceled) {
-		log.Info("shutting down")
+	if errors.Is(runErr, context.Canceled) {
 		return nil
 	}
-	return err
+	return runErr
 }

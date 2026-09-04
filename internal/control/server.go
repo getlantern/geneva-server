@@ -22,9 +22,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/getlantern/geneva-server/internal/adapter"
 	"github.com/getlantern/geneva-server/internal/canary"
 	"github.com/getlantern/geneva-server/internal/engine"
 )
@@ -34,7 +34,10 @@ type Providers struct {
 	Mode    string
 	Version string
 	Commit  string
-	Engine  *engine.Engine
+	Engine  interface {
+		DNA() string
+		Snapshot() engine.Snapshot
+	}
 	// Canary is the eval-mode capture pool; nil in prod mode.
 	Canary *canary.Pool
 	// Verdicts returns the runtime's verdict counters (JSON-marshalable). It may
@@ -43,17 +46,17 @@ type Providers struct {
 	// InboundTCP returns the inbound TCP event counts (JSON-marshalable), the
 	// box-side censor-reachability signal. It may be nil.
 	InboundTCP func() any
-	// Apply installs a strategy end to end: it reprograms the kernel's steering
-	// for what the new strategy can match and then swaps the engine. PUT goes
-	// through it rather than straight to the engine, because a strategy change
-	// can put the box on or take it off the data path. It is required for PUT:
-	// a caller that forgets to wire it gets a loud 503, never a silent
-	// engine-only swap that leaves the kernel steering for the old strategy.
-	Apply func(ctx context.Context, dna string) error
+	// Health reports lifecycle integrity. A process remains reachable for local
+	// rollback remediation while readiness is unhealthy and steering is inactive.
+	Health func() error
 	// Steering returns what the box is currently steering (JSON-marshalable).
 	// It may be nil.
 	Steering func() any
+	Adapter  Adapter
 }
+
+// Adapter is deliberately generic and contains no cloud or transport types.
+type Adapter = adapter.Adapter
 
 // Server is the HTTP control surface.
 type Server struct {
@@ -70,8 +73,16 @@ func New(p Providers) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.HandleFunc("/strategy", s.handleStrategy)
 	mux.HandleFunc("/canary", s.handleCanary)
+	mux.HandleFunc("/v1/adapter/prepare", s.handlePrepare)
+	mux.HandleFunc("/v1/adapter/descriptor", s.handleDescriptor)
+	mux.HandleFunc("/v1/adapter/verify", s.handleVerify)
+	mux.HandleFunc("/v1/adapter/activate-for-new-connections", s.handleActivateNew)
+	mux.HandleFunc("/v1/adapter/deactivate-for-new-connections", s.handleDeactivateNew)
+	mux.HandleFunc("/v1/adapter/status", s.handleAdapterStatus)
+	mux.HandleFunc("/v1/adapter/drain", s.handleDrain)
+	mux.HandleFunc("/v1/adapter/garbage-collect", s.handleGC)
+	mux.HandleFunc("/v1/adapter/rollback", s.handleRollback)
 	return mux
 }
 
@@ -79,11 +90,12 @@ func (s *Server) uptime() float64 { return time.Since(s.started).Seconds() }
 
 type healthResp struct {
 	Status   string          `json:"status"`
+	Error    string          `json:"error,omitempty"`
 	Mode     string          `json:"mode"`
 	Version  string          `json:"version"`
 	Commit   string          `json:"commit"`
 	Uptime   float64         `json:"uptime_seconds"`
-	Strategy string          `json:"strategy"`
+	Strategy string          `json:"strategy,omitempty"`
 	Engine   engine.Snapshot `json:"engine"`
 	Verdicts any             `json:"verdicts,omitempty"`
 	// InboundTCP is reported here as well as over OTLP so the counters can be
@@ -97,14 +109,14 @@ type healthResp struct {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	statusCode := http.StatusOK
 	resp := healthResp{
-		Status:   "ok",
-		Mode:     s.p.Mode,
-		Version:  s.p.Version,
-		Commit:   s.p.Commit,
-		Uptime:   s.uptime(),
-		Strategy: s.p.Engine.DNA(),
-		Engine:   s.p.Engine.Snapshot(),
+		Status:  "ok",
+		Mode:    s.p.Mode,
+		Version: s.p.Version,
+		Commit:  s.p.Commit,
+		Uptime:  s.uptime(),
+		Engine:  s.p.Engine.Snapshot(),
 	}
 	if s.p.Verdicts != nil {
 		resp.Verdicts = s.p.Verdicts()
@@ -115,58 +127,214 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.p.Steering != nil {
 		resp.Steering = s.p.Steering()
 	}
-	writeJSON(w, http.StatusOK, resp)
+	if s.p.Health != nil {
+		if err := s.p.Health(); err != nil {
+			resp.Status = "unhealthy"
+			resp.Error = err.Error()
+			statusCode = http.StatusServiceUnavailable
+		}
+	}
+	writeJSON(w, statusCode, resp)
 }
 
-// handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).
-// PUT validates the DNA before installing it, and the swap is atomic, so the new
-// strategy applies to the next packet with no restart. This works in both modes.
-//
-// The swap is not strategy-content-only: steering is scoped to what the strategy
-// can match, so installing one can widen, narrow, or remove the kernel's rules
-// (see internal/steering). PUT of an empty strategy takes the box off the data
-// path completely. The write endpoint is unauthenticated, so the control address
-// must stay on a private interface (see deploy/README.md).
-func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
-	case http.MethodPut:
-		if s.p.Apply == nil {
-			writeError(w, http.StatusServiceUnavailable, "strategy updates are not wired up")
-			return
-		}
-		// MaxBytesReader returns an error once the limit is exceeded, so an oversized
-		// body is rejected rather than silently truncated (as io.LimitReader would).
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeError(w, http.StatusRequestEntityTooLarge, "strategy exceeds 1 MiB limit")
-				return
-			}
-			writeError(w, http.StatusBadRequest, "read body: "+err.Error())
-			return
-		}
-		// Tolerate a trailing newline or surrounding whitespace (common when the
-		// body is piped from a file), which would otherwise fail validation.
-		dna := strings.TrimSpace(string(body))
-		if err := s.p.Apply(r.Context(), dna); err != nil {
-			// Only a strategy the client got wrong is the client's fault. A
-			// failure to program the kernel for a valid one is ours, and a 400
-			// there would send the caller off fixing a DNA that is fine.
-			if errors.Is(err, engine.ErrInvalidStrategy) {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "apply strategy: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+const (
+	// Base64 expands the generic []byte payload by 4/3. Keep a bounded allowance
+	// for immutable metadata while enforcing the decoded payload separately.
+	maxArtifactRequest = 2*adapter.MaxArtifactSize + 4096
+)
+
+type garbageCollectRequest struct {
+	Keep []adapter.ArtifactIdentity `json:"keep"`
+}
+
+func operationContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
+}
+
+func (s *Server) adapter(w http.ResponseWriter) Adapter {
+	if s.p.Adapter == nil {
+		writeError(w, http.StatusServiceUnavailable, "adapter lifecycle is not wired up")
 	}
+	return s.p.Adapter
+}
+
+func decodeAdapterRequest(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxArtifactRequest)
+	body, err := io.ReadAll(r.Body)
+	if err == nil {
+		err = json.Unmarshal(body, dst)
+	}
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeError(w, http.StatusRequestEntityTooLarge, "serialized adapter request exceeds its bounded envelope")
+		} else if errors.Is(err, adapter.ErrPayloadTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		} else {
+			writeError(w, http.StatusBadRequest, "decode request: "+err.Error())
+		}
+		return false
+	}
+	if artifact, ok := dst.(*adapter.Artifact); ok && len(artifact.Payload()) > adapter.MaxArtifactSize {
+		writeError(w, http.StatusRequestEntityTooLarge, "artifact exceeds 256 KiB")
+		return false
+	}
+	return true
+}
+
+func lifecycleResult(w http.ResponseWriter, err error) {
+	if err == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+	code := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, engine.ErrInvalidStrategy):
+		code = http.StatusBadRequest
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		code = http.StatusGatewayTimeout
+	case errors.Is(err, adapter.ErrLifecycleConflict):
+		code = http.StatusConflict
+	}
+	writeError(w, code, err.Error())
+}
+
+func (s *Server) handlePrepare(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.Prepare(ctx, artifact))
+}
+
+func (s *Server) handleDescriptor(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	writeJSON(w, http.StatusOK, a.Descriptor())
+}
+
+func (s *Server) handleVerify(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.Verify(ctx, artifact))
+}
+
+func (s *Server) handleActivateNew(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.ActivateForNewConnections(ctx, artifact))
+}
+
+func (s *Server) handleDeactivateNew(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var identity adapter.ArtifactIdentity
+	if !decodeAdapterRequest(w, r, &identity) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.DeactivateForNewConnections(ctx, identity))
+}
+
+func (s *Server) handleAdapterStatus(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	status, err := a.Status(ctx)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var identity adapter.ArtifactIdentity
+	if !decodeAdapterRequest(w, r, &identity) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	result, err := a.Drain(ctx, identity)
+	if err != nil {
+		lifecycleResult(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGC(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var req garbageCollectRequest
+	if !decodeAdapterRequest(w, r, &req) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.GarbageCollect(ctx, req.Keep))
+}
+
+func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
+	a := s.adapter(w)
+	if a == nil {
+		return
+	}
+	var artifact adapter.Artifact
+	if !decodeAdapterRequest(w, r, &artifact) {
+		return
+	}
+	ctx, cancel := operationContext(r)
+	defer cancel()
+	lifecycleResult(w, a.Rollback(ctx, artifact))
 }
 
 func (s *Server) handleCanary(w http.ResponseWriter, r *http.Request) {

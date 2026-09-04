@@ -8,8 +8,8 @@
 // the NIC would fill in later. Reinjecting such a packet through a raw socket
 // fails or puts a corrupt frame on the wire. Disabling these offloads makes
 // NFQUEUE hand us real, MTU-sized, fully-checksummed packets — the same thing
-// the canonical Geneva engine requires. This is best-effort: some virtual
-// interfaces expose a subset of features as fixed, and that is fine.
+// the canonical Geneva engine requires. An enabled fixed feature is a hard
+// setup error because the controller cannot establish that packet invariant.
 package netdev
 
 import (
@@ -17,60 +17,66 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 )
 
 // offloadFeatures are disabled on the steered interface. Segmentation offloads
 // keep packets MTU-sized; checksum/scatter-gather offloads keep checksums real.
-var offloadFeatures = []string{"gso", "tso", "gro", "gre", "tx", "rx", "sg", "lro", "ufo"}
+var offloadFeatures = []string{"gso", "tso", "gro", "tx-gre-segmentation", "tx", "rx", "sg", "lro", "ufo"}
 
 // restoreOrder re-enables features in dependency order. Segmentation offloads
 // require scatter-gather and tx checksumming, so restoring in the disable order
 // makes the kernel reject `tso on` and `gso on` as unsupported and silently
 // leaves them off.
-var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "gre", "lro", "ufo"}
+var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "tx-gre-segmentation", "lro", "ufo"}
 
 // ethtoolNames maps the short feature names used with `ethtool -K` to the long
 // names `ethtool -k` reports state under. Only the features whose state we need
-// to read are listed; anything absent is simply attempted blind.
+// to read are listed; anything absent is left untouched and reported as
+// unchanged because the controller cannot safely claim ownership of it.
 var ethtoolNames = map[string]string{
-	"gso": "generic-segmentation-offload",
-	"tso": "tcp-segmentation-offload",
-	"gro": "generic-receive-offload",
-	"lro": "large-receive-offload",
-	"sg":  "scatter-gather",
-	"tx":  "tx-checksumming",
-	"rx":  "rx-checksumming",
-	"ufo": "udp-fragmentation-offload",
+	"gso":                 "generic-segmentation-offload",
+	"tso":                 "tcp-segmentation-offload",
+	"gro":                 "generic-receive-offload",
+	"tx-gre-segmentation": "tx-gre-segmentation",
+	"lro":                 "large-receive-offload",
+	"sg":                  "scatter-gather",
+	"tx":                  "tx-checksumming",
+	"rx":                  "rx-checksumming",
+	"ufo":                 "udp-fragmentation-offload",
 }
 
-// readFeatures returns which of the offload features are currently on, keyed by
-// short name. A feature the driver reports as "[fixed]" is reported by its
-// current value and cannot be changed either way, which is what Disable needs
-// to know. Features it cannot determine are simply absent from the map.
-func readFeatures(ctx context.Context, ethtoolPath, iface string) map[string]bool {
+type featureState struct {
+	enabled bool
+	fixed   bool
+}
+
+// readFeatures returns the offload feature states keyed by short name. A
+// feature the driver reports as "[fixed]" retains its current value and fixed
+// flag. Features whose state cannot be determined are absent from the map.
+func readFeatures(ctx context.Context, ethtoolPath, iface string) (map[string]featureState, error) {
 	out, err := exec.CommandContext(ctx, ethtoolPath, "-k", iface).Output()
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("read offloads on %s: %w", iface, err)
 	}
-	long := make(map[string]bool, len(ethtoolNames))
+	return parseFeatureOutput(out), nil
+}
+
+func parseFeatureOutput(out []byte) map[string]featureState {
+	long := make(map[string]featureState, len(ethtoolNames))
 	for line := range strings.SplitSeq(string(out), "\n") {
 		name, value, found := strings.Cut(strings.TrimSpace(line), ":")
 		if !found {
 			continue
 		}
 		value = strings.TrimSpace(value)
-		on := strings.HasPrefix(value, "on")
-		fixed := strings.Contains(value, "[fixed]")
-		// A fixed feature is unchangeable: record its value so Disable skips it
-		// when it is already off and Restore never tries to set it.
-		if fixed && !on {
-			long[name] = false
-			continue
+		long[name] = featureState{
+			enabled: strings.HasPrefix(value, "on"),
+			fixed:   strings.Contains(value, "[fixed]"),
 		}
-		long[name] = on
 	}
-	state := make(map[string]bool, len(ethtoolNames))
+	state := make(map[string]featureState, len(ethtoolNames))
 	for short, name := range ethtoolNames {
 		if v, ok := long[name]; ok {
 			state[short] = v
@@ -79,34 +85,38 @@ func readFeatures(ctx context.Context, ethtoolPath, iface string) map[string]boo
 	return state
 }
 
-// Disabled records the features Disable actually turned off on an interface, so
-// Restore can put back exactly those and nothing else.
-type Disabled struct {
-	ethtoolPath string
-	iface       string
-	features    []string
-	skipped     []string
+// Original is the durable set of features which were on before this
+// controller touched the interface. Persisting it before mutation lets a
+// restarted controller restore exactly its own changes without claiming
+// features which an operator had already disabled.
+type Original struct {
+	Interface string   `json:"interface"`
+	Features  []string `json:"features"`
+	skipped   []string
 }
 
 // Summary describes what changed, for logging.
-func (d *Disabled) Summary() string {
-	if d == nil {
+func (o *Original) Summary() string {
+	if o == nil {
 		return "unchanged=[all]"
 	}
 	return fmt.Sprintf("disabled=[%s] unchanged=[%s]",
-		strings.Join(d.features, " "), strings.Join(d.skipped, " "))
+		strings.Join(o.Features, " "), strings.Join(o.skipped, " "))
 }
 
-// Restore re-enables the features Disable turned off. Failures are collected
+// Restore re-enables the features owned by the controller. Failures are collected
 // rather than returned on the first one: a partial restore is better than
 // stopping halfway, and the caller logs rather than aborts — the sidecar is on
 // its way out by the time this runs.
-func (d *Disabled) Restore(ctx context.Context) error {
-	if d == nil || len(d.features) == 0 {
+func (o *Original) Restore(ctx context.Context, ethtoolPath string) error {
+	if o == nil || len(o.Features) == 0 {
 		return nil
 	}
-	want := make(map[string]bool, len(d.features))
-	for _, f := range d.features {
+	if ethtoolPath == "" {
+		ethtoolPath = "ethtool"
+	}
+	want := make(map[string]bool, len(o.Features))
+	for _, f := range o.Features {
 		want[f] = true
 	}
 	var failed []string
@@ -114,28 +124,24 @@ func (d *Disabled) Restore(ctx context.Context) error {
 		if !want[f] {
 			continue
 		}
-		if err := exec.CommandContext(ctx, d.ethtoolPath, "-K", d.iface, f, "on").Run(); err != nil {
+		if err := exec.CommandContext(ctx, ethtoolPath, "-K", o.Interface, f, "on").Run(); err != nil {
 			failed = append(failed, f)
 		}
 	}
-	d.features = nil
+	o.Features = append(o.Features[:0], failed...)
 	if len(failed) > 0 {
-		return fmt.Errorf("could not re-enable offloads on %s: %s", d.iface, strings.Join(failed, " "))
+		return fmt.Errorf("could not re-enable offloads on %s: %s", o.Interface, strings.Join(failed, " "))
 	}
 	return nil
 }
 
-// Disable turns off segmentation and checksum offloads on iface and returns
-// what it changed.
+// Capture records the exact known-on offloads before mutation.
 //
-// Individual features that cannot be changed are reported in the returned
-// summary rather than as an error: some virtual interfaces expose a subset as
-// fixed, and the ones that matter on a given interface are typically
-// changeable. Three conditions are hard errors — a missing ethtool, a missing
-// interface, and no feature changeable at all — because each of them means
-// NFQUEUE would go on receiving GSO/checksum-offloaded packets that cannot be
-// reinjected intact.
-func Disable(ctx context.Context, ethtoolPath, iface string) (*Disabled, error) {
+// Disabled fixed features and unknown features are reported in the returned
+// summary rather than claimed. Enabled fixed features are rejected because
+// NFQUEUE would keep receiving offloaded packets that cannot be reinjected
+// intact.
+func Capture(ctx context.Context, ethtoolPath, iface string) (*Original, error) {
 	if ethtoolPath == "" {
 		ethtoolPath = "ethtool"
 	}
@@ -152,27 +158,50 @@ func Disable(ctx context.Context, ethtoolPath, iface string) (*Disabled, error) 
 	// driver reports as fixed, must not be recorded as something we turned off:
 	// Restore would then try to switch it back on and fail. veth reports lro
 	// exactly that way.
-	state := readFeatures(ctx, ethtoolPath, iface)
+	state, err := readFeatures(ctx, ethtoolPath, iface)
+	if err != nil {
+		return nil, err
+	}
+	return originalFromState(iface, state)
+}
 
-	var ok, skipped []string
+func originalFromState(iface string, state map[string]featureState) (*Original, error) {
+	var on, skipped []string
 	for _, f := range offloadFeatures {
-		if on, known := state[f]; known && !on {
+		feature, known := state[f]
+		if !known || !feature.enabled {
 			skipped = append(skipped, f)
 			continue
 		}
-		if err := exec.CommandContext(ctx, ethtoolPath, "-K", iface, f, "off").Run(); err != nil {
-			// Feature fixed/unsupported on this interface; not fatal on its own.
-			skipped = append(skipped, f)
-			continue
+		if feature.fixed {
+			return nil, fmt.Errorf("required NIC offload %q is enabled and fixed on %s", f, iface)
 		}
-		ok = append(ok, f)
+		on = append(on, f)
 	}
-	// If nothing could be changed at all, something is wrong (permissions, a
-	// context cancellation, an interface that rejects every request) — surface it
-	// rather than letting NFQUEUE receive GSO/checksum-offloaded packets.
-	if len(ok) == 0 {
-		return nil, fmt.Errorf("failed to disable any offload on %q (check CAP_NET_ADMIN); attempted: %s",
-			iface, strings.Join(offloadFeatures, " "))
+	return &Original{Interface: iface, Features: on, skipped: skipped}, nil
+}
+
+// Disable applies a captured ownership record. It is idempotent, so startup
+// can safely repeat it whether a crash happened before or after the original
+// mutation.
+func (o *Original) Disable(ctx context.Context, ethtoolPath string) error {
+	if o == nil || len(o.Features) == 0 {
+		return nil
 	}
-	return &Disabled{ethtoolPath: ethtoolPath, iface: iface, features: ok, skipped: skipped}, nil
+	if ethtoolPath == "" {
+		ethtoolPath = "ethtool"
+	}
+	var failed []string
+	for _, f := range o.Features {
+		if !slices.Contains(offloadFeatures, f) {
+			return fmt.Errorf("invalid persisted offload feature %q", f)
+		}
+		if err := exec.CommandContext(ctx, ethtoolPath, "-K", o.Interface, f, "off").Run(); err != nil {
+			failed = append(failed, f)
+		}
+	}
+	if len(failed) != 0 {
+		return fmt.Errorf("could not disable offloads on %s: %s", o.Interface, strings.Join(failed, " "))
+	}
+	return nil
 }

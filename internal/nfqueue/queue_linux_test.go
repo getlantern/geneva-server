@@ -5,21 +5,105 @@ package nfqueue
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"os"
 	"testing"
 
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
+type fakeConfigExecutor struct {
+	message netlink.Message
+	err     error
+}
+
+func (f *fakeConfigExecutor) Execute(m netlink.Message) ([]netlink.Message, error) {
+	f.message = m
+	return nil, f.err
+}
+
+func TestRequiredFailOpenQueueConfiguration(t *testing.T) {
+	steps := queueConfigSteps(unix.AF_INET, 123, 0xffff, 77)
+	var step *configStep
+	for i := range steps {
+		if steps[i].what == "enable required fail-open and conntrack metadata" {
+			step = &steps[i]
+			break
+		}
+	}
+	if step == nil || step.resid != 123 || len(step.attrs) != 2 {
+		t.Fatalf("fail-open step = %+v", step)
+	}
+	values := map[uint16]uint32{}
+	for _, attr := range step.attrs {
+		if len(attr.Data) != 4 {
+			t.Fatalf("attribute %d length = %d", attr.Type, len(attr.Data))
+		}
+		values[attr.Type] = binary.BigEndian.Uint32(attr.Data)
+	}
+	wantFlags := uint32(nfqaCfgFFailOpen | nfqaCfgFConntrack)
+	if values[nfqaCfgMask] != wantFlags || values[nfqaCfgFlags] != wantFlags {
+		t.Fatalf("fail-open mask/flags = %#x/%#x", values[nfqaCfgMask], values[nfqaCfgFlags])
+	}
+
+	wantErr := errors.New("kernel rejected flag")
+	fake := &fakeConfigExecutor{err: wantErr}
+	q := &queue{cfg: fake, family: unix.AF_INET}
+	if err := q.config(step.resid, step.attrs); !errors.Is(err, wantErr) {
+		t.Fatalf("config error = %v, want kernel ACK error", err)
+	}
+	if fake.message.Header.Flags != netlink.Request|netlink.Acknowledge {
+		t.Fatalf("config flags = %#x", fake.message.Header.Flags)
+	}
+}
+
+// Run explicitly inside an isolated network namespace before release:
+// GENEVA_NFQUEUE_INTEGRATION=1 go test ./internal/nfqueue -run TestOpenQueueIntegration
+func TestOpenQueueIntegration(t *testing.T) {
+	if os.Getenv("GENEVA_NFQUEUE_INTEGRATION") != "1" {
+		t.Skip("set GENEVA_NFQUEUE_INTEGRATION=1 inside an isolated root network namespace")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("requires root/CAP_NET_ADMIN")
+	}
+	q, err := openQueue(62000, 0xffff, 8)
+	if err != nil {
+		t.Fatalf("kernel did not acknowledge required fail-open configuration: %v", err)
+	}
+	if collision, err := openQueue(62000, 0xffff, 8); err == nil {
+		_ = collision.Close()
+		t.Fatal("second listener acquired an already-bound NFQUEUE")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // buildPacketBody assembles an NFQNL_MSG_PACKET body the way the kernel does,
 // so the parser is tested against the wire format rather than against itself.
 func buildPacketBody(id uint32, payload []byte, capLen uint32) []byte {
+	return buildMarkedPacketBody(id, 0, 0, payload, capLen)
+}
+
+func buildMarkedPacketBody(id, generationMark, routingMark uint32, payload []byte, capLen uint32) []byte {
 	b := []byte{unix.AF_INET, unix.NFNETLINK_V0, 0, 0} // nfgenmsg; res_id big-endian
 
 	// struct nfqnl_msg_packet_hdr { __be32 packet_id; __be16 hw_protocol; __u8 hook; }
 	hdr := make([]byte, 8)
 	binary.BigEndian.PutUint32(hdr[0:4], id)
 	b = append(b, attr(nfqaPacketHdr, hdr)...)
+	if generationMark != 0 {
+		m := make([]byte, 4)
+		binary.BigEndian.PutUint32(m, generationMark)
+		ct := attr(ctaMark|0x4000, m) // NLA_F_NET_BYTEORDER
+		b = append(b, attr(nfqaCt|0x8000, ct)...)
+	}
+	if routingMark != 0 {
+		m := make([]byte, 4)
+		binary.BigEndian.PutUint32(m, routingMark)
+		b = append(b, attr(nfqaMark, m)...)
+	}
 
 	if capLen != 0 {
 		cl := make([]byte, 4)
@@ -55,6 +139,19 @@ func TestParsePacket(t *testing.T) {
 		}
 		if p.truncated {
 			t.Error("packet reported truncated with no NFQA_CAP_LEN")
+		}
+	})
+
+	t.Run("conntrack metadata selects generation without skb mutation", func(t *testing.T) {
+		p, err := parsePacket(buildMarkedPacketBody(9, 0x6702a000, 0x438, payload, 0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.generationMark != 0x6702a000 {
+			t.Fatalf("conntrack mark = %#x", p.generationMark)
+		}
+		if p.routingMark != 0x438 {
+			t.Fatalf("routing mark = %#x", p.routingMark)
 		}
 	})
 

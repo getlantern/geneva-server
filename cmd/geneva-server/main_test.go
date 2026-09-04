@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestMarkFlagUnmarshalText(t *testing.T) {
 	tests := []struct {
@@ -41,21 +44,13 @@ func TestMarkFlagUnmarshalText(t *testing.T) {
 	}
 }
 
-// TestValidateRequiresNonZeroMark pins that the mark is required even with
-// --no-nft. The mark is what the reinjector stamps via SO_MARK, and with rules
-// managed externally it is the only thing that ruleset can use to tell a
-// reinjected packet from an original one — at zero, reinjected packets are
-// re-queued forever.
-func TestValidateRequiresNonZeroMark(t *testing.T) {
-	for _, noNFT := range []bool{false, true} {
-		o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, NoNFT: noNFT}
-		if err := o.validate(); err == nil {
-			t.Errorf("validate accepted --mark=0 with --no-nft=%v", noNFT)
-		}
-		o.Mark = 0x67656e
-		if err := o.validate(); err != nil {
-			t.Errorf("validate rejected a valid config with --no-nft=%v: %v", noNFT, err)
-		}
+// TestValidateAllowsDeprecatedMarkZero pins that the old high-bit loop guard
+// no longer participates in steering. Reinjection uses the packet's exact
+// routing mark and the dedicated adapter socket UID.
+func TestValidateAllowsDeprecatedMarkZero(t *testing.T) {
+	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, ReinjectBypassUID: -1, AdapterStateFile: "/tmp/adapter-state.json"}
+	if err := o.validate(); err != nil {
+		t.Errorf("deprecated --mark affected managed-nft validation: %v", err)
 	}
 }
 
@@ -68,8 +63,8 @@ func TestValidateRequiresNonZeroMark(t *testing.T) {
 func TestObserveInboundRefusedInProd(t *testing.T) {
 	base := func(mode string, observe bool) *runCmd {
 		return &runCmd{
-			Mode: mode, Port: 443, OutQueue: 100, InQueue: 101,
-			Mark: 0x67656e, ObserveInbound: observe,
+			Mode: mode, Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101,
+			Mark: 0x67656e, ObserveInbound: observe, AdapterStateFile: "/tmp/adapter-state.json",
 		}
 	}
 	if err := base("prod", true).validate(); err == nil {
@@ -80,5 +75,40 @@ func TestObserveInboundRefusedInProd(t *testing.T) {
 	}
 	if err := base("prod", false).validate(); err != nil {
 		t.Errorf("validate rejected prod without the flag: %v", err)
+	}
+}
+
+func TestValidateGenerationBudget(t *testing.T) {
+	for _, n := range []int{-1, 33} {
+		o := &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: n}
+		if err := o.validate(); err == nil {
+			t.Errorf("accepted max generations %d", n)
+		}
+	}
+	o := &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e}
+	if err := o.validate(); err != nil || o.MaxGenerations != 3 || o.MaxScopedGenerations != 3 || o.MaxEveryPacketGenerations != 2 {
+		t.Fatalf("default budgets = total %d scoped %d every %d, %v", o.MaxGenerations, o.MaxScopedGenerations, o.MaxEveryPacketGenerations, err)
+	}
+	o = &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: 1}
+	if err := o.validate(); err != nil || o.MaxScopedGenerations != 1 || o.MaxEveryPacketGenerations != 1 {
+		t.Fatalf("single-generation defaults = scoped %d every %d, %v", o.MaxScopedGenerations, o.MaxEveryPacketGenerations, err)
+	}
+	o = &runCmd{Mode: "eval", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0x67656e, MaxGenerations: 2, MaxScopedGenerations: 3}
+	if err := o.validate(); err == nil {
+		t.Fatal("accepted scoped budget above total")
+	}
+}
+
+func TestProductionRequiresInterfaceForOffloadOwnership(t *testing.T) {
+	o := &runCmd{Mode: "prod", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1, AdapterStateFile: "/tmp/adapter-state.json"}
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "requires --iface") {
+		t.Fatalf("missing interface error = %v", err)
+	}
+}
+
+func TestAuthoritativeProductionRequiresDurableAdapterState(t *testing.T) {
+	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1, AdapterStateFile: "   "}
+	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "requires --adapter-state-file") {
+		t.Fatalf("empty adapter state path error = %v", err)
 	}
 }

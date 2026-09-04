@@ -2,9 +2,10 @@
 // that steer a proxy's TCP traffic into the NFQUEUE queues.
 //
 // All rules live in a single dedicated table (`inet geneva_server` by default).
-// The whole table is created on startup and deleted on shutdown, so the runtime
-// can never leak a stale rule: deleting the table removes every chain and rule
-// it owns atomically, and the table name is disjoint from any other subsystem's.
+// The whole table is created when steering becomes active and deleted when it
+// becomes inactive or the process shuts down, so deleting the table removes
+// every chain and rule it owns atomically. The table name is disjoint from any
+// other subsystem's.
 //
 // The steering is scoped to one TCP port in each direction — the proxy's
 // listening port — to IPv4, and, when the loaded strategy allows it, to the
@@ -12,23 +13,30 @@
 // no trigger can match is passed through byte-for-byte by the engine, so
 // leaving it in the kernel reaches the same result without the round trip; see
 // internal/steering. A direction whose forest is empty gets no rule at all,
-// which is what makes an unconfigured sidecar free. The table family is `inet`, which sees both
-// address families, so the queue rules match `meta nfproto ipv4` explicitly:
+// which is what makes an unconfigured sidecar free. The table family is `inet`,
+// which sees both address families, so queue rules match `meta nfproto ipv4`:
 // the engine and the reinjector are IPv4-only, so queueing IPv6 would spend
-// userspace round trips on packets the engine can only fail open on. Reinjected
-// packets carry a firewall mark and are accepted before the queue rule, which
-// prevents the raw-socket reinjection loop. Both queue rules use `bypass`, so if
+// userspace round trips on packets the engine can only fail open on. Raw-socket
+// reinjections retain the original routing mark and are excluded by the
+// dedicated adapter socket's UID, which prevents a reinjection loop without
+// changing policy routing. Both queue rules use `bypass`, so if
 // the sidecar dies the kernel accepts the packets instead of dropping them: a
 // crashed sidecar fails open and the proxy keeps serving.
 package nftables
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/getlantern/geneva-server/internal/censor"
+	"github.com/getlantern/geneva-server/internal/generation"
 )
 
 // Config describes the steering rules to program.
@@ -42,6 +50,17 @@ type Config struct {
 	// strategy can act on. A zero Selector steers nothing in that direction.
 	Outbound Selector
 	Inbound  Selector
+	// Generations are the immutable live steering scopes. Queue rules require
+	// the generation's conntrack mark, so a widened scope cannot capture an
+	// unmarked connection which predates activation.
+	Generations []Generation
+	// ActiveGeneration is assigned only to unmarked inbound SYNs. Zero stops
+	// assigning new connections while retaining rules for draining ones.
+	ActiveGeneration uint32
+	// NeutralizeNew assigns reserved generation zero without queueing. It is a
+	// temporary activation-boundary state used while pre-existing conntracks
+	// are marked neutral.
+	NeutralizeNew bool
 	// Censor adds the inbound classification counters: named counters and a
 	// chain that sorts arriving packets into them without queueing any of them.
 	// See censorRules.
@@ -49,11 +68,18 @@ type Config struct {
 	// OutQueue receives egress (outbound) packets; InQueue receives ingress.
 	OutQueue uint16
 	InQueue  uint16
-	// Mark is the firewall mark set on reinjected packets so they bypass the
-	// queue rather than being re-queued forever.
-	Mark uint32
+	// BypassUID owns the adapter's raw socket. Deployment must keep this
+	// dedicated service UID distinct from the proxy UID.
+	BypassUID uint32
 	// NFTPath is the nft binary to invoke (default "nft").
 	NFTPath string
+}
+
+// Generation is one immutable engine generation's kernel steering scope.
+type Generation struct {
+	ID       uint32
+	Outbound Selector
+	Inbound  Selector
 }
 
 // Selector narrows a direction's steering to the packets a strategy can match.
@@ -195,6 +221,14 @@ func New(cfg Config) *Manager {
 	return &Manager{cfg: cfg}
 }
 
+// Config returns a copy of the effective manager configuration for lifecycle
+// verification and diagnostics.
+func (m *Manager) Config() Config {
+	cfg := m.cfg
+	cfg.Generations = append([]Generation(nil), cfg.Generations...)
+	return cfg
+}
+
 // Ruleset returns the nft script that Install applies. Exposed so the exact
 // rules can be inspected and asserted in tests without touching the kernel.
 //
@@ -215,12 +249,18 @@ func (m *Manager) Ruleset() string {
 			fmt.Fprintf(&b, "\t%s\n", line)
 		}
 	}
+	gens := m.generations()
 	// Egress (outbound): the proxy sends from Port toward the client/censor.
 	fmt.Fprintf(&b, "\tchain output {\n")
-	fmt.Fprintf(&b, "\t\ttype filter hook output priority 0; policy accept;\n")
-	fmt.Fprintf(&b, "\t\tmeta mark %#x accept\n", m.cfg.Mark)
-	for _, rule := range queueRules(m.cfg.Outbound, "sport", m.cfg.Port, m.cfg.OutQueue) {
-		fmt.Fprintf(&b, "\t\t%s\n", rule)
+	// A route-type output chain is used because routing marks may be set by the
+	// proxy socket. Raw fan-out packets retain their exact original mark and skip
+	// enqueue by their dedicated socket UID.
+	fmt.Fprintf(&b, "\t\ttype route hook output priority mangle; policy accept;\n")
+	fmt.Fprintf(&b, "\t\tmeta skuid %d accept\n", m.cfg.BypassUID)
+	for _, gen := range gens {
+		for _, rule := range generationQueueRules(gen, gen.Outbound, "sport", m.cfg.Port, m.cfg.OutQueue) {
+			fmt.Fprintf(&b, "\t\t%s\n", rule)
+		}
 	}
 	fmt.Fprintf(&b, "\t}\n")
 	// Ingress (inbound): packets arriving for the proxy's Port.
@@ -232,12 +272,41 @@ func (m *Manager) Ruleset() string {
 		// verdict: the chain returns without one.
 		fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d jump %s\n", m.cfg.Port, censorChain)
 	}
-	for _, rule := range queueRules(m.cfg.Inbound, "dport", m.cfg.Port, m.cfg.InQueue) {
-		fmt.Fprintf(&b, "\t\t%s\n", rule)
+	activeGeneration := m.cfg.ActiveGeneration
+	if activeGeneration == 0 && !m.cfg.NeutralizeNew && len(m.cfg.Generations) == 0 &&
+		(!m.cfg.Outbound.Empty() || !m.cfg.Inbound.Empty()) {
+		activeGeneration = 1
+	}
+	if activeGeneration != 0 || m.cfg.NeutralizeNew {
+		mark := generation.Namespace
+		if activeGeneration != 0 {
+			mark, _ = generation.Mark(activeGeneration)
+		}
+		// Only an original inbound SYN creates the affinity. Retransmits retain
+		// their existing connmark, and the low 12 bits are left to other mark users.
+		fmt.Fprintf(&b, "\t\tmeta nfproto ipv4 meta l4proto tcp tcp dport %d ct state new tcp flags & (syn|ack) == syn ct mark & %#x == 0 ct mark set (ct mark & %#x) | %#x\n",
+			m.cfg.Port, generation.Mask, ^generation.Mask, mark)
+	}
+	for _, gen := range gens {
+		for _, rule := range generationQueueRules(gen, gen.Inbound, "dport", m.cfg.Port, m.cfg.InQueue) {
+			fmt.Fprintf(&b, "\t\t%s\n", rule)
+		}
 	}
 	fmt.Fprintf(&b, "\t}\n")
+	// This inert regular chain fingerprints the complete desired configuration.
+	// Seeing it on readback proves the whole atomic replacement committed.
+	fmt.Fprintf(&b, "\tchain %s {}\n", m.revisionChain())
 	fmt.Fprintf(&b, "}\n")
 	return b.String()
+}
+
+func (m *Manager) revisionChain() string {
+	b, err := json.Marshal(m.cfg)
+	if err != nil {
+		panic(fmt.Sprintf("marshal nftables configuration: %v", err))
+	}
+	sum := sha256.Sum256(b)
+	return "geneva_config_" + hex.EncodeToString(sum[:8])
 }
 
 // Idle reports whether the configured selectors steer nothing, in which case no
@@ -247,19 +316,40 @@ func (m *Manager) Ruleset() string {
 // that exists for steering; they never keep one alive on their own, because a
 // box with no strategy is supposed to have nothing of ours in the kernel at all.
 func (m *Manager) Idle() bool {
-	return m.cfg.Outbound.Empty() && m.cfg.Inbound.Empty()
+	if m.cfg.NeutralizeNew {
+		return false
+	}
+	for _, gen := range m.generations() {
+		if !gen.Outbound.Empty() || !gen.Inbound.Empty() {
+			return false
+		}
+	}
+	return m.cfg.ActiveGeneration == 0
 }
 
-// queueRules renders the queue rules for one direction: one per flag match, or
-// a single unconditional rule when the selector is Any.
-func queueRules(sel Selector, portKeyword string, port, queue uint16) []string {
-	base := fmt.Sprintf("meta nfproto ipv4 meta l4proto tcp tcp %s %d", portKeyword, port)
+func (m *Manager) generations() []Generation {
+	if len(m.cfg.Generations) != 0 {
+		return m.cfg.Generations
+	}
+	if m.cfg.Outbound.Empty() && m.cfg.Inbound.Empty() {
+		return nil
+	}
+	return []Generation{{ID: 1, Outbound: m.cfg.Outbound, Inbound: m.cfg.Inbound}}
+}
+
+func generationQueueRules(gen Generation, sel Selector, portKeyword string, port, queue uint16) []string {
+	mark, err := generation.Mark(gen.ID)
+	if err != nil || sel.Empty() {
+		return nil
+	}
+	base := fmt.Sprintf("meta nfproto ipv4 meta l4proto tcp tcp %s %d ct mark & %#x == %#x", portKeyword, port, generation.Mask, mark)
+	// NFQA_CFG_F_CONNTRACK carries CTA_MARK alongside the packet. The skb mark is
+	// never changed for dispatch, so exact routing marks survive accept, bypass,
+	// queue-full fail-open, modified verdicts and raw reinjection.
 	verdict := fmt.Sprintf("queue num %d bypass", queue)
 	switch {
-	case sel.Empty():
-		return nil
 	case sel.Any:
-		return []string{fmt.Sprintf("%s %s", base, verdict)}
+		return []string{base + " " + verdict}
 	default:
 		rules := make([]string, 0, len(sel.Flags))
 		for _, f := range sel.Flags {
@@ -273,16 +363,103 @@ func queueRules(sel Selector, portKeyword string, port, queue uint16) []string {
 // (left by a prior crash) is removed first, so Install is idempotent and never
 // stacks duplicate rules.
 func (m *Manager) Install(ctx context.Context) error {
-	_ = m.Remove(ctx) // best-effort: clear a stale table from a previous run
-	if m.Idle() {
-		// Nothing can match, so there is nothing to steer: leaving the table
-		// absent is what keeps an unconfigured sidecar off the data path.
+	script, err := m.replaceScript(ctx)
+	if err != nil {
+		return err
+	}
+	if script == "" {
 		return nil
 	}
-	if err := m.run(ctx, m.Ruleset()); err != nil {
+	if err := m.run(ctx, script); err != nil {
 		return fmt.Errorf("install nftables rules: %w", err)
 	}
 	return nil
+}
+
+// VerifyInstalled reads the table back and checks its inert configuration
+// fingerprint. This makes command timeouts retry-safe: nft replacement is
+// atomic, and the fingerprint covers the complete desired configuration.
+func (m *Manager) VerifyInstalled(ctx context.Context) error {
+	if m.Idle() {
+		present, err := m.exists(ctx)
+		if err != nil {
+			return err
+		}
+		if present {
+			return errors.New("inactive Geneva table still exists")
+		}
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, m.cfg.NFTPath, "list", "table", "inet", m.cfg.Table)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("read back nftables rules: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	want := "chain " + m.revisionChain()
+	if !strings.Contains(string(out), want) {
+		return fmt.Errorf("nftables readback lacks desired transaction fingerprint %s", m.revisionChain())
+	}
+	return nil
+}
+
+// InstallVerified installs one atomic replacement and verifies it. If the
+// request context expires after the kernel commits, an independent bounded
+// readback resolves the otherwise ambiguous result.
+func (m *Manager) InstallVerified(ctx context.Context) error {
+	installErr := m.Install(ctx)
+	if installErr == nil {
+		if verifyErr := m.VerifyInstalled(ctx); verifyErr == nil {
+			return nil
+		} else {
+			installErr = fmt.Errorf("verify installed nftables transaction: %w", verifyErr)
+		}
+	}
+	reconcileCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if verifyErr := m.VerifyInstalled(reconcileCtx); verifyErr == nil {
+		return nil
+	} else {
+		return errors.Join(installErr, fmt.Errorf("reconcile ambiguous nftables transaction: %w", verifyErr))
+	}
+}
+
+// Verify asks nft to validate the exact atomic replacement transaction without
+// changing kernel state. Activation calls this before staging a generation.
+func (m *Manager) Verify(ctx context.Context) error {
+	script, err := m.replaceScript(ctx)
+	if err != nil || script == "" {
+		return err
+	}
+	if err := m.runArgs(ctx, script, "-c", "-f", "-"); err != nil {
+		return fmt.Errorf("verify nftables rules: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) replaceScript(ctx context.Context) (string, error) {
+	present, err := m.exists(ctx)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if present {
+		fmt.Fprintf(&b, "delete table inet %s\n", m.cfg.Table)
+	}
+	b.WriteString(m.Ruleset())
+	return b.String(), nil
+}
+
+func (m *Manager) exists(ctx context.Context) (bool, error) {
+	cmd := exec.CommandContext(ctx, m.cfg.NFTPath, "list", "table", "inet", m.cfg.Table)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return true, nil
+	}
+	wrapped := fmt.Errorf("%s list table: %w: %s", m.cfg.NFTPath, err, strings.TrimSpace(string(out)))
+	if isMissingTable(wrapped) {
+		return false, nil
+	}
+	return false, wrapped
 }
 
 // Remove deletes the steering table and everything in it. It is safe to call
@@ -297,7 +474,11 @@ func (m *Manager) Remove(ctx context.Context) error {
 }
 
 func (m *Manager) run(ctx context.Context, script string) error {
-	cmd := exec.CommandContext(ctx, m.cfg.NFTPath, "-f", "-")
+	return m.runArgs(ctx, script, "-f", "-")
+}
+
+func (m *Manager) runArgs(ctx context.Context, script string, args ...string) error {
+	cmd := exec.CommandContext(ctx, m.cfg.NFTPath, args...)
 	cmd.Stdin = strings.NewReader(script)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

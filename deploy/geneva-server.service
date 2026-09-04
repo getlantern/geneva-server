@@ -30,19 +30,21 @@ ProtectKernelTunables=true
 # IPv4 literal (127.0.0.1:4318, not "localhost", which can resolve to ::1).
 RestrictAddressFamilies=AF_INET AF_NETLINK
 ReadOnlyPaths=/etc/geneva-server
+StateDirectory=geneva-server
+StateDirectoryMode=0750
 
 # Configuration is written by the deployment's cloud-init before start:
-#   GENEVA_ARGS holds the run flags (mode, strategy-file, port, iface, ...).
+#   GENEVA_ARGS holds runtime flags (mode, port, iface, ...). Production starts
+#   inactive; desired state is supplied through the versioned adapter lifecycle.
 #   OTEL_EXPORTER_OTLP_* / OTEL_RESOURCE_ATTRIBUTES point metric export at the
 #   box's local collector. With no OTLP endpoint set the sidecar runs with
 #   metrics disabled rather than failing to start.
 EnvironmentFile=/etc/geneva-server/geneva.env
 ExecStart=/usr/local/bin/geneva-server run $GENEVA_ARGS
 
-# There is no ExecReload: a running strategy is replaced in place via the control
-# API (PUT /strategy), and a restart re-reads --strategy-file. The process does
-# not handle SIGHUP (its default action would kill it), so systemd reload is a
-# no-op by omission rather than a signal.
+# There is no ExecReload: the versioned loopback adapter activates immutable
+# generations for new connections. Restart reconstructs durable adapter intent
+# from StateDirectory before steering.
 
 # On stop, systemd sends SIGTERM; the sidecar tears down its nftables table on
 # the way out. Give it room to do so before SIGKILL.
