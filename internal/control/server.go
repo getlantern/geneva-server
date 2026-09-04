@@ -22,7 +22,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/getlantern/geneva-server/internal/adapter"
@@ -50,20 +49,10 @@ type Providers struct {
 	// Health reports lifecycle integrity. A process remains reachable for local
 	// rollback remediation while readiness is unhealthy and steering is inactive.
 	Health func() error
-	// Apply installs a strategy end to end: it reprograms the kernel's steering
-	// for what the new strategy can match and then swaps the engine. PUT goes
-	// through it rather than straight to the engine, because a strategy change
-	// can put the box on or take it off the data path. It is required for PUT:
-	// a caller that forgets to wire it gets a loud 503, never a silent
-	// engine-only swap that leaves the kernel steering for the old strategy.
-	Apply func(ctx context.Context, dna string) error
 	// Steering returns what the box is currently steering (JSON-marshalable).
 	// It may be nil.
 	Steering func() any
 	Adapter  Adapter
-	// LegacyStrategy enables the raw-DNA /strategy compatibility surface. It is
-	// mutually exclusive with the authoritative generic v1 adapter routes.
-	LegacyStrategy bool
 }
 
 // Adapter is deliberately generic and contains no cloud or transport types.
@@ -85,10 +74,6 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/canary", s.handleCanary)
-	if s.p.LegacyStrategy {
-		mux.HandleFunc("/strategy", s.handleStrategy)
-		return mux
-	}
 	mux.HandleFunc("/v1/adapter/prepare", s.handlePrepare)
 	mux.HandleFunc("/v1/adapter/descriptor", s.handleDescriptor)
 	mux.HandleFunc("/v1/adapter/verify", s.handleVerify)
@@ -133,9 +118,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Uptime:  s.uptime(),
 		Engine:  s.p.Engine.Snapshot(),
 	}
-	if s.p.LegacyStrategy {
-		resp.Strategy = s.p.Engine.DNA()
-	}
 	if s.p.Verdicts != nil {
 		resp.Verdicts = s.p.Verdicts()
 	}
@@ -153,60 +135,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, statusCode, resp)
-}
-
-// handleStrategy serves GET (current DNA) and PUT (assign/replace the strategy).
-// PUT validates the DNA before preparing and activating a new generation. New
-// connections use it without a restart; existing connections retain their
-// immutable generation. This works in both modes.
-//
-// The swap is not strategy-content-only: steering is scoped to what the strategy
-// can match, so installing one can widen, narrow, or remove the kernel's rules
-// (see internal/steering). PUT of an empty strategy takes the box off the data
-// path completely. The write endpoint is unauthenticated, so the control address
-// must stay on a private interface (see deploy/README.md).
-func (s *Server) handleStrategy(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
-	case http.MethodPut:
-		if s.p.Apply == nil {
-			writeError(w, http.StatusServiceUnavailable, "strategy updates are not wired up")
-			return
-		}
-		// MaxBytesReader returns an error once the limit is exceeded, so an oversized
-		// body is rejected rather than silently truncated (as io.LimitReader would).
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeError(w, http.StatusRequestEntityTooLarge, "strategy exceeds 1 MiB limit")
-				return
-			}
-			writeError(w, http.StatusBadRequest, "read body: "+err.Error())
-			return
-		}
-		// Tolerate a trailing newline or surrounding whitespace (common when the
-		// body is piped from a file), which would otherwise fail validation.
-		dna := strings.TrimSpace(string(body))
-		ctx, cancel := operationContext(r)
-		defer cancel()
-		if err := s.p.Apply(ctx, dna); err != nil {
-			// Only a strategy the client got wrong is the client's fault. A
-			// failure to program the kernel for a valid one is ours, and a 400
-			// there would send the caller off fixing a DNA that is fine.
-			if errors.Is(err, engine.ErrInvalidStrategy) {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			writeError(w, http.StatusInternalServerError, "apply strategy: "+err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]string{"strategy": s.p.Engine.DNA()})
-	default:
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
 }
 
 const (

@@ -139,11 +139,5 @@ than continuing with uncertain steering. Integrity notification on the verdict
 path only atomically latches and schedules this bounded reconciliation; packet
 acceptance never waits for the lifecycle mutex or a conntrack dump.
 
-## Compatibility mode
-
-The unauthenticated raw-DNA `/strategy` surface is disabled by default. It is
-available only with `--legacy-strategy-api`, and that mode does not expose the
-v1 lifecycle routes. `--strategy` and `--strategy-file` require the legacy flag.
 Normal provisioned production starts inactive and is activated solely through
-v1 desired state. `--no-nft` is rejected because dynamic lifecycle success
-cannot be reported without a transactional programmer and readback interface.
+v1 desired state.

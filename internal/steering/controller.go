@@ -215,7 +215,7 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 }
 
 // Start reconstructs durable engines before enabling any steering.
-func (c *Controller) Start(ctx context.Context, initialDNA string) error {
+func (c *Controller) Start(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	startFaultEpoch := c.faultEpoch.Load()
@@ -235,7 +235,6 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		}
 	}
 	loaded, err := c.loadLocked()
-	compatibilityUnsafe := false
 	if err != nil {
 		quarantined, quarantineErr := c.quarantineStateLocked()
 		if quarantineErr != nil {
@@ -244,18 +243,10 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 		// No engine or assignment from corrupt/incompatible durable intent is
 		// loaded. The original bytes remain in a durably renamed quarantine file,
 		// and the new state records the unsafe remediation requirement.
-		compatibilityUnsafe = true
 		loaded = false
 		c.unsafe, c.activeNew = true, 0
 		c.faultLatched.Store(true)
 		c.failure = fmt.Sprintf("adapter state quarantined at %s: %v", quarantined, err)
-	}
-	legacyInitial := uint32(0)
-	if !loaded && !compatibilityUnsafe && initialDNA != "" {
-		if err := c.prepareLocked(1, legacyIdentity(1, initialDNA), initialDNA); err != nil {
-			return err
-		}
-		legacyInitial = 1
 	}
 	conntrackAuthoritative := false
 	if c.cfg.Connections != nil {
@@ -372,12 +363,6 @@ func (c *Controller) Start(ctx context.Context, initialDNA string) error {
 			return err
 		}
 	}
-	if legacyInitial != 0 && !c.unsafe {
-		// The explicitly requested compatibility seed uses the same exact first-
-		// activation boundary as the versioned API. It may not capture a SYN
-		// conntrack which existed before process startup.
-		return c.activateLocked(ctx, legacyInitial, false)
-	}
 	if c.activeNew != 0 {
 		if err := c.eng.Activate(c.activeNew); err != nil {
 			removeErr := c.removeRulesLocked(ctx)
@@ -420,12 +405,6 @@ func (c *Controller) restoreActiveAfterRestartLocked(ctx context.Context) error 
 	}
 	c.log.Infof("restored active generation %d through neutral restart boundary", active)
 	return nil
-}
-
-// Prepare is the legacy compatibility path. Versioned callers use
-// PrepareDeployment with a complete immutable identity.
-func (c *Controller) PrepareGeneration(ctx context.Context, id uint32, dna string) error {
-	return c.prepare(ctx, id, legacyIdentity(id, dna), dna)
 }
 
 func (c *Controller) prepare(ctx context.Context, id uint32, identity adapter.Identity, dna string) error {
@@ -478,24 +457,6 @@ func (c *Controller) prepare(ctx context.Context, id uint32, identity adapter.Id
 	return nil
 }
 
-// Apply preserves the legacy PUT /strategy behavior using the generation
-// lifecycle. It never mutates an engine or resets a connection.
-func (c *Controller) Apply(ctx context.Context, dna string) error {
-	if dna == "" {
-		return c.DeactivateNew(ctx)
-	}
-	c.mu.Lock()
-	id := c.nextGenerationLocked()
-	c.mu.Unlock()
-	if id == 0 {
-		return errors.New("all generation IDs are in use; drain and garbage-collect an old generation")
-	}
-	if err := c.PrepareGeneration(ctx, id, dna); err != nil {
-		return err
-	}
-	return c.ActivateNew(ctx, id)
-}
-
 func (c *Controller) prepareLocked(id uint32, identity adapter.Identity, dna string) error {
 	descriptor := c.Descriptor()
 	return c.prepareArtifactLocked(id, adapter.ArtifactMetadata{
@@ -538,11 +499,6 @@ func (c *Controller) prepareArtifactLocked(id uint32, metadata adapter.ArtifactM
 		Phase: PhasePrepared, Scope: c.widen(Of(parsed)),
 	}
 	return nil
-}
-
-func legacyIdentity(id uint32, dna string) adapter.Identity {
-	sum := sha256.Sum256([]byte(dna))
-	return adapter.Identity{Technique: adapter.TechniqueGeneva, Revision: fmt.Sprintf("legacy-%d", id), Digest: hex.EncodeToString(sum[:])}
 }
 
 func validateIdentity(identity adapter.Identity, artifactDigest string) error {

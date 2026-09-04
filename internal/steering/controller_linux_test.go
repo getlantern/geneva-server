@@ -91,7 +91,7 @@ func TestStartClearsStaleTableWhenIdle(t *testing.T) {
 	// Start with no strategy. Iface is empty so the NIC is left alone.
 	eng := engine.NewRegistry()
 	ctrl := New(eng, Config{Mode: "eval", NFT: nftables.Config{Table: table, Port: 18081, OutQueue: 300, InQueue: 301}}, nil)
-	if err := ctrl.Start(ctx, ""); err != nil {
+	if err := ctrl.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	if testutil.TableExists(t, table) {

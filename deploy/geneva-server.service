@@ -35,8 +35,7 @@ StateDirectoryMode=0750
 
 # Configuration is written by the deployment's cloud-init before start:
 #   GENEVA_ARGS holds runtime flags (mode, port, iface, ...). Production starts
-#   inactive; do not include legacy --strategy/--strategy-file unless an
-#   explicitly managed compatibility deployment requires it.
+#   inactive; desired state is supplied through the versioned adapter lifecycle.
 #   OTEL_EXPORTER_OTLP_* / OTEL_RESOURCE_ATTRIBUTES point metric export at the
 #   box's local collector. With no OTLP endpoint set the sidecar runs with
 #   metrics disabled rather than failing to start.

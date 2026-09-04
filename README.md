@@ -71,9 +71,7 @@ Scope is **IPv4/TCP only** (no UDP, no IPv6), matching the library.
 The only difference is the canary (eval-only). Both modes support the versioned
 adapter lifecycle below. A strategy update is prepared as a new immutable
 generation and activated only for new TCP connections; existing connections
-remain on their original generation through rollback and drain. The raw-DNA
-`PUT /strategy` surface is disabled unless `--legacy-strategy-api` is selected,
-which is mutually exclusive with authoritative v1 operation.
+remain on their original generation through rollback and drain.
 
 ## Usage
 
@@ -101,8 +99,6 @@ box. Everything else is exported as metrics (below).
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
 | `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
-| `GET /strategy` | legacy opt-in | current raw strategy DNA                                 |
-| `PUT /strategy` | legacy opt-in | compatibility prepare + activate for new connections     |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
 | `GET /v1/adapter/descriptor` | both | numeric protocol/schema versions and bounded capabilities |
 | `POST /v1/adapter/verify` | both | validate an artifact and immutable identity without mutation |
@@ -130,14 +126,9 @@ coexistence is nevertheless intentional. SYN assignment preserves every bit
 outside Geneva's mask. NFQUEUE supplies the
 generation directly as conntrack metadata, so dispatch never mutates the skb
 mark and downstream exact `fwmark 0x438`/`0x440` rules still match. Raw
-reinjection uses NFQUEUE's original packet mark exactly. The legacy `--mark`
-flag is accepted but ignored. A foreign connmark with nonzero
+reinjection uses NFQUEUE's original packet mark exactly. A foreign connmark with nonzero
 reserved bits is never overwritten or steered. IDs are not reused while
 present; reuse is allowed only after authoritative zero-flow GC.
-
-`--no-nft` is rejected: without a transactional external programmer and exact
-readback interface, the dynamic lifecycle cannot truthfully report successful
-activation, deactivation, rollback, or cleanup.
 
 Activation uses two complete nft transactions. The first verifies and installs
 the union of old and candidate generation scopes while SYN assignment still
@@ -173,9 +164,7 @@ snapshot. Production authoritative mode requires a nonempty
 `--adapter-state-file`.
 
 The lifecycle status exposes only the canonical artifact digest: bare lowercase
-64-character SHA-256 hex. Raw DNA remains confined to the legacy,
-loopback-private `GET /strategy` and `/healthz` compatibility responses and the
-mode-0600 reconstruction file; it is never added to lifecycle status, logs, or
+64-character SHA-256 hex. Raw DNA is retained only in the mode-0600 reconstruction file; it is never added to lifecycle status, logs, or
 telemetry. The default
 live-generation budget is three (`--max-generations`); preparation refuses a
 fourth until one is drained and collected. The independently configurable

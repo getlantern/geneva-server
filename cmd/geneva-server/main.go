@@ -8,8 +8,7 @@
 //   - eval: a candidate strategy on a dedicated test box, with a per-market
 //     canary that captures real header field values for the GA brain.
 //
-// Both modes support immutable, identity-based lifecycle updates. The raw-DNA
-// compatibility API is available only behind an explicit legacy flag.
+// Both modes support immutable, identity-based lifecycle updates.
 package main
 
 import (
@@ -53,9 +52,6 @@ func (m *markFlag) UnmarshalText(b []byte) error {
 // runCmd holds the flags for the run subcommand.
 type runCmd struct {
 	Mode                      string   `arg:"--mode" default:"prod" help:"operating mode: prod or eval"`
-	Strategy                  string   `arg:"--strategy" help:"legacy opt-in initial Geneva DNA; normal production starts inactive and uses the v1 lifecycle"`
-	StrategyFile              string   `arg:"--strategy-file" help:"path to a file containing the strategy DNA"`
-	LegacyStrategyAPI         bool     `arg:"--legacy-strategy-api" help:"enable raw-DNA /strategy compatibility mode instead of the authoritative v1 adapter"`
 	Port                      uint16   `arg:"--port,required" help:"proxy TCP port to steer"`
 	OutQueue                  uint16   `arg:"--out-queue" default:"100" help:"NFQUEUE number for egress (outbound) packets"`
 	InQueue                   uint16   `arg:"--in-queue" default:"101" help:"NFQUEUE number for ingress (inbound) packets"`
@@ -68,7 +64,6 @@ type runCmd struct {
 	Market                    string   `arg:"--market" default:"unknown" help:"market label for the eval-mode canary pool"`
 	CanaryCapacity            int      `arg:"--canary-capacity" default:"64" help:"distinct values captured per field in eval mode"`
 	NFTPath                   string   `arg:"--nft" default:"nft" help:"path to the nft binary"`
-	NoNFT                     bool     `arg:"--no-nft" help:"unsupported with versioned lifecycle; retained only to reject obsolete configurations clearly"`
 	CensorCounters            bool     `arg:"--censor-counters" default:"true" help:"classify inbound packets with nftables counters, so the censor-reachability signal does not depend on steering inbound through userspace"`
 	ObserveInbound            bool     `arg:"--observe-inbound" help:"eval mode only: keep inbound packets flowing through userspace for the censor-reachability signal, at a round trip per inbound packet"`
 	Iface                     string   `arg:"--iface" help:"steered interface; required in prod so controller-owned NIC offloads are durably restorable"`
@@ -120,9 +115,6 @@ func main() {
 }
 
 func runCommand(o *runCmd) error {
-	if _, err := o.resolveStrategy(); err != nil {
-		return err
-	}
 	if err := o.validate(); err != nil {
 		return err
 	}
@@ -151,24 +143,6 @@ func validateCommand(v *validateCmd) error {
 	}
 	fmt.Println("strategy is valid")
 	return nil
-}
-
-// resolveStrategy returns the legacy opt-in initial DNA. Normal production
-// starts inactive and is activated only by durable versioned adapter intent.
-func (o *runCmd) resolveStrategy() (string, error) {
-	if o.Strategy != "" && o.StrategyFile != "" {
-		return "", fmt.Errorf("--strategy and --strategy-file are mutually exclusive")
-	}
-	dna := strings.TrimSpace(o.Strategy)
-	if o.StrategyFile != "" {
-		b, err := os.ReadFile(o.StrategyFile)
-		if err != nil {
-			return "", fmt.Errorf("read strategy file: %w", err)
-		}
-		// Tolerate a trailing newline in an operator-managed file.
-		dna = strings.TrimSpace(string(b))
-	}
-	return dna, nil
 }
 
 func (o *runCmd) validate() error {
@@ -206,9 +180,6 @@ func (o *runCmd) validate() error {
 	if o.ReinjectBypassUID < -1 || o.ReinjectBypassUID > int64(^uint32(0)) {
 		return fmt.Errorf("--reinject-bypass-uid must fit an unsigned 32-bit UID")
 	}
-	if o.NoNFT {
-		return fmt.Errorf("--no-nft is incompatible with the transactional versioned lifecycle; an external programmer/readback adapter is not implemented")
-	}
 	if o.ReinjectBypassUID == -1 {
 		o.ReinjectBypassUID = int64(os.Geteuid())
 	}
@@ -239,19 +210,7 @@ func (o *runCmd) validate() error {
 	if o.Mode == "prod" && strings.TrimSpace(o.Iface) == "" {
 		return errors.New("prod mode requires --iface so NIC offload ownership is durable and restorable")
 	}
-	if !o.LegacyStrategyAPI && (o.Strategy != "" || o.StrategyFile != "") {
-		return errors.New("--strategy/--strategy-file require --legacy-strategy-api and cannot be combined with authoritative v1 lifecycle mode")
-	}
-	if o.LegacyStrategyAPI && (o.Strategy != "" || o.StrategyFile != "") {
-		dna, err := o.resolveStrategy()
-		if err != nil {
-			return err
-		}
-		if dna == "" {
-			return errors.New("legacy --strategy/--strategy-file resolved to an empty strategy")
-		}
-	}
-	if o.Mode == "prod" && !o.LegacyStrategyAPI && strings.TrimSpace(o.AdapterStateFile) == "" {
+	if o.Mode == "prod" && strings.TrimSpace(o.AdapterStateFile) == "" {
 		return errors.New("authoritative prod mode requires --adapter-state-file for durable generation reconstruction and rollback continuity")
 	}
 	return nil

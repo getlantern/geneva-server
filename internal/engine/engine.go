@@ -236,7 +236,7 @@ func (e *Engine) Process(raw []byte, dir strategy.Direction, scratch *Scratch) (
 }
 
 // ProcessGeneration lets a single Engine satisfy nfqueue.Processor in tests
-// and legacy callers. A standalone Engine represents generation 1.
+//. A standalone Engine represents generation 1.
 func (e *Engine) ProcessGeneration(id uint32, raw []byte, dir strategy.Direction, scratch *Scratch) (Result, error) {
 	if id != 1 {
 		return Result{}, fmt.Errorf("%w: %d", ErrGenerationNotFound, id)

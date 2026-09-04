@@ -121,14 +121,14 @@ func TestNeutralBoundaryProgramsAssignmentWithoutSelectors(t *testing.T) {
 
 func TestLegacySelectorsAssignFallbackGeneration(t *testing.T) {
 	rs := New(Config{
-		Table: "geneva_legacy", Port: 8080, OutQueue: 100, InQueue: 101,
+		Table: "geneva_generation", Port: 8080, OutQueue: 100, InQueue: 101,
 		Outbound: anySel,
 	}).Ruleset()
 	if !strings.Contains(rs, "ct mark set (ct mark & 0xfff) | 0x67001000") {
-		t.Fatalf("legacy selector ruleset lacks generation-one assignment:\n%s", rs)
+		t.Fatalf("generation selector ruleset lacks generation-one assignment:\n%s", rs)
 	}
 	if !strings.Contains(rs, "ct mark & 0xfffff000 == 0x67001000 queue num 100 bypass") {
-		t.Fatalf("legacy selector ruleset lacks matching generation-one queue rule:\n%s", rs)
+		t.Fatalf("generation selector ruleset lacks matching generation-one queue rule:\n%s", rs)
 	}
 }
 

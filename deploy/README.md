@@ -63,9 +63,7 @@ back up when it stops — a sidecar with no strategy leaves the NIC alone.
 
 Both modes use immutable per-connection generations. Existing flows retain
 their conntrack generation through drain and rollback. Normal production startup
-is inactive and accepts desired state through v1. Raw-DNA `/strategy`,
-`--strategy`, and `--strategy-file` are available only with the explicit
-`--legacy-strategy-api` compatibility mode, which does not expose v1 routes.
+is inactive and accepts desired state through v1.
 
 The control API is unauthenticated, so it must not listen on `0.0.0.0`. If an
 overlay agent needs to reach it remotely, bind only a
@@ -79,7 +77,6 @@ Bind `--control-addr` to a private address (localhost or a management network).
 | Method + path   | Mode      | Purpose                                                     |
 | --------------- | --------- | ----------------------------------------------------------- |
 | `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
-| `GET /strategy` / `PUT /strategy` | legacy opt-in | raw-DNA compatibility lifecycle                 |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
 | `GET /v1/adapter/descriptor` / `POST /v1/adapter/verify` | both | generic numeric v1 capabilities / artifact validation |
 | `POST /v1/adapter/prepare` | both | validate and persist an immutable identity-bound deployment |
@@ -97,8 +94,7 @@ whether to keep a candidate within seconds of self-dialling it, which is shorter
 than an export interval plus query lag.
 
 The versioned lifecycle responses expose only a bare lowercase SHA-256 artifact
-digest. Raw DNA remains solely in the legacy private `/strategy` and `/healthz`
-compatibility responses and the mode-0600 reconstruction file. Keep this
+digest. Raw DNA remains solely in the mode-0600 reconstruction file. Keep this
 surface loopback-only unless an authenticated management network protects it.
 See [`../docs/adapter-v1.md`](../docs/adapter-v1.md) for exact request bodies,
 numeric fields, keep-set GC, and retry semantics.
@@ -170,7 +166,7 @@ Mirror the `lantern-box` provisioning flow:
 
 In eval mode the sidecar starts with no strategy, steering nothing at all, until
 the overlay agent prepares and activates an artifact through v1. A strategy
-file is used only by an explicitly legacy deployment.
+file is populated by the versioned lifecycle.
 
 The nftables rules are runtime-owned: the sidecar programs its table from the
 loaded strategy and deletes it on stop, so provisioning must **not** install
@@ -210,12 +206,8 @@ and queue-full fail-open therefore retain exact external marks, and coincidental
 foreign `0x67...` packet marks are untouched. Raw reinjection keeps NFQUEUE's
 exact original routing `SO_MARK` (`0x438`, `0x440`, or phost value) and avoids
 requeue through the dedicated service socket UID.
-The legacy `--mark` flag is ignored. A foreign nonzero value inside the reserved
+A foreign nonzero value inside the reserved
 high 20 bits is left alone and the connection is not steered.
-
-`--no-nft` is rejected because the versioned lifecycle has no transactional
-external programmer and readback interface. Merely documenting a reinjection
-UID cannot make activate/deactivate/rollback results truthful.
 
 Drain/status read conntrack over netlink, filter by the full Geneva generation
 mask, then by original IPv4/TCP destination port. GC refuses an active

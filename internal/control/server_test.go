@@ -92,10 +92,7 @@ func newTestServer(t *testing.T, mode, dna string, withCanary bool) *httptest.Se
 		Version:  "test",
 		Engine:   eng,
 		Verdicts: func() any { return map[string]int{"accepted": 0} },
-		// Engine-only apply: these tests exercise the HTTP surface, not the
-		// kernel-reprogramming half a real box wires in.
-		Apply:          func(_ context.Context, dna string) error { return eng.SetStrategy(dna) },
-		LegacyStrategy: true,
+		Adapter:  &fakeAdapter{},
 	}
 	if withCanary {
 		p.Canary = canary.NewPool("RU", 16)
@@ -122,9 +119,6 @@ func TestHealthz(t *testing.T) {
 	if body.Status != "ok" || body.Mode != "prod" {
 		t.Fatalf("unexpected health: %+v", body)
 	}
-	if body.Strategy != `[TCP:flags:R]-drop-| \/` {
-		t.Fatalf("strategy not reported: %q", body.Strategy)
-	}
 }
 
 func TestHealthzReportsLifecycleIntegrityFailureWhileControlRemainsReachable(t *testing.T) {
@@ -148,86 +142,6 @@ func TestHealthzReportsLifecycleIntegrityFailureWhileControlRemainsReachable(t *
 	}
 	if body.Status != "unhealthy" || !strings.Contains(body.Error, "quarantined") {
 		t.Fatalf("health body = %+v", body)
-	}
-}
-
-func TestStrategyReloadEval(t *testing.T) {
-	srv := newTestServer(t, "eval", "", false)
-	newDNA := `[TCP:flags:PA]-duplicate-| \/`
-	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(newDNA))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, resp)
-	if resp.StatusCode != 200 {
-		t.Fatalf("reload status = %d", resp.StatusCode)
-	}
-	// Confirm it took effect via GET.
-	gr, err := http.Get(srv.URL + "/strategy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, gr)
-	var got map[string]string
-	_ = json.NewDecoder(gr.Body).Decode(&got)
-	if got["strategy"] != newDNA {
-		t.Fatalf("strategy = %q, want %q", got["strategy"], newDNA)
-	}
-}
-
-func TestStrategyReloadRejectsInvalid(t *testing.T) {
-	srv := newTestServer(t, "eval", "", false)
-	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader("this is not a strategy"))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, resp)
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("invalid strategy status = %d, want 400", resp.StatusCode)
-	}
-}
-
-func TestStrategyReloadRejectsOversizedBody(t *testing.T) {
-	srv := newTestServer(t, "eval", "", false)
-
-	// A valid strategy followed by more than 1 MiB of trailing bytes: the handler must
-	// reject it with 413 rather than truncating to the first MiB and reporting success.
-	body := `[TCP:flags:R]-drop-| \/` + "\n" + strings.Repeat("x", 1<<20)
-	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(body))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, resp)
-	if resp.StatusCode != http.StatusRequestEntityTooLarge {
-		t.Fatalf("oversized body status = %d, want 413", resp.StatusCode)
-	}
-}
-
-func TestStrategyReloadWorksInProd(t *testing.T) {
-	// Reload-in-place is supported in both modes; prod is not special-cased.
-	srv := newTestServer(t, "prod", `[TCP:flags:R]-drop-| \/`, false)
-	newDNA := `[TCP:flags:S]-tamper{TCP:flags:replace:SA}-| \/`
-	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/strategy", strings.NewReader(newDNA))
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, resp)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("prod reload status = %d, want 200", resp.StatusCode)
-	}
-	gr, err := http.Get(srv.URL + "/strategy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, gr)
-	var got map[string]string
-	_ = json.NewDecoder(gr.Body).Decode(&got)
-	if got["strategy"] != newDNA {
-		t.Fatalf("strategy = %q, want %q", got["strategy"], newDNA)
 	}
 }
 
@@ -466,27 +380,20 @@ func TestLifecycleResultClassifiesClientAndServerFailures(t *testing.T) {
 	}
 }
 
-func TestLegacyStrategyAndAuthoritativeV1AreMutuallyExclusive(t *testing.T) {
-	legacy := newTestServer(t, "eval", "", false)
-	resp, err := http.Get(legacy.URL + "/v1/adapter/descriptor")
+func TestStrategyRouteIsNotExposed(t *testing.T) {
+	eng, err := engine.New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/strategy")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer closeResponseBody(t, resp)
 	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("legacy server exposed v1 adapter: %d", resp.StatusCode)
-	}
-
-	eng, _ := engine.New("")
-	authoritative := httptest.NewServer(New(Providers{Mode: "eval", Engine: eng, Adapter: &fakeAdapter{}}).Handler())
-	defer authoritative.Close()
-	resp2, err := http.Get(authoritative.URL + "/strategy")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer closeResponseBody(t, resp2)
-	if resp2.StatusCode != http.StatusNotFound {
-		t.Fatalf("authoritative v1 server exposed raw-DNA strategy API: %d", resp2.StatusCode)
+		t.Fatalf("strategy route status = %d, want %d", resp.StatusCode, http.StatusNotFound)
 	}
 }
 

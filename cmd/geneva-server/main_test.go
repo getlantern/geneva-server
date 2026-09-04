@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"strings"
 	"testing"
 )
@@ -52,15 +51,6 @@ func TestValidateAllowsDeprecatedMarkZero(t *testing.T) {
 	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, Mark: 0, ReinjectBypassUID: -1, AdapterStateFile: "/tmp/adapter-state.json"}
 	if err := o.validate(); err != nil {
 		t.Errorf("deprecated --mark affected managed-nft validation: %v", err)
-	}
-}
-
-func TestNoNFTRejectedForVersionedLifecycle(t *testing.T) {
-	for _, uid := range []int64{-1, 4242} {
-		o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, NoNFT: true, ReinjectBypassUID: uid, AdapterStateFile: "/tmp/adapter-state.json"}
-		if err := o.validate(); err == nil || !strings.Contains(err.Error(), "transactional versioned lifecycle") {
-			t.Fatalf("no-nft with UID %d error = %v", uid, err)
-		}
 	}
 }
 
@@ -120,33 +110,5 @@ func TestAuthoritativeProductionRequiresDurableAdapterState(t *testing.T) {
 	o := &runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, ReinjectBypassUID: -1, AdapterStateFile: "   "}
 	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "requires --adapter-state-file") {
 		t.Fatalf("empty adapter state path error = %v", err)
-	}
-}
-
-func TestLegacyStrategyRequiresExplicitExclusiveMode(t *testing.T) {
-	base := runCmd{Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101, Strategy: `[TCP:flags:S]-duplicate-| \/`, ReinjectBypassUID: -1}
-	if err := base.validate(); err == nil || !strings.Contains(err.Error(), "--legacy-strategy-api") {
-		t.Fatalf("authoritative mode accepted strategy: %v", err)
-	}
-	base.LegacyStrategyAPI = true
-	if err := base.validate(); err != nil {
-		t.Fatalf("explicit legacy compatibility rejected: %v", err)
-	}
-}
-
-func TestLegacyStrategyRejectsEmptyStrategyFile(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "empty-strategy-*.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.Close(); err != nil {
-		t.Fatal(err)
-	}
-	o := &runCmd{
-		Mode: "prod", Iface: "eth0", Port: 443, OutQueue: 100, InQueue: 101,
-		LegacyStrategyAPI: true, StrategyFile: f.Name(), ReinjectBypassUID: -1,
-	}
-	if err := o.validate(); err == nil || !strings.Contains(err.Error(), "empty strategy") {
-		t.Fatalf("empty legacy strategy file error = %v", err)
 	}
 }

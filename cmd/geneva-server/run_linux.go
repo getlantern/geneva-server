@@ -55,10 +55,6 @@ func runServer(o *runCmd) (runResult error) {
 	started := time.Now()
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	dna, err := o.resolveStrategy()
-	if err != nil {
-		return err
-	}
 	eng := engine.NewRegistry()
 	log.Info("engine registry ready", "mode", o.Mode)
 
@@ -100,7 +96,6 @@ func runServer(o *runCmd) (runResult error) {
 		},
 		EthtoolPath: o.EthtoolPath,
 		Iface:       o.Iface,
-		NoNFT:       o.NoNFT,
 
 		ObserveInbound:            o.ObserveInbound,
 		StateFile:                 o.AdapterStateFile,
@@ -153,7 +148,7 @@ func runServer(o *runCmd) (runResult error) {
 		_ = rt.Close()
 		return err
 	}
-	if err := ctrl.Start(ctx, dna); err != nil {
+	if err := ctrl.Start(ctx); err != nil {
 		startErr := err
 		var teardownErr error
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -267,10 +262,7 @@ func runServer(o *runCmd) (runResult error) {
 		Canary:     pool,
 		Verdicts:   func() any { return rt.Snapshot() },
 		InboundTCP: func() any { return censorSrc.Snapshot() },
-		// A strategy change is not just an engine swap: it can put the box on
-		// or take it off the data path, so it has to go through the controller.
-		Apply:    ctrl.Apply,
-		Steering: func() any { return ctrl.State() },
+		Steering:   func() any { return ctrl.State() },
 		Health: func() error {
 			state := ctrl.State()
 			if state.Unsafe {
@@ -278,8 +270,7 @@ func runServer(o *runCmd) (runResult error) {
 			}
 			return nil
 		},
-		Adapter:        ctrl,
-		LegacyStrategy: o.LegacyStrategyAPI,
+		Adapter: ctrl,
 	})
 	httpSrv := &http.Server{
 		Addr:              o.ControlAddr,
