@@ -97,6 +97,10 @@ runtime_version=$(jq -r .runtime_version <<<"$descriptor")
 [[ -n "$runtime_version" ]]
 [[ "$(status | jq '.active == null')" == true ]]
 
+echo 'kernel-gate: keep RX checksum verification enabled'
+"${COMPOSE[@]}" exec -T probe ethtool -K eth0 rx on
+"${COMPOSE[@]}" exec -T probe ethtool -k eth0 | grep '^rx-checksumming: on'
+
 echo 'kernel-gate: open established and half-open flows before activation'
 "${COMPOSE[@]}" exec -d tester sh -c \
   'echo $$ >/tmp/preactivation.pid; exec curl --local-port 39000 -fsS --no-buffer "http://server:8080/hold?duration=55s" >/tmp/preactivation.out'
@@ -217,6 +221,10 @@ mark_440_after=$(mark_observer_packets '0x00000440')
 [[ "$((after - before))" -lt 10000 ]]
 [[ "$mark_440_after" -gt "$mark_440_before" ]]
 
+echo 'kernel-gate: verify payload integrity with RX verification still enabled'
+"${COMPOSE[@]}" exec -T probe ethtool -k eth0 | grep '^rx-checksumming: on'
+"${COMPOSE[@]}" exec -T tester sh -c '/usr/local/bin/echo -emit -size 1048576 > /tmp/want-rx && curl --max-time 15 -fsS http://server:8080/ -o /tmp/got-rx && cmp /tmp/want-rx /tmp/got-rx'
+
 echo 'kernel-gate: rollback keeps both flows, then bounded drain and keep-set GC'
 api /v1/adapter/rollback "$one" >/dev/null
 [[ "$(status | jq --argjson want "$identity_one" '.active == $want')" == true ]]
@@ -272,4 +280,5 @@ if "${COMPOSE[@]}" exec -T probe nft list table inet geneva_server >/dev/null 2>
   exit 1
 fi
 
+"${COMPOSE[@]}" exec -T probe ethtool -k eth0 | grep '^rx-checksumming: on'
 echo 'kernel-gate: PASS'

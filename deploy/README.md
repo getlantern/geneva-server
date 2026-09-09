@@ -36,6 +36,14 @@ sidecar run `ethtool -K` to turn the offloads off, so NFQUEUE yields real,
 MTU-sized, fully-checksummed packets. Always set it to the interface carrying the
 proxy's traffic.
 
+RX checksum verification is left unchanged, including on virtio NICs that report
+`rx-checksumming: on [fixed]`. It verifies received checksums without replacing
+the bytes in the packet. NFQUEUE explicitly clears GSO delivery, so the kernel
+segments queued GSO packets and completes partial checksums before copying them
+to userspace. Segmentation and TX offloads remain mandatory checks. See the
+[Linux checksum contract](https://www.kernel.org/doc/html/latest/networking/checksum-offloads.html)
+and [NFQUEUE copy path](https://github.com/torvalds/linux/blob/v6.12/net/netfilter/nfnetlink_queue.c).
+
 The offloads come down only while something is actually being steered, and go
 back up when it stops — a sidecar with no strategy leaves the NIC alone.
 

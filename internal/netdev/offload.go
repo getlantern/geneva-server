@@ -8,8 +8,9 @@
 // the NIC would fill in later. Reinjecting such a packet through a raw socket
 // fails or puts a corrupt frame on the wire. Disabling these offloads makes
 // NFQUEUE hand us real, MTU-sized, fully-checksummed packets — the same thing
-// the canonical Geneva engine requires. An enabled fixed feature is a hard
-// setup error because the controller cannot establish that packet invariant.
+// the canonical Geneva engine requires. Enabled fixed segmentation or transmit
+// features remain a hard setup error. Receive checksum verification preserves
+// packet bytes and does not need to be disabled.
 package netdev
 
 import (
@@ -22,13 +23,17 @@ import (
 )
 
 // offloadFeatures are disabled on the steered interface. Segmentation offloads
-// keep packets MTU-sized; checksum/scatter-gather offloads keep checksums real.
-var offloadFeatures = []string{"gso", "tso", "gro", "tx-gre-segmentation", "tx", "rx", "sg", "lro", "ufo"}
+// keep packets MTU-sized; transmit checksum/scatter-gather offloads keep
+// checksums real. RX checksum verification leaves the packet checksum intact;
+// virtio NICs may permanently enable it. NFQUEUE completes partial checksums
+// before copying packets because its GSO delivery flag is explicitly cleared.
+var offloadFeatures = []string{"gso", "tso", "gro", "tx-gre-segmentation", "tx", "sg", "lro", "ufo"}
 
 // restoreOrder re-enables features in dependency order. Segmentation offloads
 // require scatter-gather and tx checksumming, so restoring in the disable order
 // makes the kernel reject `tso on` and `gso on` as unsupported and silently
-// leaves them off.
+// leaves them off. RX remains in the restore order for durable ownership
+// records created by runtimes that disabled receive checksum verification.
 var restoreOrder = []string{"sg", "tx", "rx", "gso", "tso", "gro", "tx-gre-segmentation", "lro", "ufo"}
 
 // ethtoolNames maps the short feature names used with `ethtool -K` to the long

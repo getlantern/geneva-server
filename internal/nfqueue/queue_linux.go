@@ -78,6 +78,9 @@ const (
 	// NFQA_CFG_F_CONNTRACK supplies the private generation directly as nested
 	// CTA_MARK metadata. Dispatch therefore never mutates the packet mark.
 	nfqaCfgFConntrack = 1 << 1
+	// Clearing GSO delivery requires the kernel to segment GSO packets and
+	// complete CHECKSUM_PARTIAL before copying payloads into NFQUEUE messages.
+	nfqaCfgFGSO = 1 << 2
 
 	nfqnlCfgCmdBind     = 1
 	nfqnlCfgCmdUnbind   = 2
@@ -195,7 +198,7 @@ func queueConfigSteps(family uint8, num uint16, maxPacketLen, maxQueueLen uint32
 		{"bind family", 0, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdPfBind, family)}}},
 		{"bind queue", num, []netlink.Attribute{{Type: nfqaCfgCmd, Data: cfgCmd(nfqnlCfgCmdBind, family)}}},
 		{"enable required fail-open and conntrack metadata", num, []netlink.Attribute{
-			{Type: nfqaCfgMask, Data: be32(nfqaCfgFFailOpen | nfqaCfgFConntrack)},
+			{Type: nfqaCfgMask, Data: be32(nfqaCfgFFailOpen | nfqaCfgFConntrack | nfqaCfgFGSO)},
 			{Type: nfqaCfgFlags, Data: be32(nfqaCfgFFailOpen | nfqaCfgFConntrack)},
 		}},
 		{"set copy mode", num, []netlink.Attribute{{Type: nfqaCfgParams, Data: cfgParams(maxPacketLen)}}},
