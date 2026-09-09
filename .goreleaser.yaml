@@ -29,6 +29,8 @@ changelog:
       - "^chore:"
 
 release:
+  prerelease: auto
+  make_latest: '{{ if .Prerelease }}false{{ else }}true{{ end }}'
   replace_existing_artifacts: true
 
 nfpms:
