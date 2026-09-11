@@ -43,7 +43,7 @@ func TestRequiredFailOpenQueueConfiguration(t *testing.T) {
 		values[attr.Type] = binary.BigEndian.Uint32(attr.Data)
 	}
 	wantFlags := uint32(nfqaCfgFFailOpen | nfqaCfgFConntrack)
-	if values[nfqaCfgMask] != wantFlags || values[nfqaCfgFlags] != wantFlags {
+	if values[nfqaCfgMask] != wantFlags|nfqaCfgFGSO || values[nfqaCfgFlags] != wantFlags {
 		t.Fatalf("fail-open mask/flags = %#x/%#x", values[nfqaCfgMask], values[nfqaCfgFlags])
 	}
 
