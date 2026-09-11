@@ -59,3 +59,16 @@ func TestCaptureVirtioReceiveChecksumVerification(t *testing.T) {
 		})
 	}
 }
+
+// Ownership records persisted by runtimes that disabled RX verification must
+// still load; the runtime no longer turns RX off but still restores it.
+func TestDisableAcceptsLegacyReceiveChecksumOwnership(t *testing.T) {
+	original := &Original{Interface: "eth0", Features: []string{"rx"}}
+	if err := original.Disable(t.Context(), "/nonexistent/ethtool"); err != nil {
+		t.Fatalf("legacy rx ownership rejected: %v", err)
+	}
+	original.Features = []string{"bogus"}
+	if err := original.Disable(t.Context(), "/nonexistent/ethtool"); err == nil {
+		t.Fatal("unknown persisted feature accepted")
+	}
+}

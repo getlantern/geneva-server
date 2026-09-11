@@ -198,8 +198,14 @@ func (o *Original) Disable(ctx context.Context, ethtoolPath string) error {
 	}
 	var failed []string
 	for _, f := range o.Features {
-		if !slices.Contains(offloadFeatures, f) {
+		if !slices.Contains(restoreOrder, f) {
 			return fmt.Errorf("invalid persisted offload feature %q", f)
+		}
+		// A persisted record from a runtime that disabled receive checksum
+		// verification stays valid: the feature is left as found and Restore
+		// still re-enables it.
+		if !slices.Contains(offloadFeatures, f) {
+			continue
 		}
 		if err := exec.CommandContext(ctx, ethtoolPath, "-K", o.Interface, f, "off").Run(); err != nil {
 			failed = append(failed, f)

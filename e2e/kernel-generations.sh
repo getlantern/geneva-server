@@ -98,7 +98,9 @@ runtime_version=$(jq -r .runtime_version <<<"$descriptor")
 [[ "$(status | jq '.active == null')" == true ]]
 
 echo 'kernel-gate: keep RX checksum verification enabled'
-"${COMPOSE[@]}" exec -T probe ethtool -K eth0 rx on
+# Drivers such as virtio report rx-checksumming as fixed; -K fails there even
+# though the feature is already on, so only switch it when it is off.
+"${COMPOSE[@]}" exec -T probe sh -c 'ethtool -k eth0 | grep -q "^rx-checksumming: on" || ethtool -K eth0 rx on'
 "${COMPOSE[@]}" exec -T probe ethtool -k eth0 | grep '^rx-checksumming: on'
 
 echo 'kernel-gate: open established and half-open flows before activation'
