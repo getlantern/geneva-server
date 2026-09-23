@@ -141,23 +141,23 @@ type persistedState struct {
 
 // Controller owns immutable engines, conntrack steering, durable state and NIC offloads.
 type Controller struct {
-	cfg          Config
-	eng          *engine.Registry
-	log          Logger
-	mu           sync.Mutex
-	generations  map[uint32]*generationState
-	activeNew    uint32
-	previous     uint32
-	unsafe       bool
-	failure      string
-	nft          *nftables.Manager
+	cfg         Config
+	eng         *engine.Registry
+	log         Logger
+	mu          sync.Mutex
+	generations map[uint32]*generationState
+	activeNew   uint32
+	previous    uint32
+	unsafe      bool
+	failure     string
+	nft         *nftables.Manager
 	// steeringInstalled is true only while the last program transaction
 	// succeeded and that program queues traffic for some generation. A failed
 	// or in-flight transaction leaves it false: interception is not proven.
 	steeringInstalled bool
-	offloads     *netdev.Original
-	faultLatched atomic.Bool
-	persistFatal atomic.Bool
+	offloads          *netdev.Original
+	faultLatched      atomic.Bool
+	persistFatal      atomic.Bool
 	// faultEpoch records every hot-path integrity signal, including signals
 	// received while the adapter is already unsafe and no repair guard is armed.
 	faultEpoch atomic.Uint64
