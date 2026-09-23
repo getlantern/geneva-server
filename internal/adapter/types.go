@@ -172,6 +172,35 @@ type Status struct {
 	Active   *ArtifactIdentity  `json:"active,omitempty"`
 	Prepared []ArtifactIdentity `json:"prepared,omitempty"`
 	Draining []DrainGeneration  `json:"draining,omitempty"`
+	// Activity reports what each serving generation (active or draining) has
+	// done to the traffic it processed. Older clients ignore it.
+	Activity []GenerationActivity `json:"activity,omitempty"`
+	// Steering reports where the runtime intercepts traffic.
+	Steering *SteeringStatus `json:"steering,omitempty"`
+}
+
+// GenerationActivity is one serving generation's cumulative packet counters.
+// Counters only grow within one Lineage; a new lineage for the same identity
+// means they restarted from zero. Acted packets are Dropped + Tampered +
+// Expanded: the packets the strategy changed.
+type GenerationActivity struct {
+	Identity  ArtifactIdentity `json:"identity"`
+	Lineage   string           `json:"lineage"`
+	PacketsIn uint64           `json:"packets_in"`
+	BytesIn   uint64           `json:"bytes_in"`
+	Unchanged uint64           `json:"unchanged"`
+	Dropped   uint64           `json:"dropped"`
+	Tampered  uint64           `json:"tampered"`
+	Expanded  uint64           `json:"expanded"`
+	Errors    uint64           `json:"errors"`
+}
+
+// SteeringStatus is the interception the runtime has programmed. Port is the
+// TCP listener port whose traffic is steered; Active is false while no
+// generation is steering.
+type SteeringStatus struct {
+	Port   uint16 `json:"port"`
+	Active bool   `json:"active"`
 }
 
 type DrainGeneration struct {

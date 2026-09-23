@@ -141,19 +141,23 @@ type persistedState struct {
 
 // Controller owns immutable engines, conntrack steering, durable state and NIC offloads.
 type Controller struct {
-	cfg          Config
-	eng          *engine.Registry
-	log          Logger
-	mu           sync.Mutex
-	generations  map[uint32]*generationState
-	activeNew    uint32
-	previous     uint32
-	unsafe       bool
-	failure      string
-	nft          *nftables.Manager
-	offloads     *netdev.Original
-	faultLatched atomic.Bool
-	persistFatal atomic.Bool
+	cfg         Config
+	eng         *engine.Registry
+	log         Logger
+	mu          sync.Mutex
+	generations map[uint32]*generationState
+	activeNew   uint32
+	previous    uint32
+	unsafe      bool
+	failure     string
+	nft         *nftables.Manager
+	// steeringInstalled is true only while the last program transaction
+	// succeeded and that program queues traffic for some generation. A failed
+	// or in-flight transaction leaves it false: interception is not proven.
+	steeringInstalled bool
+	offloads          *netdev.Original
+	faultLatched      atomic.Bool
+	persistFatal      atomic.Bool
 	// faultEpoch records every hot-path integrity signal, including signals
 	// received while the adapter is already unsafe and no repair guard is armed.
 	faultEpoch atomic.Uint64
@@ -1346,11 +1350,19 @@ func (c *Controller) DetailedStatus(ctx context.Context) (State, error) {
 }
 
 func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
+	// Generation IDs are reused after garbage collection, so the counter
+	// lineage of every generation is pinned before the unlocked conntrack pass
+	// and re-checked when the counters are read.
+	c.mu.Lock()
+	lineages := c.lineagesLocked()
+	c.mu.Unlock()
 	detailed, err := c.DetailedStatus(ctx)
 	if err != nil {
 		return adapter.Status{}, err
 	}
-	out := adapter.Status{Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations))}
+	out := adapter.Status{
+		Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations)),
+	}
 	for _, gen := range detailed.Generations {
 		out.Prepared = append(out.Prepared, gen.Identity)
 		if gen.ID == detailed.ActiveNew {
@@ -1363,6 +1375,15 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 			})
 		}
 	}
+	activity, steering, err := c.activityFor(detailed, lineages)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	out.Activity = activity
+	out.Steering = &steering
+	sort.Slice(out.Activity, func(i, j int) bool {
+		return out.Activity[i].Identity.Revision < out.Activity[j].Identity.Revision
+	})
 	sort.Slice(out.Prepared, func(i, j int) bool {
 		if out.Prepared[i].Technique != out.Prepared[j].Technique {
 			return out.Prepared[i].Technique < out.Prepared[j].Technique
@@ -1376,6 +1397,65 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 		return out.Draining[i].Identity.Revision < out.Draining[j].Identity.Revision
 	})
 	return out, nil
+}
+
+// lineagesLocked returns the counter lineage of every generation's engine.
+func (c *Controller) lineagesLocked() map[uint32]string {
+	lineages := make(map[uint32]string, len(c.generations))
+	for id := range c.generations {
+		if snap, ok := c.eng.GenerationSnapshot(id); ok {
+			lineages[id] = snap.Lineage
+		}
+	}
+	return lineages
+}
+
+// activityFor reads the counters of every serving generation in view. Engines
+// are only prepared and removed under c.mu, so reading them under the lock,
+// after confirming neither the generation view nor any engine lineage has
+// moved since lineages was pinned, guarantees each snapshot belongs to the
+// generation whose identity and drain counts are reported alongside it.
+//
+// Steering is read in the same critical section and reflects the installed,
+// verified program rather than the lifecycle view, which can keep a draining
+// generation after its rules were removed.
+func (c *Controller) activityFor(view State, lineages map[uint32]string) ([]adapter.GenerationActivity, adapter.SteeringStatus, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	steering := adapter.SteeringStatus{Port: c.cfg.NFT.Port, Active: c.steeringInstalled}
+	changed := errors.New("adapter generations changed while activity status was in progress; retry status")
+	if !sameStatusGenerationView(view, c.stateLocked()) {
+		return nil, steering, changed
+	}
+	var activity []adapter.GenerationActivity
+	for _, gen := range view.Generations {
+		if gen.Phase != PhaseActive && gen.Phase != PhaseDraining {
+			continue
+		}
+		snap, ok := c.eng.GenerationSnapshot(gen.ID)
+		if !ok {
+			continue
+		}
+		if pinned, known := lineages[gen.ID]; !known || pinned != snap.Lineage {
+			return nil, steering, changed
+		}
+		activity = append(activity, generationActivity(gen.Identity, snap))
+	}
+	return activity, steering, nil
+}
+
+func generationActivity(identity adapter.ArtifactIdentity, snap engine.GenerationSnapshot) adapter.GenerationActivity {
+	return adapter.GenerationActivity{
+		Identity:  identity,
+		Lineage:   snap.Lineage,
+		PacketsIn: snap.PacketsIn,
+		BytesIn:   snap.BytesIn,
+		Unchanged: snap.Unchanged,
+		Dropped:   snap.Dropped,
+		Tampered:  snap.Tampered,
+		Expanded:  snap.Expanded,
+		Errors:    snap.Errors,
+	}
 }
 
 func sameStatusGenerationView(a, b State) bool {
@@ -1599,6 +1679,7 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 	cfg := m.Config()
 	cfg.NeutralizeNew = neutral
 	m = nftables.New(cfg)
+	c.steeringInstalled = false
 	if c.cfg.Program != nil {
 		err := c.cfg.Program(ctx, m.Config(), verify)
 		if c.cfg.VerifyProgram != nil {
@@ -1616,10 +1697,12 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 			return err
 		}
 		c.nft = m
+		c.steeringInstalled = programSteers(m.Config())
 		return nil
 	}
 	if c.cfg.NoNFT {
 		c.nft = m
+		c.steeringInstalled = programSteers(m.Config())
 		return nil
 	}
 	if verify {
@@ -1631,7 +1714,18 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 		return err
 	}
 	c.nft = m
+	c.steeringInstalled = programSteers(m.Config())
 	return nil
+}
+
+// programSteers reports whether a program queues any traffic at all.
+func programSteers(cfg nftables.Config) bool {
+	for _, generation := range cfg.Generations {
+		if !generation.Outbound.Empty() || !generation.Inbound.Empty() {
+			return true
+		}
+	}
+	return false
 }
 func (c *Controller) removeRulesLocked(ctx context.Context) error {
 	return c.programLocked(ctx, nil, 0, true)

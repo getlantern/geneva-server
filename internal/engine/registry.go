@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -22,14 +24,47 @@ type Registry struct {
 	byID   atomic.Pointer[map[uint32]*Engine]
 	active atomic.Uint32
 	swaps  atomic.Uint64
+
+	// epoch and prepared name the counter lineage of every engine this
+	// registry creates. An engine's counters start at zero, so a generation
+	// removed and prepared again under the same ID is a new lineage.
+	epoch    string
+	prepared atomic.Uint64
 }
 
 // NewRegistry returns an empty immutable-engine registry.
 func NewRegistry() *Registry {
-	r := &Registry{}
+	r := &Registry{epoch: newEpoch()}
 	empty := make(map[uint32]*Engine)
 	r.byID.Store(&empty)
 	return r
+}
+
+// newEpoch returns a random identifier distinguishing this process's counter
+// lineages from those of any earlier or later process.
+func newEpoch() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		panic(fmt.Sprintf("engine: reading random epoch: %v", err))
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+// GenerationSnapshot is one engine's counters and the lineage they belong to.
+// Counters only grow within a lineage; a different lineage for the same
+// generation means they restarted from zero.
+type GenerationSnapshot struct {
+	Lineage string
+	Snapshot
+}
+
+// GenerationSnapshot returns the counters of the engine named by id.
+func (r *Registry) GenerationSnapshot(id uint32) (GenerationSnapshot, bool) {
+	eng := (*r.byID.Load())[id]
+	if eng == nil {
+		return GenerationSnapshot{}, false
+	}
+	return GenerationSnapshot{Lineage: eng.lineage, Snapshot: eng.Snapshot()}, true
 }
 
 // Prepare parses and validates dna, then publishes it as generation id. The
@@ -48,6 +83,7 @@ func (r *Registry) Prepare(id uint32, dna string) error {
 		}
 		return fmt.Errorf("generation %d is immutable and already contains different DNA", id)
 	}
+	eng.lineage = fmt.Sprintf("%s-%d", r.epoch, r.prepared.Add(1))
 	next := make(map[uint32]*Engine, len(cur)+1)
 	for k, v := range cur {
 		next[k] = v

@@ -75,6 +75,14 @@ All mutations are `POST`; `descriptor` and `status` are `GET`.
 - `GET /v1/adapter/status` returns generic `active`, `prepared`, and `draining`
   identity lists. Draining entries contain bounded authoritative conntrack
   counts. Raw DNA and private numeric generations are absent.
+  `activity` carries, for every active or draining artifact, its cumulative
+  `packets_in`, `bytes_in` and per-outcome counts (`unchanged`, `dropped`,
+  `tampered`, `expanded`, `errors`). Counters only grow within one opaque
+  `lineage`; a new lineage for the same identity means they restarted from
+  zero (process restart, or the artifact was collected and staged again).
+  `steering` reports the TCP `port` whose traffic is intercepted and whether
+  steering is `active`, so a control plane can detect a port that is not the
+  proxy's listener.
 - `/v1/adapter/drain` accepts an identity and returns `complete` plus
   `remaining_connections` from one controller-deadline-bounded count.
 - `/v1/adapter/garbage-collect` accepts `{"keep":[<identity>, ...]}`. Active,
