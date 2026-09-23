@@ -105,7 +105,7 @@ box. Everything else is exported as metrics (below).
 | `POST /v1/adapter/prepare` | both | persist an identity-bound deployment (256 KiB decoded artifact limit) |
 | `POST /v1/adapter/activate-for-new-connections` | both | assign future SYNs to a prepared artifact after union staging |
 | `POST /v1/adapter/deactivate-for-new-connections` | both | identity-fenced stop of new-SYN assignment |
-| `GET /v1/adapter/status` | both | generic active/prepared/draining identities and bounded drain counts |
+| `GET /v1/adapter/status` | both | generic active/prepared/draining identities, bounded drain counts, per-artifact activity counters and the steered port |
 | `POST /v1/adapter/drain` | both | bounded conntrack count for an artifact identity |
 | `POST /v1/adapter/garbage-collect` | both | identity keep-set GC of zero-flow generations |
 | `POST /v1/adapter/rollback` | both | restage/reactivate a complete previous-known-good artifact |

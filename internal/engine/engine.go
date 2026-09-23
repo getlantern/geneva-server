@@ -132,6 +132,9 @@ type Engine struct {
 	mu    sync.Mutex // serializes swaps; reads use the atomic pointer
 	cur   atomic.Pointer[loaded]
 	Stats Stats
+
+	// lineage is assigned by the Registry that publishes the engine.
+	lineage string
 }
 
 type loaded struct {

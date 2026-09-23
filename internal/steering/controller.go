@@ -1350,7 +1350,10 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 	if err != nil {
 		return adapter.Status{}, err
 	}
-	out := adapter.Status{Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations))}
+	out := adapter.Status{
+		Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations)),
+		Steering: &adapter.SteeringStatus{Port: c.cfg.NFT.Port, Active: detailed.Steering},
+	}
 	for _, gen := range detailed.Generations {
 		out.Prepared = append(out.Prepared, gen.Identity)
 		if gen.ID == detailed.ActiveNew {
@@ -1362,7 +1365,15 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 				Identity: gen.Identity, RemainingConnections: uint64(gen.Connections),
 			})
 		}
+		if gen.Phase == PhaseActive || gen.Phase == PhaseDraining {
+			if snap, ok := c.eng.GenerationSnapshot(gen.ID); ok {
+				out.Activity = append(out.Activity, generationActivity(gen.Identity, snap))
+			}
+		}
 	}
+	sort.Slice(out.Activity, func(i, j int) bool {
+		return out.Activity[i].Identity.Revision < out.Activity[j].Identity.Revision
+	})
 	sort.Slice(out.Prepared, func(i, j int) bool {
 		if out.Prepared[i].Technique != out.Prepared[j].Technique {
 			return out.Prepared[i].Technique < out.Prepared[j].Technique
@@ -1376,6 +1387,20 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 		return out.Draining[i].Identity.Revision < out.Draining[j].Identity.Revision
 	})
 	return out, nil
+}
+
+func generationActivity(identity adapter.ArtifactIdentity, snap engine.GenerationSnapshot) adapter.GenerationActivity {
+	return adapter.GenerationActivity{
+		Identity:  identity,
+		Lineage:   snap.Lineage,
+		PacketsIn: snap.PacketsIn,
+		BytesIn:   snap.BytesIn,
+		Unchanged: snap.Unchanged,
+		Dropped:   snap.Dropped,
+		Tampered:  snap.Tampered,
+		Expanded:  snap.Expanded,
+		Errors:    snap.Errors,
+	}
 }
 
 func sameStatusGenerationView(a, b State) bool {
