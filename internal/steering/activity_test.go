@@ -89,3 +89,36 @@ func TestStatusReportsGenerationActivityAndSteering(t *testing.T) {
 		t.Fatalf("activity after collection = %+v", st.Activity)
 	}
 }
+
+// Counters are only reported against the generation view they were read
+// under: a view that moved since it was taken is refused rather than paired
+// with another generation's counters.
+func TestActivityRefusesAStaleGenerationView(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	c := New(engine.NewRegistry(), Config{NoNFT: true, NFT: nftables.Config{Port: 46551}, Connections: flows}, nil)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	one := lifecycleArtifact(t, "r1", genOneDNA)
+	two := lifecycleArtifact(t, "r2", genTwoDNA)
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	view := c.State()
+	if activity, err := c.activityFor(view); err != nil || len(activity) != 1 {
+		t.Fatalf("current view activity = %+v, %v", activity, err)
+	}
+	if err := c.Prepare(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, two); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.activityFor(view); err == nil {
+		t.Fatal("stale generation view produced activity")
+	}
+}

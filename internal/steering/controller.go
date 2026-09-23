@@ -1365,12 +1365,12 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 				Identity: gen.Identity, RemainingConnections: uint64(gen.Connections),
 			})
 		}
-		if gen.Phase == PhaseActive || gen.Phase == PhaseDraining {
-			if snap, ok := c.eng.GenerationSnapshot(gen.ID); ok {
-				out.Activity = append(out.Activity, generationActivity(gen.Identity, snap))
-			}
-		}
 	}
+	activity, err := c.activityFor(detailed)
+	if err != nil {
+		return adapter.Status{}, err
+	}
+	out.Activity = activity
 	sort.Slice(out.Activity, func(i, j int) bool {
 		return out.Activity[i].Identity.Revision < out.Activity[j].Identity.Revision
 	})
@@ -1387,6 +1387,28 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 		return out.Draining[i].Identity.Revision < out.Draining[j].Identity.Revision
 	})
 	return out, nil
+}
+
+// activityFor reads the counters of every serving generation in view. Engines
+// are only prepared and removed under c.mu, so reading them under the lock,
+// after confirming the generation view has not moved, guarantees each
+// snapshot belongs to the identity it is reported under.
+func (c *Controller) activityFor(view State) ([]adapter.GenerationActivity, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !sameStatusGenerationView(view, c.stateLocked()) {
+		return nil, errors.New("adapter generations changed while activity status was in progress; retry status")
+	}
+	var activity []adapter.GenerationActivity
+	for _, gen := range view.Generations {
+		if gen.Phase != PhaseActive && gen.Phase != PhaseDraining {
+			continue
+		}
+		if snap, ok := c.eng.GenerationSnapshot(gen.ID); ok {
+			activity = append(activity, generationActivity(gen.Identity, snap))
+		}
+	}
+	return activity, nil
 }
 
 func generationActivity(identity adapter.ArtifactIdentity, snap engine.GenerationSnapshot) adapter.GenerationActivity {
