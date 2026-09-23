@@ -1346,6 +1346,12 @@ func (c *Controller) DetailedStatus(ctx context.Context) (State, error) {
 }
 
 func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
+	// Generation IDs are reused after garbage collection, so the counter
+	// lineage of every generation is pinned before the unlocked conntrack pass
+	// and re-checked when the counters are read.
+	c.mu.Lock()
+	lineages := c.lineagesLocked()
+	c.mu.Unlock()
 	detailed, err := c.DetailedStatus(ctx)
 	if err != nil {
 		return adapter.Status{}, err
@@ -1366,7 +1372,7 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 			})
 		}
 	}
-	activity, err := c.activityFor(detailed)
+	activity, err := c.activityFor(detailed, lineages)
 	if err != nil {
 		return adapter.Status{}, err
 	}
@@ -1389,24 +1395,42 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 	return out, nil
 }
 
+// lineagesLocked returns the counter lineage of every generation's engine.
+func (c *Controller) lineagesLocked() map[uint32]string {
+	lineages := make(map[uint32]string, len(c.generations))
+	for id := range c.generations {
+		if snap, ok := c.eng.GenerationSnapshot(id); ok {
+			lineages[id] = snap.Lineage
+		}
+	}
+	return lineages
+}
+
 // activityFor reads the counters of every serving generation in view. Engines
 // are only prepared and removed under c.mu, so reading them under the lock,
-// after confirming the generation view has not moved, guarantees each
-// snapshot belongs to the identity it is reported under.
-func (c *Controller) activityFor(view State) ([]adapter.GenerationActivity, error) {
+// after confirming neither the generation view nor any engine lineage has
+// moved since lineages was pinned, guarantees each snapshot belongs to the
+// generation whose identity and drain counts are reported alongside it.
+func (c *Controller) activityFor(view State, lineages map[uint32]string) ([]adapter.GenerationActivity, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	changed := errors.New("adapter generations changed while activity status was in progress; retry status")
 	if !sameStatusGenerationView(view, c.stateLocked()) {
-		return nil, errors.New("adapter generations changed while activity status was in progress; retry status")
+		return nil, changed
 	}
 	var activity []adapter.GenerationActivity
 	for _, gen := range view.Generations {
 		if gen.Phase != PhaseActive && gen.Phase != PhaseDraining {
 			continue
 		}
-		if snap, ok := c.eng.GenerationSnapshot(gen.ID); ok {
-			activity = append(activity, generationActivity(gen.Identity, snap))
+		snap, ok := c.eng.GenerationSnapshot(gen.ID)
+		if !ok {
+			continue
 		}
+		if pinned, known := lineages[gen.ID]; !known || pinned != snap.Lineage {
+			return nil, changed
+		}
+		activity = append(activity, generationActivity(gen.Identity, snap))
 	}
 	return activity, nil
 }

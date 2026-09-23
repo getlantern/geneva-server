@@ -108,17 +108,46 @@ func TestActivityRefusesAStaleGenerationView(t *testing.T) {
 	if err := c.ActivateForNewConnections(ctx, one); err != nil {
 		t.Fatal(err)
 	}
-	view := c.State()
-	if activity, err := c.activityFor(view); err != nil || len(activity) != 1 {
+	pinned := func() map[uint32]string {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return c.lineagesLocked()
+	}
+	view, lineages := c.State(), pinned()
+	if activity, err := c.activityFor(view, lineages); err != nil || len(activity) != 1 {
 		t.Fatalf("current view activity = %+v, %v", activity, err)
 	}
+
+	// The same generation ID and identity backed by a replaced engine: the
+	// view compares equal, the lineage does not.
+	c.mu.Lock()
+	id := c.activeNew
+	dna := c.generations[id].DNA
+	c.mu.Unlock()
+	engineRegistry := c.eng
+	c.mu.Lock()
+	engineRegistry.Deactivate()
+	if err := engineRegistry.Remove(id); err != nil {
+		c.mu.Unlock()
+		t.Fatal(err)
+	}
+	if err := engineRegistry.Prepare(id, dna); err != nil {
+		c.mu.Unlock()
+		t.Fatal(err)
+	}
+	c.mu.Unlock()
+	if _, err := c.activityFor(view, lineages); err == nil {
+		t.Fatal("a replaced engine under the same generation ID produced activity")
+	}
+
+	view, lineages = c.State(), pinned()
 	if err := c.Prepare(ctx, two); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.ActivateForNewConnections(ctx, two); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.activityFor(view); err == nil {
+	if _, err := c.activityFor(view, lineages); err == nil {
 		t.Fatal("stale generation view produced activity")
 	}
 }
