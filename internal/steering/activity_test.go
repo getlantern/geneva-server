@@ -2,6 +2,7 @@ package steering
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/getlantern/geneva/strategy"
@@ -114,7 +115,7 @@ func TestActivityRefusesAStaleGenerationView(t *testing.T) {
 		return c.lineagesLocked()
 	}
 	view, lineages := c.State(), pinned()
-	if activity, err := c.activityFor(view, lineages); err != nil || len(activity) != 1 {
+	if activity, _, err := c.activityFor(view, lineages); err != nil || len(activity) != 1 {
 		t.Fatalf("current view activity = %+v, %v", activity, err)
 	}
 
@@ -136,7 +137,7 @@ func TestActivityRefusesAStaleGenerationView(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.mu.Unlock()
-	if _, err := c.activityFor(view, lineages); err == nil {
+	if _, _, err := c.activityFor(view, lineages); err == nil {
 		t.Fatal("a replaced engine under the same generation ID produced activity")
 	}
 
@@ -147,7 +148,56 @@ func TestActivityRefusesAStaleGenerationView(t *testing.T) {
 	if err := c.ActivateForNewConnections(ctx, two); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.activityFor(view, lineages); err == nil {
+	if _, _, err := c.activityFor(view, lineages); err == nil {
 		t.Fatal("stale generation view produced activity")
+	}
+}
+
+// Steering reports the installed program: active once a strategy's rules are
+// programmed, and inactive when a program transaction fails even though the
+// lifecycle view still holds a serving generation.
+func TestStatusSteeringFollowsTheInstalledProgram(t *testing.T) {
+	ctx := context.Background()
+	flows := &fakeConnections{counts: map[uint32]int{}}
+	var failProgram bool
+	programErr := errors.New("nft transaction failed")
+	c := New(engine.NewRegistry(), Config{
+		NFT:         nftables.Config{Port: 46551},
+		Connections: flows,
+		Program: func(context.Context, nftables.Config, bool) error {
+			if failProgram {
+				return programErr
+			}
+			return nil
+		},
+	}, nil)
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	one := lifecycleArtifact(t, "r1", genOneDNA)
+	if err := c.Prepare(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.ActivateForNewConnections(ctx, one); err != nil {
+		t.Fatal(err)
+	}
+	st, err := c.Status(ctx)
+	if err != nil || st.Steering == nil || !st.Steering.Active || st.Steering.Port != 46551 {
+		t.Fatalf("steering after activation = %+v, %v", st.Steering, err)
+	}
+
+	failProgram = true
+	c.mu.Lock()
+	programmed := c.programLocked(ctx, c.liveLocked(), c.activeNew, false)
+	c.mu.Unlock()
+	if !errors.Is(programmed, programErr) {
+		t.Fatalf("program error = %v", programmed)
+	}
+	if !c.State().Steering {
+		t.Fatal("the lifecycle view should still hold the serving generation")
+	}
+	st, err = c.Status(ctx)
+	if err != nil || st.Steering == nil || st.Steering.Active {
+		t.Fatalf("steering after a failed program = %+v, %v", st.Steering, err)
 	}
 }

@@ -151,6 +151,10 @@ type Controller struct {
 	unsafe       bool
 	failure      string
 	nft          *nftables.Manager
+	// steeringInstalled is true only while the last program transaction
+	// succeeded and that program queues traffic for some generation. A failed
+	// or in-flight transaction leaves it false: interception is not proven.
+	steeringInstalled bool
 	offloads     *netdev.Original
 	faultLatched atomic.Bool
 	persistFatal atomic.Bool
@@ -1358,7 +1362,6 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 	}
 	out := adapter.Status{
 		Prepared: make([]adapter.ArtifactIdentity, 0, len(detailed.Generations)),
-		Steering: &adapter.SteeringStatus{Port: c.cfg.NFT.Port, Active: detailed.Steering},
 	}
 	for _, gen := range detailed.Generations {
 		out.Prepared = append(out.Prepared, gen.Identity)
@@ -1372,11 +1375,12 @@ func (c *Controller) Status(ctx context.Context) (adapter.Status, error) {
 			})
 		}
 	}
-	activity, err := c.activityFor(detailed, lineages)
+	activity, steering, err := c.activityFor(detailed, lineages)
 	if err != nil {
 		return adapter.Status{}, err
 	}
 	out.Activity = activity
+	out.Steering = &steering
 	sort.Slice(out.Activity, func(i, j int) bool {
 		return out.Activity[i].Identity.Revision < out.Activity[j].Identity.Revision
 	})
@@ -1411,12 +1415,17 @@ func (c *Controller) lineagesLocked() map[uint32]string {
 // after confirming neither the generation view nor any engine lineage has
 // moved since lineages was pinned, guarantees each snapshot belongs to the
 // generation whose identity and drain counts are reported alongside it.
-func (c *Controller) activityFor(view State, lineages map[uint32]string) ([]adapter.GenerationActivity, error) {
+//
+// Steering is read in the same critical section and reflects the installed,
+// verified program rather than the lifecycle view, which can keep a draining
+// generation after its rules were removed.
+func (c *Controller) activityFor(view State, lineages map[uint32]string) ([]adapter.GenerationActivity, adapter.SteeringStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	steering := adapter.SteeringStatus{Port: c.cfg.NFT.Port, Active: c.steeringInstalled}
 	changed := errors.New("adapter generations changed while activity status was in progress; retry status")
 	if !sameStatusGenerationView(view, c.stateLocked()) {
-		return nil, changed
+		return nil, steering, changed
 	}
 	var activity []adapter.GenerationActivity
 	for _, gen := range view.Generations {
@@ -1428,11 +1437,11 @@ func (c *Controller) activityFor(view State, lineages map[uint32]string) ([]adap
 			continue
 		}
 		if pinned, known := lineages[gen.ID]; !known || pinned != snap.Lineage {
-			return nil, changed
+			return nil, steering, changed
 		}
 		activity = append(activity, generationActivity(gen.Identity, snap))
 	}
-	return activity, nil
+	return activity, steering, nil
 }
 
 func generationActivity(identity adapter.ArtifactIdentity, snap engine.GenerationSnapshot) adapter.GenerationActivity {
@@ -1670,6 +1679,7 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 	cfg := m.Config()
 	cfg.NeutralizeNew = neutral
 	m = nftables.New(cfg)
+	c.steeringInstalled = false
 	if c.cfg.Program != nil {
 		err := c.cfg.Program(ctx, m.Config(), verify)
 		if c.cfg.VerifyProgram != nil {
@@ -1687,10 +1697,12 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 			return err
 		}
 		c.nft = m
+		c.steeringInstalled = programSteers(m.Config())
 		return nil
 	}
 	if c.cfg.NoNFT {
 		c.nft = m
+		c.steeringInstalled = programSteers(m.Config())
 		return nil
 	}
 	if verify {
@@ -1702,7 +1714,18 @@ func (c *Controller) programModeLocked(ctx context.Context, live []*generationSt
 		return err
 	}
 	c.nft = m
+	c.steeringInstalled = programSteers(m.Config())
 	return nil
+}
+
+// programSteers reports whether a program queues any traffic at all.
+func programSteers(cfg nftables.Config) bool {
+	for _, generation := range cfg.Generations {
+		if !generation.Outbound.Empty() || !generation.Inbound.Empty() {
+			return true
+		}
+	}
+	return false
 }
 func (c *Controller) removeRulesLocked(ctx context.Context) error {
 	return c.programLocked(ctx, nil, 0, true)
