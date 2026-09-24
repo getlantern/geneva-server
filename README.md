@@ -100,7 +100,7 @@ box. Everything else is exported as metrics (below).
 | --------------- | --------- | ----------------------------------------------------------- |
 | `GET /healthz`  | both      | liveness + mode, engine/verdict/inbound-TCP stats            |
 | `GET /canary`   | eval only | per-market captured field-value pool                        |
-| `GET /v1/adapter/descriptor` | both | numeric protocol/schema versions and bounded capabilities |
+| `GET /v1/adapter/descriptor` | both | numeric protocol/schema versions, engine compatibility `runtime_version`, and bounded capabilities |
 | `POST /v1/adapter/verify` | both | validate an artifact and immutable identity without mutation |
 | `POST /v1/adapter/prepare` | both | persist an identity-bound deployment (256 KiB decoded artifact limit) |
 | `POST /v1/adapter/activate-for-new-connections` | both | assign future SYNs to a prepared artifact after union staging |
@@ -144,6 +144,12 @@ to the wrong DNA. First activation temporarily neutral-marks both existing
 relevant conntracks and SYNs arriving during the sweep before flipping
 assignment, so a pre-activation half-open SYN retransmission cannot cross the
 boundary.
+
+The descriptor's `runtime_version` is the engine compatibility version
+(`adapter.RuntimeVersionGeneva`), independent of the package version that
+`/healthz` reports. It is bumped only when strategy interpretation changes
+(grammar, engine semantics, action behavior); see
+[docs/adapter-v1.md](docs/adapter-v1.md).
 
 State v2 retains the artifact's exact protocol, schema, and required runtime
 metadata and revalidates it against the installed descriptor before restart

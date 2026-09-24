@@ -30,7 +30,7 @@ const (
 )
 
 func lifecycleArtifact(t *testing.T, revision, dna string) adapter.Artifact {
-	return lifecycleArtifactForRuntime(t, revision, dna, "dev")
+	return lifecycleArtifactForRuntime(t, revision, dna, adapter.RuntimeVersionGeneva)
 }
 
 func lifecycleArtifactForRuntime(t *testing.T, revision, dna, runtimeVersion string) adapter.Artifact {
@@ -1136,7 +1136,7 @@ func TestQuarantineRemediatesThroughGenericT8ChampionSequence(t *testing.T) {
 				}
 				return state, &fakeConnections{counts: map[uint32]int{1: 1}}
 			},
-			runtime: "dev",
+			runtime: adapter.RuntimeVersionGeneva,
 		},
 		{
 			name: "incompatible state",

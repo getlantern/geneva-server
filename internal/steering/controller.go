@@ -64,7 +64,10 @@ type Config struct {
 	RestoreOffloads           func(context.Context, string, *netdev.Original) error
 	Fatal                     func(error)
 	ConntrackTimeout          time.Duration
-	RuntimeVersion            string
+	// RuntimeVersion is the engine compatibility version the descriptor
+	// advertises and artifacts must require. It defaults to
+	// adapter.RuntimeVersionGeneva and is never the package build version.
+	RuntimeVersion string
 	// Program is a test seam for asserting lifecycle transaction ordering. A
 	// production controller leaves it nil and invokes nft directly.
 	Program       func(context.Context, nftables.Config, bool) error
@@ -197,7 +200,7 @@ func New(eng *engine.Registry, cfg Config, log Logger) *Controller {
 		cfg.ConntrackTimeout = 5 * time.Second
 	}
 	if cfg.RuntimeVersion == "" {
-		cfg.RuntimeVersion = "dev"
+		cfg.RuntimeVersion = adapter.RuntimeVersionGeneva
 	}
 	if cfg.CaptureOffloads == nil {
 		cfg.CaptureOffloads = netdev.Capture

@@ -30,6 +30,15 @@ const (
 	MaxLiveGenerationBudget     uint32  = 32
 )
 
+// RuntimeVersionGeneva is the strategy-compatibility version of the Geneva
+// engine. The descriptor advertises it as runtime_version and artifacts must
+// require it exactly, so it is deliberately independent of the package build
+// version: a release that leaves strategy interpretation unchanged keeps it,
+// and every published artifact stays valid across the upgrade. Bump it only
+// when the same DNA could behave differently: a grammar change, different
+// engine semantics, or different action behavior.
+const RuntimeVersionGeneva = "0.0.4"
+
 type Descriptor struct {
 	AdapterProtocol    Version  `json:"adapter_protocol"`
 	Technique          string   `json:"technique"`
