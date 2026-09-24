@@ -26,3 +26,9 @@ wait_healthy() {
   done
   return 1
 }
+
+# runtime_version <container> prints the engine compatibility version the
+# sidecar descriptor advertises, which every artifact must require exactly.
+runtime_version() {
+  "${COMPOSE[@]}" exec -T "$1" curl -fsS http://server:8092/v1/adapter/descriptor | jq -er .runtime_version
+}

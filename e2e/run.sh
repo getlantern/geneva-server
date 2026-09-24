@@ -19,11 +19,12 @@ source ../scripts/harness-lib.sh
 active_identity=''
 
 artifact_json() {
-  local dna="$1" digest payload
+  local dna="$1" digest payload runtime
   digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
   payload=$(printf '%s' "$dna" | base64 -w0)
-  printf '{"metadata":{"technique":"geneva","revision":"e2e-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"dev","schema_version":1},"payload":"%s"}' \
-    "$digest" "$digest" "${#dna}" "$payload"
+  runtime=$(runtime_version tester)
+  printf '{"metadata":{"technique":"geneva","revision":"e2e-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"%s","schema_version":1},"payload":"%s"}' \
+    "$digest" "$digest" "${#dna}" "$runtime" "$payload"
 }
 
 activate_strategy() {
