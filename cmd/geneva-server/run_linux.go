@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/getlantern/geneva-server/internal/adapter"
 	"github.com/getlantern/geneva-server/internal/canary"
 	"github.com/getlantern/geneva-server/internal/censor"
 	"github.com/getlantern/geneva-server/internal/control"
@@ -83,32 +84,10 @@ func runServer(o *runCmd) (runResult error) {
 	// packets the strategy's triggers can match, and nothing at all when the
 	// strategy can match nothing — which is what keeps an unassigned eval box
 	// and a rolled-back prod box off the data path entirely.
-	ctrl := steering.New(eng, steering.Config{
-		Mode: o.Mode,
-		NFT: nftables.Config{
-			Table:     o.Table,
-			Port:      o.Port,
-			OutQueue:  o.OutQueue,
-			InQueue:   o.InQueue,
-			BypassUID: uint32(o.ReinjectBypassUID),
-			NFTPath:   o.NFTPath,
-			Censor:    o.CensorCounters,
-		},
-		EthtoolPath: o.EthtoolPath,
-		Iface:       o.Iface,
-
-		ObserveInbound:            o.ObserveInbound,
-		StateFile:                 o.AdapterStateFile,
-		Connections:               flowtrack.Counter{},
-		MaxGenerations:            o.MaxGenerations,
-		MaxScopedGenerations:      o.MaxScopedGenerations,
-		MaxEveryPacketGenerations: o.MaxEveryPacketGenerations,
-		RuntimeVersion:            version,
-		Fatal: func(err error) {
-			log.Error("fatal steering integrity failure", "err", err)
-			reportFatal(err)
-		},
-	}, slogLogger{l: log})
+	ctrl := steering.New(eng, steeringConfig(o, func(err error) {
+		log.Error("fatal steering integrity failure", "err", err)
+		reportFatal(err)
+	}), slogLogger{l: log})
 	// The inbound censor classifier runs in both modes: a prod box's IP gets
 	// burned the same way a test box's does, and the fleet-wide burn rate is
 	// what sizes the clean-IP budget for exploration.
@@ -326,4 +305,34 @@ func runtimeExitError(runErr error, fatalCause <-chan error, serveErr <-chan err
 		return nil
 	}
 	return runErr
+}
+
+// steeringConfig maps the run flags onto the steering controller. The adapter
+// runtime version is the engine compatibility version, not the package build
+// version: artifacts pin it exactly, so tying it to the build would orphan
+// every published artifact on each release.
+func steeringConfig(o *runCmd, fatal func(error)) steering.Config {
+	return steering.Config{
+		Mode: o.Mode,
+		NFT: nftables.Config{
+			Table:     o.Table,
+			Port:      o.Port,
+			OutQueue:  o.OutQueue,
+			InQueue:   o.InQueue,
+			BypassUID: uint32(o.ReinjectBypassUID),
+			NFTPath:   o.NFTPath,
+			Censor:    o.CensorCounters,
+		},
+		EthtoolPath: o.EthtoolPath,
+		Iface:       o.Iface,
+
+		ObserveInbound:            o.ObserveInbound,
+		StateFile:                 o.AdapterStateFile,
+		Connections:               flowtrack.Counter{},
+		MaxGenerations:            o.MaxGenerations,
+		MaxScopedGenerations:      o.MaxScopedGenerations,
+		MaxEveryPacketGenerations: o.MaxEveryPacketGenerations,
+		RuntimeVersion:            adapter.RuntimeVersionGeneva,
+		Fatal:                     fatal,
+	}
 }

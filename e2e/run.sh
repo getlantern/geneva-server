@@ -19,11 +19,12 @@ source ../scripts/harness-lib.sh
 active_identity=''
 
 artifact_json() {
-  local dna="$1" digest payload
+  local dna="$1" digest payload runtime
   digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
   payload=$(printf '%s' "$dna" | base64 -w0)
-  printf '{"metadata":{"technique":"geneva","revision":"e2e-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"dev","schema_version":1},"payload":"%s"}' \
-    "$digest" "$digest" "${#dna}" "$payload"
+  runtime=$(runtime_version tester)
+  printf '{"metadata":{"technique":"geneva","revision":"e2e-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"%s","schema_version":1},"payload":"%s"}' \
+    "$digest" "$digest" "${#dna}" "$runtime" "$payload"
 }
 
 activate_strategy() {
@@ -75,7 +76,13 @@ fails=$(echo "$health" | jq '.verdicts.inject_fails')
 # counters that classify what arrives in the kernel, which is the only reason
 # this signal survives steering being scoped to the strategy.
 step "Inbound TCP classification from kernel counters (the censor-reachability signal)"
-health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+# The sidecar caches counter reads for censorReadInterval (2s), so the first
+# /healthz after the transfer can still carry a pre-transfer reading.
+for _ in $(seq 1 10); do
+  health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+  [[ "$(echo "$health" | jq '.inbound_tcp.events.syn > 0 and .inbound_tcp.events.data > 0')" == true ]] && break
+  sleep 1
+done
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
 data=$(echo "$health" | jq '.inbound_tcp.events.data')

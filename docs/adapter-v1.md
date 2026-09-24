@@ -11,11 +11,21 @@ equivalently protected management network.
   "adapter_protocol": 1,
   "technique": "geneva",
   "runtime_name": "geneva-engine",
-  "runtime_version": "<exact build version>",
+  "runtime_version": "0.0.4",
   "schema_versions": [1],
   "max_live_generations": 3
 }
 ```
+
+`runtime_version` is the Geneva engine compatibility version
+(`adapter.RuntimeVersionGeneva`), not the geneva-server package version, which
+`/healthz` reports as `version`. Artifacts must require it exactly. It changes
+only when the same DNA could behave differently: a grammar change, different
+engine semantics, or different action behavior. A release that leaves strategy
+interpretation unchanged keeps it, so published artifacts and persisted state
+stay valid across the upgrade. Bumping it deliberately invalidates every
+artifact built for the previous value, and restart quarantines persisted state
+that requires it.
 
 The cap is configurable from 1 through the generic maximum of 32 and defaults
 to 3. The independent every-packet cap defaults to 2 so active/previous-known-
@@ -37,7 +47,7 @@ one-to-one mapping from artifact identity to conntrack generation.
     "size": 123,
     "adapter_protocol": 1,
     "required_runtime_name": "geneva-engine",
-    "required_runtime_version": "<exact build version>",
+    "required_runtime_version": "0.0.4",
     "schema_version": 1
   },
   "payload": "<base64 Geneva DNA>"

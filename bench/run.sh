@@ -93,7 +93,7 @@ measure() {
 
 # put installs a strategy through the versioned adapter lifecycle on a running sidecar.
 put() {
-  local dna="$1" digest payload body
+  local dna="$1" digest payload body runtime
   if [[ -z "$dna" ]]; then
     printf '%s' "$active_identity" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/deactivate-for-new-connections >/dev/null
     active_identity=''
@@ -101,7 +101,8 @@ put() {
   fi
   digest=$(printf '%s' "$dna" | sha256sum | awk '{print $1}')
   payload=$(printf '%s' "$dna" | base64 -w0)
-  body=$(printf '{"metadata":{"technique":"geneva","revision":"bench-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"dev","schema_version":1},"payload":"%s"}' "$digest" "$digest" "${#dna}" "$payload")
+  runtime=$(runtime_version client)
+  body=$(printf '{"metadata":{"technique":"geneva","revision":"bench-%s","content_sha256":"%s","size":%d,"adapter_protocol":1,"required_runtime_name":"geneva-engine","required_runtime_version":"%s","schema_version":1},"payload":"%s"}' "$digest" "$digest" "${#dna}" "$runtime" "$payload")
   printf '%s' "$body" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/prepare >/dev/null
   printf '%s' "$body" | "${COMPOSE[@]}" exec -T client curl -fsS -X POST --data-binary @- http://server:8092/v1/adapter/activate-for-new-connections >/dev/null
   active_identity=$(printf '%s' "$body" | jq -c '.metadata | {technique, revision, digest: .content_sha256}')
