@@ -76,7 +76,13 @@ fails=$(echo "$health" | jq '.verdicts.inject_fails')
 # counters that classify what arrives in the kernel, which is the only reason
 # this signal survives steering being scoped to the strategy.
 step "Inbound TCP classification from kernel counters (the censor-reachability signal)"
-health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+# The sidecar caches counter reads for censorReadInterval (2s), so the first
+# /healthz after the transfer can still carry a pre-transfer reading.
+for _ in $(seq 1 10); do
+  health=$("${COMPOSE[@]}" exec -T tester curl -fsS http://server:8092/healthz)
+  [[ "$(echo "$health" | jq '.inbound_tcp.events.syn > 0 and .inbound_tcp.events.data > 0')" == true ]] && break
+  sleep 1
+done
 echo "$health" | jq '.inbound_tcp'
 syn=$(echo "$health" | jq '.inbound_tcp.events.syn')
 data=$(echo "$health" | jq '.inbound_tcp.events.data')
