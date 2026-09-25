@@ -219,7 +219,14 @@ high 20 bits is left alone and the connection is not steered.
 
 Drain/status read conntrack over netlink, filter by the full Geneva generation
 mask, then by original IPv4/TCP destination port. GC refuses an active
-generation or any nonzero result. IDs are bounded to 1..4095 and cannot be
+generation or any nonzero result. An ESTABLISHED flow idle longer than
+`--drain-idle-timeout` (default 5m, 0 disables) no longer holds a drain open:
+a connection the path killed without a FIN (a censor dropping it after the
+handshake, a client that vanished) stays ESTABLISHED in conntrack for
+`nf_conntrack_tcp_timeout_established`, five days by default. Idleness comes
+from the entry's own timer, which restarts on every packet, so a live
+connection holds the drain however long it lasts. ID allocation still counts
+every entry, idle or not, so an ID is never reused while one carries its mark. IDs are bounded to 1..4095 and cannot be
 changed in place; an ID becomes reusable only after zero-flow GC, so wraparound
 cannot bind an old conntrack entry to new DNA. Startup also reserves every live
 orphan ID found in the namespace. Restaging an absent rollback artifact takes a

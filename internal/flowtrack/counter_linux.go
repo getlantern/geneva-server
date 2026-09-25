@@ -7,6 +7,10 @@ package flowtrack
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	ct "github.com/ti-mo/conntrack"
 	"golang.org/x/sys/unix"
@@ -15,7 +19,64 @@ import (
 )
 
 // Counter counts live, adapter-owned TCP flows.
-type Counter struct{}
+//
+// IdleAfter, when positive, leaves out ESTABLISHED flows that have carried no
+// packet for that long. A connection the path killed without a FIN or RST
+// (a censor dropping a flow after its handshake, a client that vanished)
+// stays ESTABLISHED in conntrack for nf_conntrack_tcp_timeout_established,
+// five days by default, and would hold its generation's drain open for all of
+// it. Idleness is read from conntrack itself: an entry's remaining timeout
+// restarts at the established timeout on every packet, so a live connection
+// keeps counting however long it lasts.
+type Counter struct {
+	IdleAfter time.Duration
+}
+
+// establishedTimeoutPath is where the kernel exposes the timeout an
+// ESTABLISHED TCP entry restarts at on every packet.
+var establishedTimeoutPath = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established"
+
+// tcpConntrackEstablished is the kernel's TCP_CONNTRACK_ESTABLISHED state.
+const tcpConntrackEstablished = 3
+
+// liveness decides which dumped flows still hold a drain open.
+type liveness struct {
+	idleAfter   time.Duration
+	established time.Duration
+}
+
+// newLiveness reads the established timeout. Without it idleness cannot be
+// measured, so every flow counts: holding a drain open is the safe mistake.
+func (c Counter) newLiveness() liveness {
+	if c.IdleAfter <= 0 {
+		return liveness{}
+	}
+	raw, err := os.ReadFile(establishedTimeoutPath)
+	if err != nil {
+		return liveness{}
+	}
+	seconds, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 32)
+	if err != nil || seconds == 0 {
+		return liveness{}
+	}
+	return liveness{idleAfter: c.IdleAfter, established: time.Duration(seconds) * time.Second}
+}
+
+// live reports whether a flow still counts toward a drain.
+func (l liveness) live(flow ct.Flow) bool {
+	if l.idleAfter <= 0 || l.established <= 0 {
+		return true
+	}
+	tcp := flow.ProtoInfo.TCP
+	if tcp == nil || tcp.State != tcpConntrackEstablished {
+		return true
+	}
+	remaining := time.Duration(flow.Timeout) * time.Second
+	if remaining >= l.established {
+		return true
+	}
+	return l.established-remaining < l.idleAfter
+}
 
 // Conntrack's netlink dump does not accept a context. Keep lifecycle calls
 // bounded by running at most one dump at a time and allowing the caller to
@@ -27,16 +88,19 @@ var dumpSlot = make(chan struct{}, 1)
 // Count returns flows whose full Geneva namespace+generation bits match id and
 // whose original tuple targeted the configured proxy port. Connmark bits
 // outside the adapter reservation are intentionally ignored.
-func (Counter) Count(ctx context.Context, id uint32, port uint16) (int, error) {
+func (c Counter) Count(ctx context.Context, id uint32, port uint16) (int, error) {
 	mark, err := generation.Mark(id)
 	if err != nil {
 		return 0, err
 	}
-	return count(ctx, ct.Filter{Mark: mark, Mask: generation.Mask}, port)
+	return count(ctx, ct.Filter{Mark: mark, Mask: generation.Mask}, port, c.newLiveness())
 }
 
 // Counts returns one consistent namespace snapshot grouped by generation.
 // Startup uses it to find orphan marks without racing several separate dumps.
+// It deliberately ignores IdleAfter: it decides which generation IDs are still
+// in use, and an ID must not be handed to new DNA while any entry, idle or
+// not, still carries its mark.
 func (Counter) Counts(ctx context.Context, port uint16) (map[uint32]int, error) {
 	flows, err := dump(ctx, ct.Filter{Mark: generation.Namespace, Mask: 0xff000000})
 	if err != nil {
@@ -59,14 +123,14 @@ func (Counter) Neutralize(ctx context.Context, port uint16) (int, error) {
 	return updateNeutral(ctx, port)
 }
 
-func count(ctx context.Context, filter ct.Filter, port uint16) (int, error) {
+func count(ctx context.Context, filter ct.Filter, port uint16, alive liveness) (int, error) {
 	flows, err := dump(ctx, filter)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
 	for _, flow := range flows {
-		if adapterFlow(flow, port) {
+		if adapterFlow(flow, port) && alive.live(flow) {
 			n++
 		}
 	}
