@@ -138,13 +138,20 @@ func TestNeutralMarkPreservesAllBitsOutsideReservation(t *testing.T) {
 
 // A connection killed on the path without a FIN stays ESTABLISHED in conntrack
 // for days; once idle past the drain idle timeout it stops holding the drain.
-// Anything that has carried a packet recently, or is not ESTABLISHED, counts.
+// Anything that has carried a packet recently, is not ESTABLISHED, or runs on
+// the short retransmission or unacknowledged-data timer, counts.
 func TestLivenessDropsIdleEstablishedFlows(t *testing.T) {
 	established := 432000 * time.Second
-	alive := liveness{idleAfter: 5 * time.Minute, established: established}
+	alive := liveness{idleAfter: 5 * time.Minute, established: established, shortTimer: 300 * time.Second}
 	flow := func(state uint8, idle time.Duration) ct.Flow {
 		return ct.Flow{
 			Timeout:   uint32((established - idle) / time.Second),
+			ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: state}},
+		}
+	}
+	withTimeout := func(state uint8, remaining time.Duration) ct.Flow {
+		return ct.Flow{
+			Timeout:   uint32(remaining / time.Second),
 			ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: state}},
 		}
 	}
@@ -158,6 +165,9 @@ func TestLivenessDropsIdleEstablishedFlows(t *testing.T) {
 		{"idle past the timeout", flow(tcpConntrackEstablished, 5*time.Minute), false},
 		{"dead for hours", flow(tcpConntrackEstablished, 6*time.Hour), false},
 		{"closing flows expire on their own timers", flow(7, 6*time.Hour), true},
+		{"retransmitting or unacknowledged, just re-armed", withTimeout(tcpConntrackEstablished, 300*time.Second), true},
+		{"retransmitting or unacknowledged, nearly expired", withTimeout(tcpConntrackEstablished, time.Second), true},
+		{"established timer just above the short timer", withTimeout(tcpConntrackEstablished, 301*time.Second), false},
 		{"no TCP protocol info", ct.Flow{Timeout: 10}, true},
 	}
 	for _, tc := range cases {
@@ -170,23 +180,42 @@ func TestLivenessDropsIdleEstablishedFlows(t *testing.T) {
 	}
 }
 
-// Without the established timeout, idleness cannot be measured and every flow
-// counts.
-func TestLivenessWithoutEstablishedTimeoutCountsEverything(t *testing.T) {
-	original := establishedTimeoutPath
-	t.Cleanup(func() { establishedTimeoutPath = original })
-	establishedTimeoutPath = t.TempDir() + "/missing"
-	l := Counter{IdleAfter: time.Minute}.newLiveness()
-	dead := ct.Flow{Timeout: 1, ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: tcpConntrackEstablished}}}
-	if !l.live(dead) {
-		t.Fatal("an unreadable established timeout must count the flow")
+// Without every conntrack TCP timeout, idleness cannot be measured and every
+// flow counts.
+func TestLivenessWithoutTimeoutsCountsEverything(t *testing.T) {
+	paths := []*string{&establishedTimeoutPath, &maxRetransTimeoutPath, &unacknowledgedTimeoutPath}
+	originals := make([]string, len(paths))
+	for i, p := range paths {
+		originals[i] = *p
 	}
-	path := t.TempDir() + "/established"
-	if err := os.WriteFile(path, []byte("432000\n"), 0o600); err != nil {
-		t.Fatal(err)
+	t.Cleanup(func() {
+		for i, p := range paths {
+			*p = originals[i]
+		}
+	})
+	dir := t.TempDir()
+	write := func(name, value string) string {
+		path := dir + "/" + name
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
-	establishedTimeoutPath = path
+	established := write("established", "432000\n")
+	maxRetrans := write("max_retrans", "300\n")
+	unacknowledged := write("unacknowledged", "300\n")
+	missing := dir + "/missing"
+
+	dead := ct.Flow{Timeout: 3600, ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: tcpConntrackEstablished}}}
+	for i := range paths {
+		establishedTimeoutPath, maxRetransTimeoutPath, unacknowledgedTimeoutPath = established, maxRetrans, unacknowledged
+		*paths[i] = missing
+		if !(Counter{IdleAfter: time.Minute}).newLiveness().live(dead) {
+			t.Fatalf("an unreadable %s must count the flow", originals[i])
+		}
+	}
+	establishedTimeoutPath, maxRetransTimeoutPath, unacknowledgedTimeoutPath = established, maxRetrans, unacknowledged
 	if (Counter{IdleAfter: time.Minute}).newLiveness().live(dead) {
-		t.Fatal("a flow idle for days must not count once the timeout is known")
+		t.Fatal("a flow idle for days must not count once the timeouts are known")
 	}
 }

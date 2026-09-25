@@ -225,7 +225,11 @@ a connection the path killed without a FIN (a censor dropping it after the
 handshake, a client that vanished) stays ESTABLISHED in conntrack for
 `nf_conntrack_tcp_timeout_established`, five days by default. Idleness comes
 from the entry's own timer, which restarts on every packet, so a live
-connection holds the drain however long it lasts. ID allocation still counts
+connection holds the drain however long it lasts. A flow that is
+retransmitting or has unacknowledged data runs on the much shorter
+`nf_conntrack_tcp_timeout_max_retrans` / `_unacknowledged` timer instead,
+which says nothing about idle time, so it keeps holding the drain until that
+timer expires the entry. ID allocation still counts
 every entry, idle or not, so an ID is never reused while one carries its mark. IDs are bounded to 1..4095 and cannot be
 changed in place; an ID becomes reusable only after zero-flow GC, so wraparound
 cannot bind an old conntrack entry to new DNA. Startup also reserves every live

@@ -28,13 +28,24 @@ import (
 // it. Idleness is read from conntrack itself: an entry's remaining timeout
 // restarts at the established timeout on every packet, so a live connection
 // keeps counting however long it lasts.
+//
+// While a flow retransmits or has data outstanding, the kernel re-arms its
+// timer at the much shorter max-retrans or unacknowledged timeout instead.
+// Such a timer says nothing about idle time, so the flow counts; if the path
+// has killed it, that short timer removes the entry soon anyway.
 type Counter struct {
 	IdleAfter time.Duration
 }
 
 // establishedTimeoutPath is where the kernel exposes the timeout an
-// ESTABLISHED TCP entry restarts at on every packet.
-var establishedTimeoutPath = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established"
+// ESTABLISHED TCP entry restarts at on every packet. maxRetransTimeoutPath and
+// unacknowledgedTimeoutPath hold the shorter timeouts it restarts at instead
+// while the flow retransmits or has unacknowledged data.
+var (
+	establishedTimeoutPath    = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established"
+	maxRetransTimeoutPath     = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_max_retrans"
+	unacknowledgedTimeoutPath = "/proc/sys/net/netfilter/nf_conntrack_tcp_timeout_unacknowledged"
+)
 
 // tcpConntrackEstablished is the kernel's TCP_CONNTRACK_ESTABLISHED state.
 const tcpConntrackEstablished = 3
@@ -43,23 +54,47 @@ const tcpConntrackEstablished = 3
 type liveness struct {
 	idleAfter   time.Duration
 	established time.Duration
+	// shortTimer is the longest timeout an ESTABLISHED entry can restart at
+	// while it retransmits or has unacknowledged data. A remaining timeout at
+	// or below it may have been re-armed by the latest packet.
+	shortTimer time.Duration
 }
 
-// newLiveness reads the established timeout. Without it idleness cannot be
-// measured, so every flow counts: holding a drain open is the safe mistake.
+// newLiveness reads the conntrack TCP timeouts. Without them idleness cannot
+// be measured, so every flow counts: holding a drain open is the safe mistake.
 func (c Counter) newLiveness() liveness {
 	if c.IdleAfter <= 0 {
 		return liveness{}
 	}
-	raw, err := os.ReadFile(establishedTimeoutPath)
-	if err != nil {
+	established, ok := readTimeout(establishedTimeoutPath)
+	if !ok {
 		return liveness{}
+	}
+	maxRetrans, ok := readTimeout(maxRetransTimeoutPath)
+	if !ok {
+		return liveness{}
+	}
+	unacknowledged, ok := readTimeout(unacknowledgedTimeoutPath)
+	if !ok {
+		return liveness{}
+	}
+	return liveness{
+		idleAfter:   c.IdleAfter,
+		established: established,
+		shortTimer:  max(maxRetrans, unacknowledged),
+	}
+}
+
+func readTimeout(path string) (time.Duration, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
 	}
 	seconds, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 32)
 	if err != nil || seconds == 0 {
-		return liveness{}
+		return 0, false
 	}
-	return liveness{idleAfter: c.IdleAfter, established: time.Duration(seconds) * time.Second}
+	return time.Duration(seconds) * time.Second, true
 }
 
 // live reports whether a flow still counts toward a drain.
@@ -72,7 +107,7 @@ func (l liveness) live(flow ct.Flow) bool {
 		return true
 	}
 	remaining := time.Duration(flow.Timeout) * time.Second
-	if remaining >= l.established {
+	if remaining >= l.established || remaining <= l.shortTimer {
 		return true
 	}
 	return l.established-remaining < l.idleAfter
