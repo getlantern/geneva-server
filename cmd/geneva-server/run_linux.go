@@ -328,7 +328,7 @@ func steeringConfig(o *runCmd, fatal func(error)) steering.Config {
 
 		ObserveInbound:            o.ObserveInbound,
 		StateFile:                 o.AdapterStateFile,
-		Connections:               flowtrack.Counter{},
+		Connections:               flowtrack.Counter{IdleAfter: o.DrainIdleTimeout},
 		MaxGenerations:            o.MaxGenerations,
 		MaxScopedGenerations:      o.MaxScopedGenerations,
 		MaxEveryPacketGenerations: o.MaxEveryPacketGenerations,

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,5 +133,89 @@ func TestNeutralMarkPreservesAllBitsOutsideReservation(t *testing.T) {
 		if got&0x00000fff != mark&0x00000fff {
 			t.Fatalf("neutralization changed non-Geneva bits: %#x -> %#x", mark, got)
 		}
+	}
+}
+
+// A connection killed on the path without a FIN stays ESTABLISHED in conntrack
+// for days; once idle past the drain idle timeout it stops holding the drain.
+// Anything that has carried a packet recently, is not ESTABLISHED, or runs on
+// the short retransmission or unacknowledged-data timer, counts.
+func TestLivenessDropsIdleEstablishedFlows(t *testing.T) {
+	established := 432000 * time.Second
+	alive := liveness{idleAfter: 5 * time.Minute, established: established, shortTimer: 300 * time.Second}
+	flow := func(state uint8, idle time.Duration) ct.Flow {
+		return ct.Flow{
+			Timeout:   uint32((established - idle) / time.Second),
+			ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: state}},
+		}
+	}
+	withTimeout := func(state uint8, remaining time.Duration) ct.Flow {
+		return ct.Flow{
+			Timeout:   uint32(remaining / time.Second),
+			ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: state}},
+		}
+	}
+	cases := []struct {
+		name string
+		flow ct.Flow
+		want bool
+	}{
+		{"active", flow(tcpConntrackEstablished, 10*time.Second), true},
+		{"just under the idle timeout", flow(tcpConntrackEstablished, 5*time.Minute-time.Second), true},
+		{"idle past the timeout", flow(tcpConntrackEstablished, 5*time.Minute), false},
+		{"dead for hours", flow(tcpConntrackEstablished, 6*time.Hour), false},
+		{"closing flows expire on their own timers", flow(7, 6*time.Hour), true},
+		{"retransmitting or unacknowledged, just re-armed", withTimeout(tcpConntrackEstablished, 300*time.Second), true},
+		{"retransmitting or unacknowledged, nearly expired", withTimeout(tcpConntrackEstablished, time.Second), true},
+		{"established timer just above the short timer", withTimeout(tcpConntrackEstablished, 301*time.Second), false},
+		{"no TCP protocol info", ct.Flow{Timeout: 10}, true},
+	}
+	for _, tc := range cases {
+		if got := alive.live(tc.flow); got != tc.want {
+			t.Errorf("%s: live = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if !(liveness{}).live(flow(tcpConntrackEstablished, 6*time.Hour)) {
+		t.Error("a disabled idle timeout must count every flow")
+	}
+}
+
+// Without every conntrack TCP timeout, idleness cannot be measured and every
+// flow counts.
+func TestLivenessWithoutTimeoutsCountsEverything(t *testing.T) {
+	paths := []*string{&establishedTimeoutPath, &maxRetransTimeoutPath, &unacknowledgedTimeoutPath}
+	originals := make([]string, len(paths))
+	for i, p := range paths {
+		originals[i] = *p
+	}
+	t.Cleanup(func() {
+		for i, p := range paths {
+			*p = originals[i]
+		}
+	})
+	dir := t.TempDir()
+	write := func(name, value string) string {
+		path := dir + "/" + name
+		if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	established := write("established", "432000\n")
+	maxRetrans := write("max_retrans", "300\n")
+	unacknowledged := write("unacknowledged", "300\n")
+	missing := dir + "/missing"
+
+	dead := ct.Flow{Timeout: 3600, ProtoInfo: ct.ProtoInfo{TCP: &ct.ProtoInfoTCP{State: tcpConntrackEstablished}}}
+	for i := range paths {
+		establishedTimeoutPath, maxRetransTimeoutPath, unacknowledgedTimeoutPath = established, maxRetrans, unacknowledged
+		*paths[i] = missing
+		if !(Counter{IdleAfter: time.Minute}).newLiveness().live(dead) {
+			t.Fatalf("an unreadable %s must count the flow", originals[i])
+		}
+	}
+	establishedTimeoutPath, maxRetransTimeoutPath, unacknowledgedTimeoutPath = established, maxRetrans, unacknowledged
+	if (Counter{IdleAfter: time.Minute}).newLiveness().live(dead) {
+		t.Fatal("a flow idle for days must not count once the timeouts are known")
 	}
 }
